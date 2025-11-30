@@ -1,0 +1,21 @@
+{
+  "name": "the-still-base",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4",
+    "vite-plugin-pwa": "^1.2.0"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.86.0",
+    "three": "^0.181.2",
+    "zustand": "^5.0.9"
+  }
+}
