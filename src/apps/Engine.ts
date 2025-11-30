@@ -7,6 +7,8 @@ import type { SaveManager } from "../core/SaveManager";
 import { SceneManager } from "./SceneManager";
 import type { SceneContext, SceneController, SceneName } from "./SceneTypes";
 import { DebugOverlay } from "./DebugOverlay";
+import { CameraSystem } from "../systems/CameraSystem";
+import { ControlSystem } from "../systems/ControlSystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -29,6 +31,8 @@ export class Engine {
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly camera: THREE.PerspectiveCamera;
+  private readonly cameraSystem: CameraSystem;
+  private readonly controlSystem: ControlSystem;
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
 
@@ -59,6 +63,18 @@ export class Engine {
       1000,
     );
 
+    this.cameraSystem = new CameraSystem({
+      camera: this.camera,
+      bus: this.bus,
+      config: this.config,
+    });
+
+    this.controlSystem = new ControlSystem({
+      domElement: this.canvas,
+      bus: this.bus,
+      config: this.config,
+    });
+
     this.sceneManager = new SceneManager(this.save);
 
     const ctx: SceneContext = {
@@ -87,7 +103,7 @@ export class Engine {
 
     // Dev-only debug overlay
     if (import.meta.env.DEV) {
-      this.debugOverlay = new DebugOverlay(this.camera);
+      this.debugOverlay = new DebugOverlay(this.camera, this.bus);
     }
 
     window.addEventListener("resize", this.handleResize);
@@ -112,6 +128,10 @@ export class Engine {
     this.lastTime = now;
 
     const dt = Math.min(dtRaw, this.config.maxDeltaTime);
+
+    const snapshot = this.controlSystem.consumeSnapshot();
+    this.cameraSystem.applyControlDeltas(snapshot.rotateDelta, snapshot.dollyDelta);
+    this.cameraSystem.update(dt);
 
     this.sceneManager.update(dt);
 
@@ -147,6 +167,7 @@ export class Engine {
       this.debugOverlay = null;
     }
 
+    this.controlSystem.dispose();
     this.renderer.dispose();
   }
 }

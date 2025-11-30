@@ -1,9 +1,19 @@
 // src/apps/DebugOverlay.ts
 
 import * as THREE from "three";
+import type { EventBus } from "../core/EventBus";
+
+interface CameraTelemetryOverlay {
+  position: THREE.Vector3;
+  target: THREE.Vector3;
+  distance: number;
+  azimuthAngle: number;
+  polarAngle: number;
+}
 
 export class DebugOverlay {
   private readonly camera: THREE.PerspectiveCamera;
+  private readonly bus: EventBus;
   private readonly container: HTMLDivElement;
   private readonly textEl: HTMLPreElement;
 
@@ -12,9 +22,11 @@ export class DebugOverlay {
   private fps = 0;
 
   private readonly hasMemoryAPI: boolean;
+  private lastTelemetry: CameraTelemetryOverlay | null = null;
 
-  constructor(camera: THREE.PerspectiveCamera) {
+  constructor(camera: THREE.PerspectiveCamera, bus: EventBus) {
     this.camera = camera;
+    this.bus = bus;
 
     this.container = document.createElement("div");
     this.container.className = "debug-overlay";
@@ -27,6 +39,10 @@ export class DebugOverlay {
 
     this.hasMemoryAPI =
       typeof performance !== "undefined" && "memory" in performance;
+
+    this.bus.on<CameraTelemetryOverlay>("camera:telemetry", (payload) => {
+      this.lastTelemetry = payload;
+    });
   }
 
   update(dt: number): void {
@@ -65,6 +81,14 @@ export class DebugOverlay {
       `pos: ${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}, ${pos.z.toFixed(2)}`,
       `dir: ${dir.x.toFixed(3)}, ${dir.y.toFixed(3)}, ${dir.z.toFixed(3)}`,
     ];
+
+    if (this.lastTelemetry) {
+      lines.push(
+        `dist: ${this.lastTelemetry.distance.toFixed(2)}`,
+        `az: ${this.lastTelemetry.azimuthAngle.toFixed(3)}`,
+        `phi: ${this.lastTelemetry.polarAngle.toFixed(3)}`
+      );
+    }
 
     this.textEl.textContent = lines.join("\n");
   }
