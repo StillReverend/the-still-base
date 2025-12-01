@@ -10,18 +10,21 @@
 //    time position and a gradient fading back toward 12.
 //  - Driven by local time, independent of audio.
 //
-// Notes:
-//  - Uses THREE.Points with per-vertex colors (no shaders yet).
-//  - Later phases can:
-//      * add bloom/post-processing
-//      * add color modes (perRing / rainbow / vinyl)
-//      * hook into audio for ripple effects.
+// Enhancements in this version:
+//  - Global + distance-based intensity scaling
+//  - Optional audio-reactive boost hooks
+//  - Thickness scaling APIs (global + per-ring)
+//  - Color mode wiring for future rainbow / vinyl modes
+//    (logic included but commented out as requested)
+//  - Baseline tail intensity so 12 o'clock never fully vanishes
 // ============================================================
 
 import * as THREE from "three";
 
+export type ClockColorMode = "classic" | "perRing" | "rainbow" | "vinyl";
+
 export interface ClockSystemConfig {
-  /** Number of points per ring (higher = smoother arc). */
+  /** Number of points for the base hour ring. */
   pointsPerRing?: number;
   /** Global tail shaping factor (0..1) used to tweak falloff. */
   tailLength?: number;
@@ -39,11 +42,25 @@ export class ClockSystem {
 
   private readonly _tempColor = new THREE.Color();
 
+  // New control knobs (all default to neutral behavior)
+  private colorMode: ClockColorMode = "classic";
+  private globalIntensity = 1.0;
+  private distanceFactor = 1.0;
+
+  private audioLow = 0.0;
+  private audioMid = 0.0;
+  private audioHigh = 0.0;
+
   constructor(config: ClockSystemConfig = {}) {
     this.root = new THREE.Group();
     this.root.name = "ClockSystem";
 
-    this.pointsPerRing = config.pointsPerRing ?? 512;
+    // Base footing: think of this as "hour resolution".
+    // H: pointsPerRing (12)   -> one per hour
+    // M: pointsPerRing * 5    -> 60 slots
+    // S: pointsPerRing * 30   -> 360 slots (1° per point)
+    this.pointsPerRing = config.pointsPerRing ?? 12;
+
     this.tailLength = THREE.MathUtils.clamp(
       config.tailLength ?? 0.25,
       0.0,
@@ -51,37 +68,37 @@ export class ClockSystem {
     );
 
     // Base radii and thickness values; tweak as needed
-    const baseRadius = 2.5;
-    const gap = 0.35;
+    const baseRadius = 4.0;
+    const gap = 0.6;
 
     // Hour ring (thickest, closest to core)
     this.hourRing = new RingPoints({
       radius: baseRadius,
-      thickness: 0.20,
+      thickness: 0.2,
       points: this.pointsPerRing,
       // Use tailLength to control falloff softness
       falloffFactor: this.tailLength * 0.6,
-      baseColor: new THREE.Color(0x1a1a40),
+      baseColor: new THREE.Color(0xd4af37), // warm gold
     });
     this.root.add(this.hourRing.points);
 
     // Minute ring (medium thickness)
     this.minuteRing = new RingPoints({
-      radius: baseRadius + gap * 1,
-      thickness: 0.15,
-      points: this.pointsPerRing,
+      radius: baseRadius + gap,
+      thickness: 0.16,
+      points: this.pointsPerRing * 5, // 12 * 5 = 60
       falloffFactor: this.tailLength,
-      baseColor: new THREE.Color(0x1a1a40),
+      baseColor: new THREE.Color(0x7fd0ff), // soft cyan
     });
     this.root.add(this.minuteRing.points);
 
     // Second ring (thinnest, largest radius)
     this.secondRing = new RingPoints({
-      radius: baseRadius + gap * 3,
-      thickness: 0.10,
-      points: this.pointsPerRing,
+      radius: baseRadius + gap * 2,
+      thickness: 0.12,
+      points: this.pointsPerRing * 30, // 12 * 30 = 360
       falloffFactor: this.tailLength * 1.4,
-      baseColor: new THREE.Color(0x1a1a40),
+      baseColor: new THREE.Color(0xff4f9a), // magenta-ish
     });
     this.root.add(this.secondRing.points);
   }
@@ -101,6 +118,71 @@ export class ClockSystem {
   public getHourColor(target?: THREE.Color): THREE.Color {
     const out = target ?? this._tempColor;
     return out.copy(this.hourRing.getBaseColor());
+  }
+
+  // ---------- New knobs ----------
+
+  /**
+   * Global brightness multiplier (0..N).
+   * 1 = default, <1 = dimmer, >1 = hotter rings.
+   */
+  public setGlobalIntensity(value: number): void {
+    this.globalIntensity = Math.max(0, value);
+  }
+
+  /**
+   * Distance-based intensity control (0..N).
+   * Idea: camera or core can set this based on distance.
+   */
+  public setDistanceFactor(value: number): void {
+    this.distanceFactor = Math.max(0, value);
+  }
+
+  /**
+   * Set current audio levels (0..1 ideally).
+   * These are optional; if never called, rings behave as before.
+   *
+   * low  -> mostly affects hour ring
+   * mid  -> mostly affects minute ring
+   * high -> mostly affects second ring
+   */
+  public setAudioLevels(low: number, mid: number, high: number): void {
+    this.audioLow = THREE.MathUtils.clamp(low, 0, 1);
+    this.audioMid = THREE.MathUtils.clamp(mid, 0, 1);
+    this.audioHigh = THREE.MathUtils.clamp(high, 0, 1);
+  }
+
+  /**
+   * Switch between color modes.
+   * For now, only "classic" is active; rainbow/vinyl logic
+   * is stubbed out in RingPoints and commented as requested.
+   */
+  public setColorMode(mode: ClockColorMode): void {
+    this.colorMode = mode;
+  }
+
+  /**
+   * Uniform thickness scaling for all rings.
+   * 1 = default current look, 2 = twice as thick, etc.
+   */
+  public setThicknessScale(scale: number): void {
+    const s = Math.max(0.1, scale);
+    this.hourRing.setThicknessScale(s);
+    this.minuteRing.setThicknessScale(s);
+    this.secondRing.setThicknessScale(s);
+  }
+
+  /**
+   * Per-ring thickness scaling (H, M, S).
+   */
+  public setRingThicknessScales(
+    hourScale: number,
+    minuteScale: number,
+    secondScale: number,
+  ): void {
+    this.hourRing.setThicknessScale(Math.max(0.1, hourScale));
+    this.minuteRing.setThicknessScale(Math.max(0.1, minuteScale));
+    this.secondRing.setThicknessScale(Math.max(0.1, secondScale));
   }
 
   /**
@@ -136,12 +218,35 @@ export class ClockSystem {
     const minuteAngle = minuteProgress * tau;
     const secondAngle = secondProgress * tau;
 
-    // Update each ring with:
-    //  - headAngle = current time position
-    //  - fillFraction = how far around the circle to fill from "12"
-    this.hourRing.updateFill(hourAngle, hourProgress);
-    this.minuteRing.updateFill(minuteAngle, minuteProgress);
-    this.secondRing.updateFill(secondAngle, secondProgress);
+    // Intensity baseline (global + distance).
+    const baseIntensity =
+      this.globalIntensity * this.distanceFactor;
+
+    // Audio boosts (subtle by design).
+    const hourBoost = 1 + this.audioLow * 0.6;
+    const minuteBoost = 1 + this.audioMid * 0.6;
+    const secondBoost = 1 + this.audioHigh * 0.6;
+
+    this.hourRing.updateFill(
+      hourAngle,
+      hourProgress,
+      baseIntensity * hourBoost,
+      this.colorMode,
+    );
+
+    this.minuteRing.updateFill(
+      minuteAngle,
+      minuteProgress,
+      baseIntensity * minuteBoost,
+      this.colorMode,
+    );
+
+    this.secondRing.updateFill(
+      secondAngle,
+      secondProgress,
+      baseIntensity * secondBoost,
+      this.colorMode,
+    );
   }
 
   public dispose(): void {
@@ -175,6 +280,9 @@ class RingPoints {
   private readonly colors: Float32Array;
   private readonly falloffPower: number;
 
+  private readonly baseSize: number;
+  private readonly tempColor = new THREE.Color();
+
   constructor(config: RingPointsConfig) {
     const {
       radius,
@@ -185,8 +293,9 @@ class RingPoints {
     } = config;
 
     this.geometry = new THREE.BufferGeometry();
+    this.baseSize = thickness * 0.8;
     this.material = new THREE.PointsMaterial({
-      size: thickness * 0.8,
+      size: this.baseSize,
       sizeAttenuation: true,
       vertexColors: true,
       transparent: true,
@@ -243,16 +352,27 @@ class RingPoints {
   }
 
   /**
+   * Uniform per-ring thickness scaling.
+   */
+  public setThicknessScale(scale: number): void {
+    this.material.size = this.baseSize * scale;
+  }
+
+  /**
    * Fill an arc from "12 o'clock" up to headAngle, with the
    * brightest point at headAngle and a gradient fading back
    * toward the oldest part of the arc near 12.
    *
-   * @param headAngle    current time position in radians (0..2π)
-   * @param fillFraction how much of the circle is filled (0..1)
+   * @param headAngle      current time position in radians (0..2π)
+   * @param fillFraction   how much of the circle is filled (0..1)
+   * @param intensityScale global+distance+audio multiplier
+   * @param mode           color mode (classic / perRing / rainbow / vinyl)
    */
   public updateFill(
     headAngle: number,
     fillFraction: number,
+    intensityScale: number = 1,
+    mode: ClockColorMode = "classic",
   ): void {
     const tau = Math.PI * 2;
     const clampedFill = THREE.MathUtils.clamp(fillFraction, 0, 1);
@@ -272,12 +392,18 @@ class RingPoints {
     const angles = this.angles;
     const count = angles.length;
 
+    const safeIntensityScale = Math.max(0, intensityScale);
+
+    // Baseline intensity so that any point within the arc
+    // never fully disappears (helps keep 12 o'clock visible).
+    const minTailIntensity = 0.15; // tweak 0.1–0.25 to taste
+
     for (let i = 0; i < count; i++) {
       const angle = angles[i];
 
-      // We measure "behind the head" along the circle.
-      // delta = how far back from head this point lies, along the
-      // completed arc. 0 at head, increasing toward 12.
+      // Measure "behind the head" along the circle:
+      // delta = how far back from head this point lies along
+      // the completed arc. 0 at head, increasing toward 12.
       let delta = head - angle;
       delta = (delta + tau) % tau; // normalize to [0, 2π)
 
@@ -286,13 +412,53 @@ class RingPoints {
       if (delta >= 0 && delta <= fillArc) {
         // 0 at the oldest part, 1 at head
         const t = 1 - delta / fillArc;
-        intensity = Math.pow(t, this.falloffPower);
+
+        // Shape the head with falloffPower, but keep a floor
+        // along the arc so the start (near 12) never fully vanishes.
+        const shaped = Math.pow(t, this.falloffPower);
+        intensity =
+          minTailIntensity +
+          (1 - minTailIntensity) * shaped;
       }
 
+      intensity *= safeIntensityScale;
+      if (intensity > 1) intensity = 1;
+
       const idx = i * 3;
+
+      // --- Classic / per-ring color mode (ACTIVE) ---
+      // We always use baseColor for now to preserve current look.
       colors[idx] = baseR * intensity;
       colors[idx + 1] = baseG * intensity;
       colors[idx + 2] = baseB * intensity;
+
+      // --- Rainbow / Vinyl modes (EXPERIMENTAL, COMMENTED OUT) ---
+      //
+      // Uncomment and adapt this block when you're ready to
+      // preview rainbow / vinyl behaviors:
+      //
+      // if (mode === "rainbow" || mode === "vinyl") {
+      //   // Rainbow: hue based on angle around the circle.
+      //   // Vinyl: you could add an offset or quantization here.
+      //   let hue = angle / tau; // 0..1 around the circle
+      //
+      //   if (mode === "vinyl") {
+      //     // Example vinyl tweak: rotate hue and add subtle banding.
+      //     hue += 0.25; // rotate palette
+      //     hue %= 1.0;
+      //   }
+      //
+      //   this.tempColor.setHSL(hue, 0.7, 0.5);
+      //
+      //   colors[idx] = this.tempColor.r * intensity;
+      //   colors[idx + 1] = this.tempColor.g * intensity;
+      //   colors[idx + 2] = this.tempColor.b * intensity;
+      // } else {
+      //   // Classic mode: per-ring baseColor
+      //   colors[idx] = baseR * intensity;
+      //   colors[idx + 1] = baseG * intensity;
+      //   colors[idx + 2] = baseB * intensity;
+      // }
     }
 
     (
