@@ -1,67 +1,160 @@
-// src/scenes/DemoScene.ts
+// ============================================================
+// THE STILL — P03
+// DemoScene.ts
+// ------------------------------------------------------------
+// Temporary "main world" scene for P03.
+// Responsibilities:
+//  - Host the CoreSystem (black hole + clock rings)
+//  - Provide a simple lighting setup
+//  - Position the camera in a good starting orbit
+//
+// Notes:
+//  - BootScene will eventually handle arrival/cinematics.
+//  - This scene will likely evolve/rename into the main
+//    STILL scene later (e.g. StillScene).
+// ============================================================
 
 import * as THREE from "three";
-import type { SceneController, SceneContext, SceneName } from "../apps/SceneTypes";
+
+import type {
+  SceneController,
+  SceneContext,
+  SceneName,
+} from "../apps/SceneTypes";
+
+import type { CorePhase } from "../systems/CoreSystem";
+import { CoreSystem } from "../systems/CoreSystem";
 
 export class DemoScene implements SceneController {
   public readonly name: SceneName = "DemoScene";
   public readonly scene = new THREE.Scene();
 
   private ctx: SceneContext | null = null;
-  private sphere: THREE.Mesh | null = null;
+  private core: CoreSystem | null = null;
+
+  private ambientLight: THREE.AmbientLight | null = null;
+  private keyLight: THREE.DirectionalLight | null = null;
+  private rimLight: THREE.DirectionalLight | null = null;
+
   private elapsed = 0;
 
-  init(ctx: SceneContext): void {
+  // ----------------------------------------------------------
+  // init()
+  // ----------------------------------------------------------
+  public init(ctx: SceneContext): void {
     this.ctx = ctx;
 
-    this.scene.background = new THREE.Color(0x020207);
+    if (import.meta.env.DEV) {
+      // eslint-disable-next-line no-console
+      console.log("[DemoScene] init");
+    }
 
-    const geometry = new THREE.SphereGeometry(1.0, 48, 48);
-    const material = new THREE.MeshStandardMaterial({
-      color: 0x6ec3ff,
-      metalness: 0.2,
-      roughness: 0.4,
-      emissive: new THREE.Color(0x123456),
-      emissiveIntensity: 0.7,
+    // Space-like background
+    this.scene.background = new THREE.Color(0x020208);
+
+    this.buildLights();
+    this.buildCore(ctx);
+
+    this.configureCamera(ctx);
+  }
+
+  // ----------------------------------------------------------
+  // Scene construction
+  // ----------------------------------------------------------
+
+  private buildLights(): void {
+    // Soft ambient light so shadows aren't crushed
+    this.ambientLight = new THREE.AmbientLight(0x404060, 0.6);
+    this.scene.add(this.ambientLight);
+
+    // Key light, warm-ish
+    this.keyLight = new THREE.DirectionalLight(0xfff2d1, 1.0);
+    this.keyLight.position.set(6, 8, 5);
+    this.keyLight.castShadow = false;
+    this.scene.add(this.keyLight);
+
+    // Rim/cool light to give the core some edge
+    this.rimLight = new THREE.DirectionalLight(0x6fa9ff, 0.7);
+    this.rimLight.position.set(-5, -3, -7);
+    this.rimLight.castShadow = false;
+    this.scene.add(this.rimLight);
+  }
+
+  private buildCore(ctx: SceneContext): void {
+    this.core = new CoreSystem({
+      bus: ctx.bus,
+      config: ctx.config,
+      save: ctx.save,
     });
 
-    this.sphere = new THREE.Mesh(geometry, material);
-    this.scene.add(this.sphere);
+    // Start in black hole phase (guided experience default)
+    const phase: CorePhase = "black_hole";
+    this.core.setPhase(phase);
 
-    const ambient = new THREE.AmbientLight(0xffffff, 0.5);
-    this.scene.add(ambient);
+    // At P03, shrinkLevel = 0 (largest core)
+    this.core.setShrinkLevel(0);
 
-    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
-    dir.position.set(-4, 6, 3);
-    this.scene.add(dir);
+    this.scene.add(this.core.getRoot());
+  }
 
-    if (this.ctx) {
-      const { camera } = this.ctx;
-      camera.position.set(0, 0, 4.5);
-      camera.lookAt(0, 0, 0);
+  private configureCamera(ctx: SceneContext): void {
+    // Reasonable starting position: "NEAR" the core and slightly above
+    const camera = ctx.camera;
+
+    const distance = 12; // can tune later to match your AT/NEAR/FAR scheme
+    const theta = THREE.MathUtils.degToRad(35); // elevation angle
+    const phi = THREE.MathUtils.degToRad(45); // around Y
+
+    const x = Math.cos(theta) * Math.cos(phi) * distance;
+    const y = Math.sin(theta) * distance;
+    const z = Math.cos(theta) * Math.sin(phi) * distance;
+
+    camera.position.set(x, y, z);
+    camera.lookAt(0, 0, 0);
+  }
+
+  // ----------------------------------------------------------
+  // update()
+  // ----------------------------------------------------------
+  public update(delta: number): void {
+    this.elapsed += delta;
+
+    if (this.core) {
+      this.core.update(delta);
     }
   }
 
-  update(delta: number): void {
-    if (!this.sphere) return;
+  // ----------------------------------------------------------
+  // dispose()
+  // ----------------------------------------------------------
+  public dispose(): void {
+    if (import.meta.env.DEV) {
+      // eslint-disable-next-line no-console
+      console.log("[DemoScene] dispose");
+    }
 
-    this.elapsed += delta;
-    const t = this.elapsed;
+    if (this.core) {
+      this.core.dispose();
+      this.scene.remove(this.core.getRoot());
+      this.core = null;
+    }
 
-    this.sphere.rotation.y = t * 0.4;
-    this.sphere.rotation.x = Math.sin(t * 0.5) * 0.2;
+    if (this.ambientLight) {
+      this.scene.remove(this.ambientLight);
+      this.ambientLight.dispose();
+      this.ambientLight = null;
+    }
 
-    const material = this.sphere.material as THREE.MeshStandardMaterial;
-    const pulse = 0.6 + Math.sin(t * 2.0) * 0.4;
-    material.emissiveIntensity = pulse;
-  }
+    if (this.keyLight) {
+      this.scene.remove(this.keyLight);
+      this.keyLight.dispose();
+      this.keyLight = null;
+    }
 
-  dispose(): void {
-    if (this.sphere) {
-      this.scene.remove(this.sphere);
-      this.sphere.geometry.dispose();
-      (this.sphere.material as THREE.Material).dispose();
-      this.sphere = null;
+    if (this.rimLight) {
+      this.scene.remove(this.rimLight);
+      this.rimLight.dispose();
+      this.rimLight = null;
     }
   }
 }
