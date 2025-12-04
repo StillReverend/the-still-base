@@ -68,37 +68,36 @@ export class ClockSystem {
     );
 
     // Base radii and thickness values; tweak as needed
-    const baseRadius = 4.0;
+    const baseRadius = 3.1;
     const gap = 0.6;
 
     // Hour ring (thickest, closest to core)
     this.hourRing = new RingPoints({
-      radius: baseRadius,
+      radius: baseRadius + gap,
       thickness: 0.2,
       points: this.pointsPerRing,
-      // Use tailLength to control falloff softness
       falloffFactor: this.tailLength * 0.6,
-      baseColor: new THREE.Color(0xd4af37), // warm gold
+      baseColor: new THREE.Color(0xd4af37),
     });
     this.root.add(this.hourRing.points);
 
     // Minute ring (medium thickness)
     this.minuteRing = new RingPoints({
-      radius: baseRadius + gap,
+      radius: baseRadius + gap * 2,
       thickness: 0.16,
-      points: this.pointsPerRing * 5, // 12 * 5 = 60
+      points: this.pointsPerRing * 5,
       falloffFactor: this.tailLength,
-      baseColor: new THREE.Color(0x7fd0ff), // soft cyan
+      baseColor: new THREE.Color(0x7fd0ff),
     });
     this.root.add(this.minuteRing.points);
 
     // Second ring (thinnest, largest radius)
     this.secondRing = new RingPoints({
-      radius: baseRadius + gap * 2,
+      radius: baseRadius + gap * 3,
       thickness: 0.12,
-      points: this.pointsPerRing * 30, // 12 * 30 = 360
+      points: this.pointsPerRing * 30,
       falloffFactor: this.tailLength * 1.4,
-      baseColor: new THREE.Color(0xff4f9a), // magenta-ish
+      baseColor: new THREE.Color(0xff4f9a),
     });
     this.root.add(this.secondRing.points);
   }
