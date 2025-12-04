@@ -4,9 +4,11 @@
 // ------------------------------------------------------------
 // Temporary "main world" scene for P03.
 // Responsibilities:
-//  - Host the CoreSystem (black hole + clock rings)
+//  - Host the CoreSystem (black hole)
+//  - Host the ClockSystem (H/M/S neon rings) parented to core
 //  - Provide a simple lighting setup
 //  - Position the camera in a good starting orbit
+//  - Drive distance-based brightness for the clock rings
 //
 // Notes:
 //  - BootScene will eventually handle arrival/cinematics.
@@ -24,13 +26,16 @@ import type {
 
 import type { CorePhase } from "../systems/CoreSystem";
 import { CoreSystem } from "../systems/CoreSystem";
+import { ClockSystem } from "../systems/ClockSystem";
 
 export class DemoScene implements SceneController {
   public readonly name: SceneName = "DemoScene";
   public readonly scene = new THREE.Scene();
 
   private ctx: SceneContext | null = null;
+
   private core: CoreSystem | null = null;
+  private clock: ClockSystem | null = null;
 
   private ambientLight: THREE.AmbientLight | null = null;
   private keyLight: THREE.DirectionalLight | null = null;
@@ -53,8 +58,7 @@ export class DemoScene implements SceneController {
     this.scene.background = new THREE.Color(0x020208);
 
     this.buildLights();
-    this.buildCore(ctx);
-
+    this.buildCoreAndClock(ctx);
     this.configureCamera(ctx);
   }
 
@@ -80,7 +84,12 @@ export class DemoScene implements SceneController {
     this.scene.add(this.rimLight);
   }
 
-  private buildCore(ctx: SceneContext): void {
+  /**
+   * Build the core (black hole) and attach the clock rings
+   * as a child so they always travel with the core.
+   */
+  private buildCoreAndClock(ctx: SceneContext): void {
+    // --- Core ---
     this.core = new CoreSystem({
       bus: ctx.bus,
       config: ctx.config,
@@ -94,7 +103,28 @@ export class DemoScene implements SceneController {
     // At P03, shrinkLevel = 0 (largest core)
     this.core.setShrinkLevel(0);
 
-    this.scene.add(this.core.getRoot());
+    const coreRoot = this.core.getRoot();
+    this.scene.add(coreRoot);
+
+    // --- Clock ---
+    this.clock = new ClockSystem({
+      // using defaults: 12/60/360 points for H/M/S
+      // tailLength can be tuned later if needed
+    });
+
+    const clockRoot = this.clock.getRoot();
+    clockRoot.name = "ClockSystemRoot";
+
+    // Parent the clock under the core so they feel like one unit.
+    coreRoot.add(clockRoot);
+
+    // Set initial visual baseline for P03:
+    // - Slightly under full intensity so we have headroom later.
+    // - Distance factor will modulate further each frame.
+    this.clock.setGlobalIntensity(0.9);
+
+    // If you ever want to adjust per-ring thickness:
+    // this.clock.setRingThicknessScales(1.0, 1.0, 1.0);
   }
 
   private configureCamera(ctx: SceneContext): void {
@@ -122,6 +152,34 @@ export class DemoScene implements SceneController {
     if (this.core) {
       this.core.update(delta);
     }
+
+    const camera = this.ctx?.camera ?? null;
+
+    if (this.clock && camera) {
+      // Distance from camera to core (assumed at world origin).
+      const distance = camera.position.length();
+
+      // Map distance into a brightness factor.
+      // Closer to the core => brighter rings.
+      //
+      // minDist: inside this, clamp to max brightness
+      // maxDist: beyond this, clamp to min brightness
+      const minDist = 6;
+      const maxDist = 40;
+
+      const t = THREE.MathUtils.clamp(
+        (distance - minDist) / (maxDist - minDist),
+        0,
+        1,
+      );
+
+      // When t=0 (very close), factor ~1.2 (bright/hot).
+      // When t=1 (far), factor ~0.35 (dim but visible).
+      const distanceFactor = THREE.MathUtils.lerp(1.2, 0.35, t);
+
+      this.clock.setDistanceFactor(distanceFactor);
+      this.clock.update(delta);
+    }
   }
 
   // ----------------------------------------------------------
@@ -133,9 +191,18 @@ export class DemoScene implements SceneController {
       console.log("[DemoScene] dispose");
     }
 
+    // Clock first (it’s a child of core)
+    if (this.clock) {
+      if (this.core) {
+        this.core.getRoot().remove(this.clock.getRoot());
+      }
+      this.clock.dispose();
+      this.clock = null;
+    }
+
     if (this.core) {
-      this.core.dispose();
       this.scene.remove(this.core.getRoot());
+      this.core.dispose();
       this.core = null;
     }
 
