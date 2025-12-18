@@ -123,8 +123,8 @@ export class CoreSystem {
 
   public update(dt: number): void {
     // Subtle slow rotation so core is always gently alive
-    const spin = dt * 0.06;
-    this.root.rotation.y += spin;
+    //const spin = dt * 0.06;
+    //this.root.rotation.y += spin;
 
     // We could also pulse aura slightly by shrinkLevel or phase later.
 
