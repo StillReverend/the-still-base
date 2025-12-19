@@ -77,7 +77,7 @@ export class ClockSystem {
     this.root.name = "ClockSystem";
 
     this.pointsPerRing = config.pointsPerRing ?? 12;
-    this.tailLength = THREE.MathUtils.clamp(config.tailLength ?? 0.25, 0.0, 1.0);
+    this.tailLength = THREE.MathUtils.clamp(config.tailLength ?? 0.33, 0.0, 1.0);
 
     const baseRadius = 3.1;
     const gap = 0.6;
