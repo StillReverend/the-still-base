@@ -136,7 +136,7 @@ export class CoreSystem {
 
     // Presence should drive clock *before* clock renders this frame.
     this.presence.update(dt);
-    this.clock.setPresenceLevel(this.presence.getPresenceLevel());
+    this.clock.setRingPresenceLevels(this.presence.getClockPresenceLevels());
 
     this.clock.update(dt);
     this.time.update(dt);
