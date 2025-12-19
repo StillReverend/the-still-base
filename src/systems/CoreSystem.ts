@@ -25,6 +25,7 @@ import type { SaveManager } from "../core/SaveManager";
 
 import { ClockSystem } from "./ClockSystem";
 import { TimeSystem } from "./TimeSystem";
+import { PresenceSystem } from "./PresenceSystem";
 
 export type CorePhase = "black_hole" | "solar" | "lunar";
 
@@ -47,6 +48,7 @@ export class CoreSystem {
 
   private readonly clock: ClockSystem;
   private readonly time: TimeSystem;
+  private readonly presence: PresenceSystem;
 
   private phase: CorePhase = "black_hole";
   /** 0..1 where 0 = largest (start of guided) and 1 = fully shrunk. */
@@ -68,6 +70,12 @@ export class CoreSystem {
 
     this.clock = new ClockSystem();
     this.time = new TimeSystem();
+
+    // Presence is a world-state driver (P04)
+    this.presence = new PresenceSystem();
+    this.presence.enableDebugHotkeys();
+    // If you want console control too, uncomment:
+    // this.presence.devExposeToWindow();
 
     this.root.add(this.clock.getRoot());
     this.root.add(this.time.getRoot());
@@ -123,16 +131,21 @@ export class CoreSystem {
 
   public update(dt: number): void {
     // Subtle slow rotation so core is always gently alive
-    //const spin = dt * 0.06;
-    //this.root.rotation.y += spin;
+    // const spin = dt * 0.06;
+    // this.root.rotation.y += spin;
 
-    // We could also pulse aura slightly by shrinkLevel or phase later.
+    // Presence should drive clock *before* clock renders this frame.
+    this.presence.update(dt);
+    this.clock.setPresenceLevel(this.presence.getPresenceLevel());
 
     this.clock.update(dt);
     this.time.update(dt);
   }
 
   public dispose(): void {
+    // Unhook debug listeners if this system gets torn down
+    this.presence.disableDebugHotkeys();
+
     if (this.coreSphere) {
       this.coreGroup.remove(this.coreSphere);
       this.coreSphere.geometry.dispose();
@@ -165,8 +178,7 @@ export class CoreSystem {
     // Map to a reasonable scale range, e.g. 1.0 → 0.3
     const maxScale = 1.0;
     const minScale = 0.3;
-    const scale =
-      maxScale - (maxScale - minScale) * this.shrinkLevel;
+    const scale = maxScale - (maxScale - minScale) * this.shrinkLevel;
 
     this.coreGroup.scale.setScalar(scale);
     this.clock.getRoot().scale.setScalar(scale);

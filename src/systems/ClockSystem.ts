@@ -7,14 +7,16 @@
 //    Hours, Minutes, and Seconds.
 //  - Each ring is a comet-style trail orbiting the core:
 //      * Bright "head" at the current time position
-//      * Fixed-length tail behind it, controlled by tailLength
+//      * Tail that can be fixed-length OR presence-filled
 //  - Driven by local time, independent of audio.
 //
-// Tail behavior:
-//  - tailLength (0..1) controls how much of the circle the
-//    comet tail covers (as a fraction of 2π).
-//  - The tail does NOT reset at 12 o'clock.
-//  - Head keeps time, tail stays a consistent orbiting length.
+// Presence behavior (NEW):
+//  - presenceLevel (0..1) controls legibility.
+//  - At presence = 1.0:
+//      * ring fills from 12 o'clock (angle 0) up to "now"
+//  - As presence decreases:
+//      * the lit arc retracts from the far end back toward the head,
+//        until it becomes the minimum comet tail (tailLength).
 //
 // Enhancements:
 //  - Global + distance-based intensity scaling
@@ -36,12 +38,12 @@ export interface ClockSystemConfig {
   /**
    * Global tail factor (0..1).
    * - Controls gradient "sharpness"
-   * - Controls the comet tail length as a fraction of the circle.
+   * - Controls the minimum comet tail length as a fraction of the circle.
    *
    * Examples:
-   *  tailLength = 0.25 -> tail spans 25% of orbit
-   *  tailLength = 0.5  -> tail spans half the circle
-   *  tailLength = 1.0  -> tail spans the full circle
+   *  tailLength = 0.25 -> min tail spans 25% of orbit
+   *  tailLength = 0.5  -> min tail spans half the circle
+   *  tailLength = 1.0  -> min tail spans the full circle
    */
   tailLength?: number;
 }
@@ -67,30 +69,26 @@ export class ClockSystem {
   private audioMid = 0.0;
   private audioHigh = 0.0;
 
+  // Presence (0..1): 1 = fully legible (filled arc), 0 = comet tail only
+  private presenceLevel = 0.0;
+
   constructor(config: ClockSystemConfig = {}) {
     this.root = new THREE.Group();
     this.root.name = "ClockSystem";
 
-    // Conceptual footing: "hour resolution".
-    //  - hours:   12 conceptual slots
-    //  - minutes: 60 conceptual slots
-    //  - seconds: 360 conceptual slots
     this.pointsPerRing = config.pointsPerRing ?? 12;
-
-    // Drives both gradient shaping & comet tail length.
     this.tailLength = THREE.MathUtils.clamp(config.tailLength ?? 0.25, 0.0, 1.0);
 
-    // Base radii and thickness values; tweak as needed
     const baseRadius = 3.1;
     const gap = 0.6;
 
-    // Hour ring (thickest)
+    // Hour ring (12)
     this.hourRing = new RingPoints({
       radius: baseRadius + gap * 7,
-      thickness: 0.1,
-      points: this.pointsPerRing, // 12
-      falloffFactor: this.tailLength * 2.0,
-      tailLength: this.tailLength * 1.7,
+      thickness: 0.2,
+      points: this.pointsPerRing,
+      falloffFactor: this.tailLength,
+      tailLength: this.tailLength,
       baseColor: new THREE.Color(0xd4af37),
     });
     this.root.add(this.hourRing.points);
@@ -99,7 +97,7 @@ export class ClockSystem {
     this.minuteRing = new RingPoints({
       radius: baseRadius + gap * 2.5,
       thickness: 0.15,
-      points: this.pointsPerRing * 5, // 12 * 5 = 60
+      points: this.pointsPerRing * 5,
       falloffFactor: this.tailLength,
       tailLength: this.tailLength,
       baseColor: new THREE.Color(0x7fd0ff),
@@ -109,13 +107,16 @@ export class ClockSystem {
     // Second ring (360)
     this.secondRing = new RingPoints({
       radius: baseRadius,
-      thickness: 0.2,
-      points: this.pointsPerRing * 30, // 12 * 30 = 360
-      falloffFactor: this.tailLength * 1.4,
-      tailLength: this.tailLength * 2.0,
+      thickness: 0.13,
+      points: this.pointsPerRing * 30,
+      falloffFactor: this.tailLength,
+      tailLength: this.tailLength,
       baseColor: new THREE.Color(0xff4f9a),
     });
     this.root.add(this.secondRing.points);
+
+    // Define True North for Rings (presentation transform)
+    this.root.rotation.y = -Math.PI / 2;
   }
 
   public getRoot(): THREE.Object3D {
@@ -125,6 +126,21 @@ export class ClockSystem {
   public getHourColor(target?: THREE.Color): THREE.Color {
     const out = target ?? this._tempColor;
     return out.copy(this.hourRing.getBaseColor());
+  }
+
+  // ---------- Presence ----------
+
+  /**
+   * 0..1 where:
+   *  - 0.0 = minimum comet tail only
+   *  - 1.0 = filled arc from 12 o'clock to the head ("now")
+   */
+  public setPresenceLevel(value: number): void {
+    this.presenceLevel = THREE.MathUtils.clamp(value, 0, 1);
+  }
+
+  public getPresenceLevel(): number {
+    return this.presenceLevel;
   }
 
   // ---------- Control knobs ----------
@@ -154,7 +170,11 @@ export class ClockSystem {
     this.secondRing.setThicknessScale(s);
   }
 
-  public setRingThicknessScales(hourScale: number, minuteScale: number, secondScale: number): void {
+  public setRingThicknessScales(
+    hourScale: number,
+    minuteScale: number,
+    secondScale: number,
+  ): void {
     this.hourRing.setThicknessScale(Math.max(0.1, hourScale));
     this.minuteRing.setThicknessScale(Math.max(0.1, minuteScale));
     this.secondRing.setThicknessScale(Math.max(0.1, secondScale));
@@ -170,12 +190,10 @@ export class ClockSystem {
 
     const tau = Math.PI * 2;
 
-    // ✅ C-1: Smooth hour progress (real clock behavior)
-    // This removes the “snap” at the top of the hour.
+    // Smooth hour progress (real clock behavior)
     const hourProgress =
       ((hours % 12) + minutes / 60 + seconds / 3600 + ms / 3600000) / 12;
 
-    // Smooth minutes + seconds (already “vibey”)
     const minuteProgress = (minutes + seconds / 60 + ms / 60000) / 60;
     const secondProgress = (seconds + ms / 1000) / 60;
 
@@ -189,9 +207,31 @@ export class ClockSystem {
     const minuteBoost = 1 + this.audioMid * 0.6;
     const secondBoost = 1 + this.audioHigh * 0.6;
 
-    this.hourRing.updateFill(hourAngle, hourProgress, baseIntensity * hourBoost, this.colorMode);
-    this.minuteRing.updateFill(minuteAngle, minuteProgress, baseIntensity * minuteBoost, this.colorMode);
-    this.secondRing.updateFill(secondAngle, secondProgress, baseIntensity * secondBoost, this.colorMode);
+    const presence = this.presenceLevel;
+
+    this.hourRing.updateFill(
+      hourAngle,
+      hourProgress,
+      baseIntensity * hourBoost,
+      presence,
+      this.colorMode,
+    );
+
+    this.minuteRing.updateFill(
+      minuteAngle,
+      minuteProgress,
+      baseIntensity * minuteBoost,
+      presence,
+      this.colorMode,
+    );
+
+    this.secondRing.updateFill(
+      secondAngle,
+      secondProgress,
+      baseIntensity * secondBoost,
+      presence,
+      this.colorMode,
+    );
   }
 
   public dispose(): void {
@@ -260,10 +300,6 @@ class RingPoints {
 
     for (let i = 0; i < points; i++) {
       const t = i / points;
-
-      // 0 radians corresponds to +X. That’s OK because all rings share it,
-      // so "true north" is consistent across rings. We can rotate the whole
-      // ClockSystem group later if you want 12 to be +Z, etc.
       const angle = t * Math.PI * 2;
 
       const x = Math.cos(angle) * radius;
@@ -297,76 +333,87 @@ class RingPoints {
   }
 
   public updateFill(
-    headAngle: number,
-    fillFraction: number, // currently unused for tail length
-    intensityScale: number = 1,
-    mode: ClockColorMode = "classic",
-  ): void {
-    const tau = Math.PI * 2;
+  headAngle: number,
+  _fillFraction: number,
+  intensityScale: number = 1,
+  presenceLevel: number = 0,
+  mode: ClockColorMode = "classic",
+): void {
+  const tau = Math.PI * 2;
 
-    const tailArc = Math.max(this.tailLengthFraction * tau, 1e-4);
+  // Normalize headAngle to [0, TAU)
+  let head = headAngle % tau;
+  if (head < 0) head += tau;
 
-    let head = headAngle % tau;
-    if (head < 0) head += tau;
+  const presence = THREE.MathUtils.clamp(presenceLevel, 0, 1);
+  const safeIntensityScale = Math.max(0, intensityScale);
 
-    const baseR = this.baseColor.r;
-    const baseG = this.baseColor.g;
-    const baseB = this.baseColor.b;
+  // Minimum comet tail arc (baseline)
+  const minTailArc = Math.max(this.tailLengthFraction * tau, 1e-4);
 
-    const colors = this.colors;
-    const angles = this.angles;
-    const count = angles.length;
+  // Single-arc model:
+  // - presence = 1 => start at 0 (12 o'clock), end at head
+  // - presence = 0 => start at (head - minTailArc), end at head
+  // We slide the start between those two.
+  let startAtPresence0 = head - minTailArc; // may go negative
+  // Wrap start into [0, TAU)
+  startAtPresence0 = (startAtPresence0 % tau + tau) % tau;
 
-    const safeIntensityScale = Math.max(0, intensityScale);
+  // start angle interpolates from "tail behind head" to "12 o'clock"
+  // Presence 0 -> start = head - minTailArc
+  // Presence 1 -> start = 0
+  const start = THREE.MathUtils.lerp(startAtPresence0, 0, presence);
 
-    // ✅ C-2: Epsilon to prevent boundary “dot popping”
-    const EPS = 1e-6;
+  // Arc length from start -> head along the forward direction (in [0, TAU))
+  let arcLen = (head - start + tau) % tau;
 
-    for (let i = 0; i < count; i++) {
-      const angle = angles[i];
+  // Safety: ensure we always draw at least a tiny arc so the head dot exists
+  arcLen = Math.max(arcLen, 1e-4);
 
-      let delta = head - angle;
-      delta = (delta + tau) % tau;
+  const baseR = this.baseColor.r;
+  const baseG = this.baseColor.g;
+  const baseB = this.baseColor.b;
 
-      let intensity = 0;
+  const colors = this.colors;
+  const angles = this.angles;
+  const count = angles.length;
 
-      if (delta >= 0 && delta <= tailArc + EPS) {
-        const t = 1 - delta / tailArc;
+  const EPS = 1e-6;
 
-        // Tail intensity floor so the oldest dots (e.g. 12/1 on hour ring)
-        // don’t fade to invisibility.
-        const TAIL_FLOOR = 0.14; // try 0.08–0.22
+  for (let i = 0; i < count; i++) {
+    const angle = angles[i];
 
-        const shaped = Math.pow(t, this.falloffPower);
-        intensity = TAIL_FLOOR + (1 - TAIL_FLOOR) * shaped;
-      }
+    // deltaBack = how far back from head this point is, traveling backward along the arc
+    let deltaBack = head - angle;
+    deltaBack = (deltaBack + tau) % tau;
 
-      intensity *= safeIntensityScale;
-      if (intensity > 1) intensity = 1;
+    let intensity = 0;
 
-      const idx = i * 3;
+    // Lit if the point lies within the single active arc [start..head]
+    if (deltaBack >= 0 && deltaBack <= arcLen + EPS) {
+      // t = 0 at the oldest part of arc, 1 at head
+      const t = 1 - deltaBack / arcLen;
 
-      colors[idx] = baseR * intensity;
-      colors[idx + 1] = baseG * intensity;
-      colors[idx + 2] = baseB * intensity;
+      // Keep oldest visible a bit (especially helps hour ring)
+      const TAIL_FLOOR = 0.14;
 
-      // --- Rainbow / Vinyl modes (EXPERIMENTAL, COMMENTED OUT) ---
-      //
-      // if (mode === "rainbow" || mode === "vinyl") {
-      //   let hue = angle / tau;
-      //   if (mode === "vinyl") {
-      //     hue += 0.25;
-      //     hue %= 1.0;
-      //   }
-      //   this.tempColor.setHSL(hue, 0.7, 0.5);
-      //   colors[idx] = this.tempColor.r * intensity;
-      //   colors[idx + 1] = this.tempColor.g * intensity;
-      //   colors[idx + 2] = this.tempColor.b * intensity;
-      // }
+      const shaped = Math.pow(t, this.falloffPower);
+      intensity = TAIL_FLOOR + (1 - TAIL_FLOOR) * shaped;
     }
 
-    (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+    intensity *= safeIntensityScale;
+    if (intensity > 1) intensity = 1;
+
+    const idx = i * 3;
+    colors[idx] = baseR * intensity;
+    colors[idx + 1] = baseG * intensity;
+    colors[idx + 2] = baseB * intensity;
+
+    void mode;
   }
+
+  (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+}
 
   public dispose(): void {
     this.geometry.dispose();

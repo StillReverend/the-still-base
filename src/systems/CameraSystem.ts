@@ -78,8 +78,10 @@ export class CameraSystem {
     this.target = new THREE.Vector3(0, 0, 0);
     this.options = { ...DEFAULT_OPTIONS };
 
-    // Initial camera placement: slightly above and back
-    this.spherical.set(12, Math.PI / 3, 0); // radius, phi, theta
+    const radius = 12;
+    const phi = Math.PI / 3;  // MUST be positive; < PI/2 = above the plane
+    const theta = Math.PI;    // -Z
+    this.spherical.set(radius, phi, theta);
     this.updateCameraFromSpherical();
 
     this.registerBusHandlers();
