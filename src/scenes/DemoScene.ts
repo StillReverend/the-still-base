@@ -28,6 +28,9 @@ import type { CorePhase } from "../systems/CoreSystem";
 import { CoreSystem } from "../systems/CoreSystem";
 import { ClockSystem } from "../systems/ClockSystem";
 
+// P05 (math-only) Regions
+import { RegionSystem } from "../systems/RegionSystem";
+
 export class DemoScene implements SceneController {
   public readonly name: SceneName = "DemoScene";
   public readonly scene = new THREE.Scene();
@@ -42,6 +45,30 @@ export class DemoScene implements SceneController {
   private rimLight: THREE.DirectionalLight | null = null;
 
   private elapsed = 0;
+
+  // ----------------------------------------------------------
+  // DEV: Region wireframe overlay
+  // ----------------------------------------------------------
+  private regionSystem: RegionSystem | null = null;
+  private regionDebugRoot: THREE.Object3D | null = null;
+  private regionDebugDisposables: Array<THREE.BufferGeometry | THREE.Material> =
+    [];
+
+  // NOTE:
+  // We intentionally keep the event handler as a bound class property so
+  // removeEvent/off patterns stay simple later (if your EventBus supports off()).
+  private onToggleRegions = (): void => {
+    if (!this.regionDebugRoot) return;
+
+    this.regionDebugRoot.visible = !this.regionDebugRoot.visible;
+
+    if (import.meta.env.DEV) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[DemoScene] Region overlay ${this.regionDebugRoot.visible ? "ON" : "OFF"}`,
+      );
+    }
+  };
 
   // ----------------------------------------------------------
   // init()
@@ -60,6 +87,15 @@ export class DemoScene implements SceneController {
     this.buildLights();
     this.buildCoreAndClock(ctx);
     this.configureCamera(ctx);
+
+    // DEV-only region wireframe overlay
+    if (import.meta.env.DEV) {
+      this.buildRegionWireframeOverlay();
+
+      // Wire DebugOverlay hotkey -> Scene toggle
+      // DebugOverlay emits: "debug:toggle-regions"
+      ctx.bus.on("debug:toggle-regions", this.onToggleRegions);
+    }
   }
 
   // ----------------------------------------------------------
@@ -122,9 +158,6 @@ export class DemoScene implements SceneController {
     // - Slightly under full intensity so we have headroom later.
     // - Distance factor will modulate further each frame.
     this.clock.setGlobalIntensity(0.9);
-
-    // If you ever want to adjust per-ring thickness:
-    // this.clock.setRingThicknessScales(1.0, 1.0, 1.0);
   }
 
   private configureCamera(ctx: SceneContext): void {
@@ -141,6 +174,125 @@ export class DemoScene implements SceneController {
 
     camera.position.set(x, y, z);
     camera.lookAt(0, 0, 0);
+  }
+
+  // ----------------------------------------------------------
+  // DEV: Region wireframe overlay (spokes + rings)
+  // ----------------------------------------------------------
+
+  private buildRegionWireframeOverlay(): void {
+    // Keep this completely optional and self-contained.
+    // No impact on gameplay systems.
+    this.regionSystem = new RegionSystem();
+
+    const root = new THREE.Object3D();
+    root.name = "RegionWireframeOverlay";
+
+    // Slight lift so lines don’t fight with any future ground plane
+    const y = 0.02;
+
+    // --- Universe/System scale rules ---
+    // UniverseRadius = current calendar year (2025 now, +1 each year)
+    // SystemRadius = "edge of content" for now (authored space boundary)
+    //
+    // Notes:
+    // - Keep these DEV-only for now; later we can promote to Config as a source of truth.
+    const universeRadius = new Date().getFullYear(); // e.g., 2025
+    const systemRadius = 1979;
+
+    // Region spokes should reach to the SystemRadius (content boundary),
+    // not the UniverseRadius (which is mostly outer-dark/void).
+    const spokeRadius = systemRadius;
+
+    const regions = this.regionSystem.getRegions();
+    const count = regions.length;
+
+    // Matches RegionSystem wedge layout: evenly spaced around Y
+    const wedgeSize = (Math.PI * 2) / count;
+
+    // Spokes: wedge boundaries at angles 0, wedge, 2*wedge...
+    for (let i = 0; i < count; i++) {
+      const angle = i * wedgeSize;
+      const x = Math.cos(angle) * spokeRadius;
+      const z = Math.sin(angle) * spokeRadius;
+
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute([0, y, 0, x, y, z], 3),
+      );
+
+      // Color-coded by region bias hue (purely for dev legibility)
+      const hueDeg = regions[i].colorBias.hue;
+      const c = new THREE.Color();
+      c.setHSL(((hueDeg % 360) + 360) % 360 / 360, 0.9, 0.6);
+
+      const mat = new THREE.LineBasicMaterial({
+        color: c,
+        transparent: true,
+        opacity: 0.75,
+        depthTest: true,
+        depthWrite: false,
+      });
+
+      const line = new THREE.Line(geom, mat);
+      line.name = `RegionBoundary_${regions[i].id}`;
+
+      root.add(line);
+      this.regionDebugDisposables.push(geom, mat);
+    }
+
+    // Helper: add a ring (Line) at a given radius.
+    const addRing = (radius: number, name: string, opacity: number): void => {
+      const ringSegments = 192;
+      const ringPts: number[] = [];
+
+      for (let s = 0; s <= ringSegments; s++) {
+        const t = s / ringSegments;
+        const a = t * Math.PI * 2;
+        ringPts.push(Math.cos(a) * radius, y, Math.sin(a) * radius);
+      }
+
+      const ringGeom = new THREE.BufferGeometry();
+      ringGeom.setAttribute(
+        "position",
+        new THREE.Float32BufferAttribute(ringPts, 3),
+      );
+
+      const ringMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(1, 1, 1),
+        transparent: true,
+        opacity,
+        depthTest: true,
+        depthWrite: false,
+      });
+
+      const ring = new THREE.Line(ringGeom, ringMat);
+      ring.name = name;
+
+      root.add(ring);
+      this.regionDebugDisposables.push(ringGeom, ringMat);
+    };
+
+    // Comfort rings (small scale references)
+    addRing(50, "DevRing_50", 0.14);
+    addRing(100, "DevRing_100", 0.14);
+    addRing(250, "DevRing_250", 0.14);
+    addRing(500, "DevRing_500", 0.14);
+
+    // System boundary ring (content edge)
+    addRing(systemRadius, `SystemRadius_${systemRadius}`, 0.25);
+
+    // Universe boundary ring (legal edge of existence this year)
+    addRing(universeRadius, `UniverseRadius_${universeRadius}`, 0.18);
+
+    this.scene.add(root);
+    this.regionDebugRoot = root;
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[DemoScene] Region overlay enabled. SystemRadius=${systemRadius}, UniverseRadius=${universeRadius}`,
+    );
   }
 
   // ----------------------------------------------------------
@@ -190,6 +342,23 @@ export class DemoScene implements SceneController {
       // eslint-disable-next-line no-console
       console.log("[DemoScene] dispose");
     }
+
+    // DEV: remove region overlay + dispose resources
+    if (this.regionDebugRoot) {
+      this.scene.remove(this.regionDebugRoot);
+      this.regionDebugRoot = null;
+    }
+    for (const d of this.regionDebugDisposables) {
+      d.dispose();
+    }
+    this.regionDebugDisposables = [];
+    this.regionSystem = null;
+
+    // NOTE:
+    // If your EventBus later supports an .off() API, we should unregister
+    // ctx.bus.off("debug:toggle-regions", this.onToggleRegions) here.
+    // For now, DemoScene persists in the initialized cache, so the handler
+    // remains valid. (No harm, and it keeps toggling working reliably.)
 
     // Clock first (it’s a child of core)
     if (this.clock) {

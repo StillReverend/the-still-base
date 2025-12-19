@@ -39,8 +39,8 @@ export interface CameraSystemDeps {
 
 // Tuned down for smoother, slower feel
 const DEFAULT_OPTIONS: CameraRigOptions = {
-  minDistance: 10,
-  maxDistance: 500,
+  minDistance: 46,
+  maxDistance: 1979,
   minPolarAngle: 0.1,           // don't let the camera go exactly over the pole
   maxPolarAngle: Math.PI - 0.1, // don't flip upside down
   enableDamping: true,
@@ -74,7 +74,6 @@ export class CameraSystem {
     this.camera = deps.camera;
     this.bus = deps.bus;
     this.config = deps.config;
-
     this.target = new THREE.Vector3(0, 0, 0);
     this.options = { ...DEFAULT_OPTIONS };
 
@@ -83,6 +82,12 @@ export class CameraSystem {
     const theta = Math.PI;    // -Z
     this.spherical.set(radius, phi, theta);
     this.updateCameraFromSpherical();
+
+    // Clipping planes: must cover SystemRadius / UniverseRadius visibility.
+    // Keep near reasonably large to preserve depth precision at large far distances.
+    this.camera.near = 0.5;
+    this.camera.far = 3500;
+    this.camera.updateProjectionMatrix();
 
     this.registerBusHandlers();
   }

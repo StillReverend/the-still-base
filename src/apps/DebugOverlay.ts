@@ -24,6 +24,16 @@ export class DebugOverlay {
   private readonly hasMemoryAPI: boolean;
   private lastTelemetry: CameraTelemetryOverlay | null = null;
 
+  private onKeyDown = (ev: KeyboardEvent): void => {
+    const key = ev.key.toLowerCase();
+
+    // DEV Hotkeys
+    //  - R: toggle Region wireframe
+    if (key === "r") {
+      this.bus.emit("debug:toggle-regions", {});
+    }
+  };
+
   constructor(camera: THREE.PerspectiveCamera, bus: EventBus) {
     this.camera = camera;
     this.bus = bus;
@@ -43,6 +53,11 @@ export class DebugOverlay {
     this.bus.on<CameraTelemetryOverlay>("camera:telemetry", (payload) => {
       this.lastTelemetry = payload;
     });
+
+    // DEV-only hotkeys live here so toggles are global
+    if (import.meta.env.DEV) {
+      window.addEventListener("keydown", this.onKeyDown);
+    }
   }
 
   update(dt: number): void {
@@ -80,10 +95,14 @@ export class DebugOverlay {
       memLine,
       `pos: ${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}, ${pos.z.toFixed(2)}`,
       `dir: ${dir.x.toFixed(3)}, ${dir.y.toFixed(3)}, ${dir.z.toFixed(3)}`,
+      "",
+      "hotkeys:",
+      "  R: toggle regions",
     ];
 
     if (this.lastTelemetry) {
       lines.push(
+        "",
         `dist: ${this.lastTelemetry.distance.toFixed(2)}`,
         `az: ${this.lastTelemetry.azimuthAngle.toFixed(3)}`,
         `phi: ${this.lastTelemetry.polarAngle.toFixed(3)}`
@@ -94,6 +113,10 @@ export class DebugOverlay {
   }
 
   dispose(): void {
+    if (import.meta.env.DEV) {
+      window.removeEventListener("keydown", this.onKeyDown);
+    }
+
     if (this.container.parentElement) {
       this.container.parentElement.removeChild(this.container);
     }

@@ -85,13 +85,13 @@ export class ClockSystem {
     const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.01, 0.0, 1.0);
     const maxTail = THREE.MathUtils.clamp(config.maxTailLength ?? 0.97, 0.0, 1.0);
 
-    const baseRadius = 3.1;
-    const gap = 0.6;
+    const baseRadius = 10.0;
+    const gap = 0.79;
 
     // Hour ring (12)
     this.hourRing = new RingPoints({
       radius: baseRadius + gap * 7,
-      thickness: 0.31,
+      thickness: 0.4,
       points: this.pointsPerRing,
       falloffFactor: 0.35,
       minTailLength: minTail + 0.1,
@@ -103,7 +103,7 @@ export class ClockSystem {
     // Minute ring (60)
     this.minuteRing = new RingPoints({
       radius: baseRadius + gap * 2.5,
-      thickness: 0.17,
+      thickness: 0.3,
       points: this.pointsPerRing * 5,
       falloffFactor: 0.35,
       minTailLength: minTail + 0.01,
@@ -115,7 +115,7 @@ export class ClockSystem {
     // Second ring (360)
     this.secondRing = new RingPoints({
       radius: baseRadius,
-      thickness: 0.13,
+      thickness: 0.2,
       points: this.pointsPerRing * 30,
       falloffFactor: 0.35,
       minTailLength: minTail,
