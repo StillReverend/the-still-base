@@ -82,7 +82,7 @@ export class ClockSystem {
 
     this.pointsPerRing = config.pointsPerRing ?? 12;
 
-    const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.031, 0.0, 1.0);
+    const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.01, 0.0, 1.0);
     const maxTail = THREE.MathUtils.clamp(config.maxTailLength ?? 0.97, 0.0, 1.0);
 
     const baseRadius = 3.1;
@@ -94,7 +94,7 @@ export class ClockSystem {
       thickness: 0.31,
       points: this.pointsPerRing,
       falloffFactor: 0.35,
-      minTailLength: minTail,
+      minTailLength: minTail + 0.1,
       maxTailLength: maxTail,
       baseColor: new THREE.Color(0xd4af37),
     });
@@ -106,7 +106,7 @@ export class ClockSystem {
       thickness: 0.17,
       points: this.pointsPerRing * 5,
       falloffFactor: 0.35,
-      minTailLength: minTail,
+      minTailLength: minTail + 0.01,
       maxTailLength: maxTail,
       baseColor: new THREE.Color(0x7fd0ff),
     });
