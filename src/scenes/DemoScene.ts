@@ -5,7 +5,7 @@
 // Temporary "main world" scene for P03.
 // Responsibilities:
 //  - Host the CoreSystem (black hole)
-//  - Host the ClockSystem (H/M/S neon rings) parented to core
+//  - CoreSystem owns clock rings; DemoScene modulates distance factor
 //  - Provide a simple lighting setup
 //  - Position the camera in a good starting orbit
 //  - Drive distance-based brightness for the clock rings
@@ -26,7 +26,6 @@ import type {
 
 import type { CorePhase } from "../systems/CoreSystem";
 import { CoreSystem } from "../systems/CoreSystem";
-import { ClockSystem } from "../systems/ClockSystem";
 
 // P05 (math-only) Regions
 import { RegionSystem } from "../systems/RegionSystem";
@@ -38,7 +37,6 @@ export class DemoScene implements SceneController {
   private ctx: SceneContext | null = null;
 
   private core: CoreSystem | null = null;
-  private clock: ClockSystem | null = null;
 
   private ambientLight: THREE.AmbientLight | null = null;
   private keyLight: THREE.DirectionalLight | null = null;
@@ -141,23 +139,6 @@ export class DemoScene implements SceneController {
 
     const coreRoot = this.core.getRoot();
     this.scene.add(coreRoot);
-
-    // --- Clock ---
-    this.clock = new ClockSystem({
-      // using defaults: 12/60/360 points for H/M/S
-      // tailLength can be tuned later if needed
-    });
-
-    const clockRoot = this.clock.getRoot();
-    clockRoot.name = "ClockSystemRoot";
-
-    // Parent the clock under the core so they feel like one unit.
-    coreRoot.add(clockRoot);
-
-    // Set initial visual baseline for P03:
-    // - Slightly under full intensity so we have headroom later.
-    // - Distance factor will modulate further each frame.
-    this.clock.setGlobalIntensity(0.9);
   }
 
   private configureCamera(ctx: SceneContext): void {
@@ -295,27 +276,21 @@ export class DemoScene implements SceneController {
     );
   }
 
-  // ----------------------------------------------------------
+    // ----------------------------------------------------------
   // update()
   // ----------------------------------------------------------
   public update(delta: number): void {
     this.elapsed += delta;
 
-    if (this.core) {
-      this.core.update(delta);
-    }
-
     const camera = this.ctx?.camera ?? null;
 
-    if (this.clock && camera) {
+    // Drive distance-based brightness for clock rings (CoreSystem owns clock)
+    if (this.core && camera) {
       // Distance from camera to core (assumed at world origin).
       const distance = camera.position.length();
 
       // Map distance into a brightness factor.
       // Closer to the core => brighter rings.
-      //
-      // minDist: inside this, clamp to max brightness
-      // maxDist: beyond this, clamp to min brightness
       const minDist = 6;
       const maxDist = 40;
 
@@ -329,8 +304,11 @@ export class DemoScene implements SceneController {
       // When t=1 (far), factor ~0.35 (dim but visible).
       const distanceFactor = THREE.MathUtils.lerp(1.2, 0.35, t);
 
-      this.clock.setDistanceFactor(distanceFactor);
-      this.clock.update(delta);
+      this.core.setClockDistanceFactor(distanceFactor);
+    }
+
+    if (this.core) {
+      this.core.update(delta);
     }
   }
 
@@ -359,15 +337,6 @@ export class DemoScene implements SceneController {
     // ctx.bus.off("debug:toggle-regions", this.onToggleRegions) here.
     // For now, DemoScene persists in the initialized cache, so the handler
     // remains valid. (No harm, and it keeps toggling working reliably.)
-
-    // Clock first (it’s a child of core)
-    if (this.clock) {
-      if (this.core) {
-        this.core.getRoot().remove(this.clock.getRoot());
-      }
-      this.clock.dispose();
-      this.clock = null;
-    }
 
     if (this.core) {
       this.scene.remove(this.core.getRoot());

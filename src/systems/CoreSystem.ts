@@ -142,6 +142,10 @@ export class CoreSystem {
     this.time.update(dt);
   }
 
+  public setClockDistanceFactor(distanceFactor: number): void {
+  this.clock.setDistanceFactor(distanceFactor);
+}
+
   public dispose(): void {
     // Unhook debug listeners if this system gets torn down
     this.presence.disableDebugHotkeys();
