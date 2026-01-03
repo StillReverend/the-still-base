@@ -91,7 +91,7 @@ export class CoreSystem {
 
   private buildCoreBody(): void {
     // Base radius for the black hole body in P03
-    const radius = 7.9;
+    const radius = 3.1;
 
     // Core sphere (black hole placeholder, dark with subtle spec)
     const coreGeom = new THREE.SphereGeometry(radius, 64, 64);

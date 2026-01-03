@@ -85,7 +85,7 @@ export class ClockSystem {
     const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.01, 0.0, 1.0);
     const maxTail = THREE.MathUtils.clamp(config.maxTailLength ?? 0.97, 0.0, 1.0);
 
-    const baseRadius = 10.0;
+    const baseRadius = 4.0;
     const gap = 0.79;
 
     // Hour ring (12)

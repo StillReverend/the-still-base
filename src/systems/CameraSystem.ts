@@ -39,7 +39,7 @@ export interface CameraSystemDeps {
 
 // Tuned down for smoother, slower feel
 const DEFAULT_OPTIONS: CameraRigOptions = {
-  minDistance: 46,
+  minDistance: 10,
   maxDistance: 1979,
   minPolarAngle: 0.1,           // don't let the camera go exactly over the pole
   maxPolarAngle: Math.PI - 0.1, // don't flip upside down
