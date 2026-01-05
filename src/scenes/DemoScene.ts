@@ -131,7 +131,7 @@ export class DemoScene implements SceneController {
     });
 
     // Start in black hole phase (guided experience default)
-    const phase: CorePhase = "black_hole";
+    const phase: CorePhase = "solar";
     this.core.setPhase(phase);
 
     // At P03, shrinkLevel = 0 (largest core)

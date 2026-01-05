@@ -9,6 +9,7 @@ import type { SceneContext, SceneController, SceneName } from "./SceneTypes";
 import { DebugOverlay } from "./DebugOverlay";
 import { CameraSystem } from "../systems/CameraSystem";
 import { ControlSystem } from "../systems/ControlSystem";
+import { PostFXSystem } from "../systems/PostFXSystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -30,6 +31,7 @@ export class Engine {
   private readonly save: SaveManager;
 
   private readonly renderer: THREE.WebGLRenderer;
+  private readonly postFX: PostFXSystem;
   private readonly camera: THREE.PerspectiveCamera;
   private readonly cameraSystem: CameraSystem;
   private readonly controlSystem: ControlSystem;
@@ -59,7 +61,7 @@ export class Engine {
     this.camera = new THREE.PerspectiveCamera(
       60,
       window.innerWidth / window.innerHeight,
-      0.1,
+      1.0,
       1000,
     );
 
@@ -89,6 +91,28 @@ export class Engine {
     // Initial scene
     const initialScene = deps.initialSceneFactory();
     this.sceneManager.switchSceneImmediately(initialScene);
+
+    // PostFX pipeline (composer + bloom). Safe to add now.
+    // We initialize it with the current scene, and we’ll keep it updated in the loop.
+    const current = this.sceneManager.getCurrentScene();
+    this.postFX = new PostFXSystem({
+      renderer: this.renderer,
+      scene: current?.scene ?? new THREE.Scene(),
+      camera: this.camera,
+      width: window.innerWidth,
+      height: window.innerHeight,
+      pixelRatio: this.config.pixelRatio,
+      // Optional: start subtle; tune later
+      settings: {
+        enabled: true,
+        bloom: {
+          enabled: true,
+          strength: 1.05,
+          radius: 0.55,
+          threshold: 0.12,
+        },
+      },
+    });
 
     // Listen for scene switch events
     this.bus.on<SceneSwitchPayload>("scene:switch", (payload) => {
@@ -142,7 +166,9 @@ export class Engine {
 
     const current = this.sceneManager.getCurrentScene();
     if (current) {
-      this.renderer.render(current.scene, this.camera);
+      // Keep PostFX aimed at the active scene
+      this.postFX.setTargets(current.scene, this.camera);
+      this.postFX.render();
     }
 
     requestAnimationFrame(this.loop);
@@ -153,6 +179,7 @@ export class Engine {
     const height = window.innerHeight;
 
     this.renderer.setSize(width, height, false);
+    this.postFX.resize(width, height, this.config.pixelRatio);
 
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
@@ -168,6 +195,7 @@ export class Engine {
     }
 
     this.controlSystem.dispose();
+    this.postFX.dispose();
     this.renderer.dispose();
   }
 }

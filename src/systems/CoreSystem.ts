@@ -27,6 +27,10 @@ import { ClockSystem } from "./ClockSystem";
 import { TimeSystem } from "./TimeSystem";
 import { PresenceSystem } from "./PresenceSystem";
 
+// P03.1 bolt-on visuals
+import type { CoreStateName } from "./CoreStates";
+import { CoreStates } from "./CoreStates";
+
 export type CorePhase = "black_hole" | "solar" | "lunar";
 
 export interface CoreSystemDeps {
@@ -50,6 +54,9 @@ export class CoreSystem {
   private readonly time: TimeSystem;
   private readonly presence: PresenceSystem;
 
+  // P03.1: bolt-on core visuals (blackHole / sol / luna)
+  private coreStates: CoreStates | null = null;
+
   private phase: CorePhase = "black_hole";
   /** 0..1 where 0 = largest (start of guided) and 1 = fully shrunk. */
   private shrinkLevel = 0;
@@ -67,6 +74,17 @@ export class CoreSystem {
     this.root.add(this.coreGroup);
 
     this.buildCoreBody();
+
+    // P03.1: Create bolt-on states and hide placeholders.
+    // Keep placeholders alive for now so we can roll back easily.
+    this.coreStates = new CoreStates({
+      parent: this.coreGroup,
+      radius: 7.9,
+      initialState: this.mapPhaseToState(this.phase),
+    });
+
+    if (this.coreSphere) this.coreSphere.visible = false;
+    if (this.auraSphere) this.auraSphere.visible = false;
 
     this.clock = new ClockSystem();
     this.time = new TimeSystem();
@@ -121,6 +139,20 @@ export class CoreSystem {
     this.coreGroup.add(this.auraSphere);
   }
 
+  private mapPhaseToState(phase: CorePhase): CoreStateName {
+    // CoreStates uses: blackHole / sol / luna
+    // CoreSystem phase uses: black_hole / solar / lunar
+    switch (phase) {
+      case "solar":
+        return "sol";
+      case "lunar":
+        return "luna";
+      case "black_hole":
+      default:
+        return "blackHole";
+    }
+  }
+
   // ----------------------------------------------------------
   // Public API
   // ----------------------------------------------------------
@@ -130,25 +162,31 @@ export class CoreSystem {
   }
 
   public update(dt: number): void {
-    // Subtle slow rotation so core is always gently alive
-    // const spin = dt * 0.06;
-    // this.root.rotation.y += spin;
-
     // Presence should drive clock *before* clock renders this frame.
     this.presence.update(dt);
     this.clock.setRingPresenceLevels(this.presence.getClockPresenceLevels());
+
+    // P03.1: drive core visuals (audio stubbed until AudioSystem exists)
+    if (this.coreStates) {
+      this.coreStates.update(dt, { energy: 0 });
+    }
 
     this.clock.update(dt);
     this.time.update(dt);
   }
 
   public setClockDistanceFactor(distanceFactor: number): void {
-  this.clock.setDistanceFactor(distanceFactor);
-}
+    this.clock.setDistanceFactor(distanceFactor);
+  }
 
   public dispose(): void {
     // Unhook debug listeners if this system gets torn down
     this.presence.disableDebugHotkeys();
+
+    if (this.coreStates) {
+      this.coreStates.dispose();
+      this.coreStates = null;
+    }
 
     if (this.coreSphere) {
       this.coreGroup.remove(this.coreSphere);
@@ -191,15 +229,16 @@ export class CoreSystem {
 
   /**
    * Switch between black_hole / solar / lunar phases.
-   * In P03 we just remember the phase; later we will swap
-   * materials, colors, audio, etc.
+   * In P03 we just remember the phase; P03.1 forwards to CoreStates.
    */
   public setPhase(phase: CorePhase): void {
     this.phase = phase;
 
-    // Stub: in future, adjust materials by phase.
-    // e.g. black hole: dark core, blue aura
-    //      solar: bright emissive gold, warm aura
-    //      lunar: desaturated, cooler colors
+    if (this.coreStates) {
+      this.coreStates.setState(this.mapPhaseToState(phase));
+    }
+
+    // Stub: in future, adjust materials by phase beyond CoreStates
+    // e.g. audio behavior, particles, etc.
   }
 }
