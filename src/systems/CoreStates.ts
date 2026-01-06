@@ -285,6 +285,178 @@ function createSolPlasmaMaterial(): THREE.ShaderMaterial {
   });
 }
 
+function createLunaRegolithMaterial(): THREE.ShaderMaterial {
+  const uniforms = {
+    uTime: { value: 0 },
+    uEnergy: { value: 0 }, // 0..1
+    uDetail: { value: 1.0 }, // 0..2-ish
+
+    // IMPORTANT: Darker base so bloom doesn’t flatten everything to “white ball”.
+    uBase: { value: new THREE.Color(0x8f97a6) },
+    uShadow: { value: new THREE.Color(0x2b303a) },
+
+    // Rim should be subtle with bloom
+    uRim: { value: new THREE.Color(0xe6ecff) },
+    uRimStrength: { value: 0.05 },
+
+    uCraterScale: { value: 2.10 },
+    uCraterDepth: { value: 1.0 },
+    uLightDir: { value: new THREE.Vector3(0.25, 0.8, 0.35).normalize() },
+  };
+
+  const vertexShader = /* glsl */ `
+    varying vec3 vN;
+    varying vec3 vWPos;
+    varying vec3 vObjPos;
+
+    void main() {
+      vN = normalize(normalMatrix * normal);
+      vec4 wPos = modelMatrix * vec4(position, 1.0);
+      vWPos = wPos.xyz;
+      vObjPos = position;
+      gl_Position = projectionMatrix * viewMatrix * wPos;
+    }
+  `;
+
+  const fragmentShader = /* glsl */ `
+    precision highp float;
+
+    uniform float uTime;
+    uniform float uEnergy;
+    uniform float uDetail;
+    uniform vec3  uBase;
+    uniform vec3  uShadow;
+    uniform vec3  uRim;
+    uniform float uRimStrength;
+    uniform float uCraterScale;
+    uniform float uCraterDepth;
+    uniform vec3  uLightDir;
+
+    varying vec3 vN;
+    varying vec3 vWPos;
+    varying vec3 vObjPos;
+
+    float hash(vec3 p) {
+      p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+      p *= 17.0;
+      return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+    }
+
+    float valueNoise(vec3 p) {
+      vec3 i = floor(p);
+      vec3 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+
+      float n000 = hash(i + vec3(0.0, 0.0, 0.0));
+      float n100 = hash(i + vec3(1.0, 0.0, 0.0));
+      float n010 = hash(i + vec3(0.0, 1.0, 0.0));
+      float n110 = hash(i + vec3(1.0, 1.0, 0.0));
+      float n001 = hash(i + vec3(0.0, 0.0, 1.0));
+      float n101 = hash(i + vec3(1.0, 0.0, 1.0));
+      float n011 = hash(i + vec3(0.0, 1.0, 1.0));
+      float n111 = hash(i + vec3(1.0, 1.0, 1.0));
+
+      float nx00 = mix(n000, n100, f.x);
+      float nx10 = mix(n010, n110, f.x);
+      float nx01 = mix(n001, n101, f.x);
+      float nx11 = mix(n011, n111, f.x);
+
+      float nxy0 = mix(nx00, nx10, f.y);
+      float nxy1 = mix(nx01, nx11, f.y);
+
+      return mix(nxy0, nxy1, f.z);
+    }
+
+    float fbm(vec3 p) {
+      float sum = 0.0;
+      float amp = 0.55;
+      float freq = 1.0;
+      for (int i = 0; i < 5; i++) {
+        sum += amp * valueNoise(p * freq);
+        freq *= 2.02;
+        amp *= 0.5;
+      }
+      return sum;
+    }
+
+    float craterField(vec3 p, float scale, float detail) {
+      vec3 q = normalize(p) * scale;
+
+      float n1 = fbm(q * (1.20 + detail * 0.35));
+      float n2 = fbm(q * (2.35 + detail * 0.65) + vec3(3.1, 1.7, -2.2));
+
+      float basins = smoothstep(0.38, 0.78, n1);
+      float rims   = smoothstep(0.62, 0.88, n2) - smoothstep(0.88, 0.985, n2);
+
+      float field = basins * 0.85 + rims * 0.40;
+      return clamp(field, 0.0, 1.0);
+    }
+
+    void main() {
+      vec3 N = normalize(vN);
+      vec3 V = normalize(cameraPosition - vWPos);
+
+      float e = clamp(uEnergy, 0.0, 1.0);
+      float detail = clamp(uDetail, 0.0, 2.0);
+
+      // Drift to avoid “printed texture”
+      float t = uTime * 0.03;
+      vec3 p = vObjPos + vec3(t, -t, t * 0.7);
+
+      float cr = craterField(p, uCraterScale, detail);
+      cr = pow(cr, 1.15);
+
+      // Strong separation: pits and rims
+      float pit = smoothstep(0.18, 0.78, cr);
+      float rim = smoothstep(0.55, 0.90, cr) - smoothstep(0.90, 0.985, cr);
+
+      // --- ALBEDO (more aggressive) ---
+      // pits go much darker; rims get a modest lift
+      vec3 col = mix(uBase, uShadow, pit * (1.10 * uCraterDepth));
+      col += uBase * (rim * (0.12 * uCraterDepth));
+
+      // --- MICRO CONTRAST (cheap grit) ---
+      float grit = fbm(normalize(p) * (9.0 + detail * 3.0) + vec3(9.3, 1.2, 4.7));
+      grit = pow(grit, 1.4);
+      col *= (0.88 + 0.22 * grit);
+
+      // --- LIGHTING with floor ---
+      vec3 L = normalize(uLightDir);
+      float ndl = max(dot(N, L), 0.0);
+
+      float ambient = 0.42; // higher floor keeps body visible
+      float diff = ambient + (1.0 - ambient) * ndl;
+
+      // pits catch less light, rims slightly more
+      diff *= mix(1.0, 0.55, pit * uCraterDepth);
+      diff *= (1.0 + rim * (0.20 * uCraterDepth));
+
+      col *= mix(0.82, 1.20, diff);
+
+      // subtle view rim (bloom will amplify)
+      float viewRim = pow(1.0 - max(dot(N, V), 0.0), 2.0);
+      col += uRim * (viewRim * uRimStrength);
+
+      // tiny pulse
+      col *= (1.0 + e * 0.02);
+
+      // bloom-safe soft compression (gentle)
+      col = col / (col + vec3(1.10));
+
+      gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    }
+  `;
+
+  return new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader,
+    fragmentShader,
+    transparent: false,
+    depthWrite: true,
+    depthTest: true,
+  });
+}
+
 // ------------------------------------------------------------
 // Glow + Ring
 // ------------------------------------------------------------
@@ -539,12 +711,8 @@ function createLunaState(radius: number, tuning: CoreStateTuning): StateBundle {
   group.name = "CoreState_luna";
 
   const coreGeom = new THREE.SphereGeometry(radius, 80, 80);
-  const coreMat = new THREE.MeshStandardMaterial({
-    color: 0xcfd3db,
-    emissive: 0x000000,
-    metalness: 0.02,
-    roughness: 0.92,
-  });
+  const coreMat = createLunaRegolithMaterial();
+
   const coreMesh = new THREE.Mesh(coreGeom, coreMat);
   coreMesh.name = "CoreSurface_luna";
   coreMesh.renderOrder = 100;
@@ -565,12 +733,18 @@ function createLunaState(radius: number, tuning: CoreStateTuning): StateBundle {
     group.visible = v;
   };
 
-  const update = (_dt: number, audio: CoreAudioFrame): void => {
-    const energy = clamp01(audio.energy ?? 0);
-    if (realLight) {
-      realLight.intensity = tuning.realLightIntensity * (0.65 + energy * 0.6);
-    }
-  };
+  const update = (dt: number, audio: CoreAudioFrame, quality: CoreQuality): void => {
+  const energy = clamp01(audio.energy ?? 0);
+  const q = clamp01(quality.value);
+
+  coreMat.uniforms.uTime.value += dt;
+  coreMat.uniforms.uEnergy.value = energy;
+  coreMat.uniforms.uDetail.value = 0.75 + q * 1.0;
+
+  if (realLight) {
+    realLight.intensity = tuning.realLightIntensity * (0.65 + energy * 0.6);
+  }
+};
 
   const dispose = (): void => {
     group.remove(coreMesh);
@@ -586,7 +760,7 @@ function createLunaState(radius: number, tuning: CoreStateTuning): StateBundle {
     coreMesh,
     realLight,
     tuning,
-    update: (dt, audio, _quality) => update(dt, audio),
+    update,
     setVisible,
     dispose,
   };

@@ -98,9 +98,13 @@ export class CoreSystem {
     this.root.add(this.clock.getRoot());
     this.root.add(this.time.getRoot());
 
-    // Basic starting rotation so the core is not perfectly aligned
-    this.root.rotation.x = 0.15;
-    this.root.rotation.y = -0.2;
+    // IMPORTANT:
+    // Core root must remain axis-aligned.
+    // Any aesthetic tilt should be applied to visual subgroups,
+    // not the semantic world root (regions, clock, fog depend on this).
+    //this.root.rotation.x = 0.15;
+    //this.root.rotation.y = -0.2;
+    this.root.rotation.set(0, 0, 0);
   }
 
   // ----------------------------------------------------------
