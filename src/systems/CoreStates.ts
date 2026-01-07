@@ -93,12 +93,12 @@ const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
 const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   blackHole: {
-    glowIntensity: 0.0,
-    ringIntensity: 1.0,
-    ringColor: 0x1a1a40,
-    glowColor: 0x9bbcff,
-    enableRealLight: false,
-    realLightIntensity: 0.0,
+    glowIntensity: 0.31,
+    ringIntensity: 1.90, // ← bump slightly for a stronger event horizon
+    ringColor: 0xccccff,
+    glowColor: 0xccccff,
+    enableRealLight: true,
+    realLightIntensity: 0.35,
   },
   sol: {
     glowIntensity: 0.31,
@@ -113,8 +113,8 @@ const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
     ringIntensity: 0.65,
     ringColor: 0xb8c6ff,
     glowColor: 0xe6ecff,
-    enableRealLight: false,
-    realLightIntensity: 0.0,
+    enableRealLight: true,
+    realLightIntensity: 0.35,
   },
 };
 
@@ -458,6 +458,145 @@ function createLunaRegolithMaterial(): THREE.ShaderMaterial {
 }
 
 // ------------------------------------------------------------
+// Black Hole Shader (subtle horizon + swirl, bloom-safe)
+// ------------------------------------------------------------
+
+function createBlackHoleMaterial(): THREE.ShaderMaterial {
+  const uniforms = {
+    uTime: { value: 0 },
+    uEnergy: { value: 0 }, // 0..1 (future audio)
+    uDeep: { value: new THREE.Color(0x02020a) },
+    uTint: { value: new THREE.Color(0x0b0b18) }, // faint blue-violet tint
+    uRim: { value: new THREE.Color(0xd4af37) },  // tiny gold rim echo (ties to Sol)
+    uRimStrength: { value: 0.14 },               // keep modest; bloom will amplify
+    uSwirlStrength: { value: 0.22 },             // subtle “accretion motion” hint
+    uDetail: { value: 1.0 },                     // 0..2-ish
+  };
+
+  const vertexShader = /* glsl */ `
+    varying vec3 vWPos;
+    varying vec3 vObjPos;
+    varying vec3 vWNormal;
+
+    void main() {
+      vec4 wPos = modelMatrix * vec4(position, 1.0);
+      vWPos = wPos.xyz;
+      vObjPos = position;
+      vWNormal = normalize(mat3(modelMatrix) * normal);
+
+      gl_Position = projectionMatrix * viewMatrix * wPos;
+    }
+  `;
+
+  const fragmentShader = /* glsl */ `
+    precision highp float;
+
+    uniform float uTime;
+    uniform float uEnergy;
+    uniform vec3  uDeep;
+    uniform vec3  uTint;
+    uniform vec3  uRim;
+    uniform float uRimStrength;
+    uniform float uSwirlStrength;
+    uniform float uDetail;
+
+    varying vec3 vWPos;
+    varying vec3 vObjPos;
+    varying vec3 vWNormal;
+
+    float hash(vec3 p) {
+      p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+      p *= 17.0;
+      return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+    }
+
+    float valueNoise(vec3 p) {
+      vec3 i = floor(p);
+      vec3 f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+
+      float n000 = hash(i + vec3(0.0, 0.0, 0.0));
+      float n100 = hash(i + vec3(1.0, 0.0, 0.0));
+      float n010 = hash(i + vec3(0.0, 1.0, 0.0));
+      float n110 = hash(i + vec3(1.0, 1.0, 0.0));
+      float n001 = hash(i + vec3(0.0, 0.0, 1.0));
+      float n101 = hash(i + vec3(1.0, 0.0, 1.0));
+      float n011 = hash(i + vec3(0.0, 1.0, 1.0));
+      float n111 = hash(i + vec3(1.0, 1.0, 1.0));
+
+      float nx00 = mix(n000, n100, f.x);
+      float nx10 = mix(n010, n110, f.x);
+      float nx01 = mix(n001, n101, f.x);
+      float nx11 = mix(n011, n111, f.x);
+
+      float nxy0 = mix(nx00, nx10, f.y);
+      float nxy1 = mix(nx01, nx11, f.y);
+
+      return mix(nxy0, nxy1, f.z);
+    }
+
+    float fbm(vec3 p) {
+      float sum = 0.0;
+      float amp = 0.55;
+      float freq = 1.0;
+      for (int i = 0; i < 5; i++) {
+        sum += amp * valueNoise(p * freq);
+        freq *= 2.02;
+        amp *= 0.5;
+      }
+      return sum;
+    }
+
+    void main() {
+      vec3 N = normalize(vWNormal);
+      vec3 V = normalize(cameraPosition - vWPos);
+
+      // Fresnel-like horizon term: 1 at silhouette, 0 facing camera
+      float ndv = clamp(dot(N, V), 0.0, 1.0);
+      float rim = pow(1.0 - ndv, 3.0);
+
+      // Object-space direction
+      vec3 p = normalize(vObjPos);
+
+      // Swirl coordinates: rotate around Y using time
+      float t = uTime;
+      float a = t * 0.22;
+      mat2 rot = mat2(cos(a), -sin(a), sin(a), cos(a));
+      vec3 q = p;
+      q.xz = rot * q.xz;
+
+      float d = mix(0.9, 1.8, clamp(uDetail, 0.0, 2.0) * 0.6);
+      float n = fbm(q * (3.2 * d) + vec3(t * 0.05, -t * 0.03, t * 0.04));
+      n = pow(n, 1.35);
+
+      // Dark body: almost pure void, with faint tinted movement
+      vec3 col = mix(uDeep, uTint, n * (0.18 + uSwirlStrength));
+
+      // Event horizon: a thin bright band near the rim
+      float e = clamp(uEnergy, 0.0, 1.0);
+      float horizon = smoothstep(0.55, 0.98, rim);
+      float band = horizon * (0.10 + e * 0.10);
+
+      col += uRim * band * uRimStrength;
+
+      // Bloom-safe compression: keeps it punchy without blowing out
+      col = col / (col + vec3(1.35));
+
+      gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    }
+  `;
+
+  return new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader,
+    fragmentShader,
+    transparent: false,
+    depthWrite: true,
+    depthTest: true,
+  });
+}
+
+// ------------------------------------------------------------
 // Glow + Ring
 // ------------------------------------------------------------
 
@@ -521,62 +660,160 @@ type Ring = {
 
 function createRing(coreRadius: number): Ring {
   // Ring is a tight band just outside the surface.
-  const innerRadius = coreRadius * 1.01;
   const baseOuterRadius = coreRadius * 1.02;
 
   const geom = new THREE.SphereGeometry(baseOuterRadius, 64, 64);
 
   const mat = new THREE.ShaderMaterial({
-  uniforms: {
-    uColor: { value: new THREE.Color(0xffffff) },
-    uIntensity: { value: 1.0 },
-    uPower: { value: 3.2 },   // rim tightness (higher = thinner)
-    uSoft: { value: 0.85 },   // soften/fatten the rim slightly
-  },
-  vertexShader: /* glsl */ `
-    varying vec3 vWorldPos;
-    varying vec3 vWorldNormal;
+    uniforms: {
+      uColor: { value: new THREE.Color(0xffffff) },
+      uIntensity: { value: 1.0 },
+      uPower: { value: 3.2 },   // rim tightness (higher = thinner)
+      uSoft: { value: 0.85 },   // soften/fatten the rim slightly
 
-    void main() {
-      vec4 wp = modelMatrix * vec4(position, 1.0);
-      vWorldPos = wp.xyz;
-      vWorldNormal = normalize(mat3(modelMatrix) * normal);
+      // NEW: time + subtle lensing wobble + micro doppler tinting
+      uTime: { value: 0.0 },
+      uWobbleStrength: { value: 0.0 },   // 0..~0.06 recommended
+      uWobbleSpeed: { value: 0.7 },      // 0.2..1.2
+      uWobbleScale: { value: 2.1 },      // 1..6
 
-      gl_Position = projectionMatrix * viewMatrix * wp;
-    }
-  `,
-  fragmentShader: /* glsl */ `
-    precision highp float;
+      uDopplerStrength: { value: 0.0 },  // 0..~0.18 recommended
+      uSpinAxis: { value: new THREE.Vector3(0, 1, 0) }, // world-space axis
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vWorldPos;
+      varying vec3 vWorldNormal;
 
-    uniform vec3  uColor;
-    uniform float uIntensity;
-    uniform float uPower;
-    uniform float uSoft;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPos = wp.xyz;
+        vWorldNormal = normalize(mat3(modelMatrix) * normal);
 
-    varying vec3 vWorldPos;
-    varying vec3 vWorldNormal;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      precision highp float;
 
-    void main() {
-      vec3 V = normalize(cameraPosition - vWorldPos);
-      float ndv = clamp(dot(normalize(vWorldNormal), V), 0.0, 1.0);
+      uniform vec3  uColor;
+      uniform float uIntensity;
+      uniform float uPower;
+      uniform float uSoft;
 
-      // Rim term: 1 at silhouette, 0 when facing camera
-      float rim = pow(1.0 - ndv, uPower);
+      uniform float uTime;
+      uniform float uWobbleStrength;
+      uniform float uWobbleSpeed;
+      uniform float uWobbleScale;
 
-      // Soft shaping so it reads like a band, not a harsh line
-      rim = smoothstep(0.0, uSoft, rim);
+      uniform float uDopplerStrength;
+      uniform vec3  uSpinAxis;
 
-      float a = rim * uIntensity;
+      varying vec3 vWorldPos;
+      varying vec3 vWorldNormal;
 
-      gl_FragColor = vec4(uColor, a);
-    }
-  `,
-  transparent: true,
-  depthWrite: false,
-  depthTest: true,                 // keep true so core can occlude the far side
-  blending: THREE.AdditiveBlending,
-  side: THREE.FrontSide,
-});
+      // cheap hashy noise (stable, no textures)
+      float hash(vec3 p) {
+        p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+        p *= 17.0;
+        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+      }
+
+      float valueNoise(vec3 p) {
+        vec3 i = floor(p);
+        vec3 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+
+        float n000 = hash(i + vec3(0.0, 0.0, 0.0));
+        float n100 = hash(i + vec3(1.0, 0.0, 0.0));
+        float n010 = hash(i + vec3(0.0, 1.0, 0.0));
+        float n110 = hash(i + vec3(1.0, 1.0, 0.0));
+        float n001 = hash(i + vec3(0.0, 0.0, 1.0));
+        float n101 = hash(i + vec3(1.0, 0.0, 1.0));
+        float n011 = hash(i + vec3(0.0, 1.0, 1.0));
+        float n111 = hash(i + vec3(1.0, 1.0, 1.0));
+
+        float nx00 = mix(n000, n100, f.x);
+        float nx10 = mix(n010, n110, f.x);
+        float nx01 = mix(n001, n101, f.x);
+        float nx11 = mix(n011, n111, f.x);
+
+        float nxy0 = mix(nx00, nx10, f.y);
+        float nxy1 = mix(nx01, nx11, f.y);
+
+        return mix(nxy0, nxy1, f.z);
+      }
+
+      float fbm(vec3 p) {
+        float sum = 0.0;
+        float amp = 0.55;
+        float freq = 1.0;
+        for (int i = 0; i < 4; i++) {
+          sum += amp * valueNoise(p * freq);
+          freq *= 2.02;
+          amp *= 0.5;
+        }
+        return sum;
+      }
+
+      void main() {
+        vec3 N = normalize(vWorldNormal);
+        vec3 V = normalize(cameraPosition - vWorldPos);
+
+        // -----------------------------
+        // Lensing wobble (subtle)
+        // Idea: perturb ndv near the silhouette so the horizon “shimmers”
+        // -----------------------------
+        float ndv = clamp(dot(N, V), 0.0, 1.0);
+
+        float rimBase = 1.0 - ndv;              // 0 center, 1 silhouette
+        float rimMask = smoothstep(0.25, 1.0, rimBase); // only affect rim-ish area
+
+        float t = uTime * uWobbleSpeed;
+        float n = fbm(N * uWobbleScale + vec3(t, -t * 0.8, t * 0.6));
+        n = (n * 2.0 - 1.0); // -1..1
+
+        // Tiny perturbation to ndv makes the rim “wobble” instead of a static line
+        float ndvWarped = clamp(ndv + n * uWobbleStrength * rimMask, 0.0, 1.0);
+
+        // Rim term: 1 at silhouette, 0 when facing camera
+        float rim = pow(1.0 - ndvWarped, uPower);
+
+        // Soft shaping so it reads like a band, not a harsh line
+        rim = smoothstep(0.0, uSoft, rim);
+
+        float a = rim * uIntensity;
+
+        // -----------------------------
+        // Micro Doppler tint near horizon
+        // Idea: treat ring as rotating; side moving toward camera gets slightly bluer,
+        // away gets slightly warmer. Keep it *tiny*.
+        // -----------------------------
+        vec3 axis = normalize(uSpinAxis);
+        vec3 tangent = normalize(cross(axis, N)); // rotational direction around axis
+
+        // "approach" is + when tangent points toward camera direction
+        float approach = dot(tangent, V);
+
+        float dopMask = rimMask * a; // only tint where ring is visible
+        float d = clamp(approach * uDopplerStrength, -1.0, 1.0);
+
+        // Warm/cool nudges (super small)
+        vec3 cool = vec3(0.08, 0.10, 0.16);
+        vec3 warm = vec3(0.16, 0.10, 0.04);
+
+        vec3 tint = (d >= 0.0) ? cool * d : warm * (-d);
+
+        vec3 outCol = uColor + tint * dopMask;
+
+        gl_FragColor = vec4(outCol, a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    depthTest: true,                 // keep true so core can occlude the far side
+    blending: THREE.AdditiveBlending,
+    side: THREE.FrontSide,
+  });
 
   const mesh = new THREE.Mesh(geom, mat);
   mesh.name = "CoreRing_Shared";
@@ -593,19 +830,16 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
   const group = new THREE.Group();
   group.name = "CoreState_blackHole";
 
-  const coreGeom = new THREE.SphereGeometry(radius, 64, 64);
-  const coreMat = new THREE.MeshStandardMaterial({
-    color: 0x0b0b18,
-    metalness: 0.85,
-    roughness: 0.35,
-    emissive: 0x000000,
-  });
+  const coreGeom = new THREE.SphereGeometry(radius, 96, 96);
+  const coreMat = createBlackHoleMaterial();
+
   const coreMesh = new THREE.Mesh(coreGeom, coreMat);
   coreMesh.name = "CoreSurface_blackHole";
   coreMesh.renderOrder = 100;
 
+  // Usually OFF for black hole. If you enable later, keep it extremely subtle.
   const realLight = tuning.enableRealLight
-    ? new THREE.PointLight(new THREE.Color(tuning.ringColor), tuning.realLightIntensity, radius * 25)
+    ? new THREE.PointLight(new THREE.Color(tuning.ringColor), tuning.realLightIntensity, radius * 20)
     : null;
 
   if (realLight) {
@@ -620,10 +854,21 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
     group.visible = v;
   };
 
-  const update = (_dt: number, _audio: CoreAudioFrame): void => {
-    // Core-only state. Shared halo/ring is handled in CoreStates.update().
+  const update = (dt: number, audio: CoreAudioFrame, quality: CoreQuality): void => {
+    const energy = clamp01(audio.energy ?? 0);
+    const q = clamp01(quality.value);
+
+    coreMat.uniforms.uTime.value += dt;
+
+    // For now: keep energy near-zero unless you want subtle breathing even pre-audio.
+    // If you want a tiny alive pulse without AudioSystem, uncomment next line:
+    // coreMat.uniforms.uEnergy.value = 0.06 + 0.04 * sin(coreMat.uniforms.uTime.value * 0.6);
+
+    coreMat.uniforms.uEnergy.value = energy;
+    coreMat.uniforms.uDetail.value = 0.85 + q * 1.0;
+
     if (realLight) {
-      realLight.intensity = tuning.realLightIntensity;
+      realLight.intensity = tuning.realLightIntensity * (0.35 + energy * 0.5);
     }
   };
 
@@ -641,7 +886,7 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
     coreMesh,
     realLight,
     tuning,
-    update: (dt, audio, _quality) => update(dt, audio),
+    update,
     setVisible,
     dispose,
   };
@@ -862,6 +1107,38 @@ export class CoreStates {
     // Shared halo + ring response, driven by ACTIVE state's tuning
     const t = this.states[this.active].tuning;
     const energy = clamp01(a.energy ?? 0);
+
+    // ----------------------------------------------------------
+    // NEW: time drive + per-state horizon effects
+    // ----------------------------------------------------------
+    const uni = this.Ring.mat.uniforms as any;
+
+    // Time always advances (even if wobble is zero)
+    if (uni.uTime) {
+      uni.uTime.value = (uni.uTime.value as number) + dt;
+    }
+
+    // Per-state tuning (safe even if some uniforms aren't present yet)
+    if (this.active === "blackHole") {
+      const e = energy; // already computed above
+      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.31 + e * 0.02;; // try 0.03..0.06
+      if (uni.uWobbleSpeed) uni.uWobbleSpeed.value = 0.46;
+      if (uni.uWobbleScale) uni.uWobbleScale.value = 3.0;
+
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.9 + e * 0.03;; // try 0.08..0.18
+      if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
+    } else if (this.active === "sol") {
+      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.012;
+      if (uni.uWobbleSpeed) uni.uWobbleSpeed.value = 0.75;
+      if (uni.uWobbleScale) uni.uWobbleScale.value = 2.0;
+
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.05;
+      if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
+    } else {
+      // luna
+      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.0;
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.0;
+    }
 
     // Glow opacity pulse (outer shell expands)
     const innerBase = 0.14;

@@ -113,7 +113,7 @@ export class DemoScene implements SceneController {
     });
 
     // Start in desired phase (change as needed)
-    const phase: CorePhase = "solar";
+    const phase: CorePhase = "black_hole";
     this.core.setPhase(phase);
 
     // At P03, shrinkLevel = 0 (largest core)

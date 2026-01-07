@@ -39,8 +39,8 @@ type BloomProfile = {
  */
 const BLOOM_PROFILES: Record<PostFXProfileName, BloomProfile> = {
   solar:     { threshold: 0.35, strength: 1.45, radius: 0.50 },
-  luna:      { threshold: 0.40, strength: 1.35, radius: 0.35 },
-  blackHole: { threshold: 0.45, strength: 1.25, radius: 0.22 },
+  luna:      { threshold: 0.20, strength: 1.25, radius: 0.40 },
+  blackHole: { threshold: 0.30, strength: 1.35, radius: 0.30 },
 };
 
 export type BloomSettings = {

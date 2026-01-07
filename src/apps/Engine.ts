@@ -193,15 +193,28 @@ export class Engine {
     requestAnimationFrame(this.loop);
   };
 
+  // IMPORTANT:
+  // Renderer + PostFX must share the SAME capped pixel ratio.
+  // Higher DPR causes bloom threshold shimmer in fullscreen (Solar mode).
+  // pr=1.0 is intentional and stable.
+
   private handleResize = (): void => {
-    const width = window.innerWidth;
-    const height = window.innerHeight;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
 
-    this.renderer.setSize(width, height, false);
-    this.postFX.resize(width, height, this.config.pixelRatio);
+    const dpr = window.devicePixelRatio || 1;
 
-    this.camera.aspect = width / height;
+    // ✅ Known-good anti-flicker cap (start here)
+    const pr = Math.min(dpr, 1.0);
+
+    // Renderer + PostFX must agree on pixel ratio to prevent shimmer
+    this.renderer.setPixelRatio(pr);
+    this.renderer.setSize(w, h, false);
+
+    this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+
+    this.postFX.resize(w, h, pr);
   };
 
   dispose(): void {
