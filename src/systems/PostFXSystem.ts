@@ -20,6 +20,29 @@ import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 
+export type PostFXProfileName = "solar" | "luna" | "blackHole";
+
+type BloomProfile = {
+  /** UnrealBloomPass threshold */
+  threshold: number;
+  /** UnrealBloomPass strength */
+  strength: number;
+  /** UnrealBloomPass radius */
+  radius: number;
+};
+
+/**
+ * Baseline bloom looks:
+ * - solar: hot neon lens bleed
+ * - luna: quieter photographic glow
+ * - blackHole: restrained, sharp highlights only
+ */
+const BLOOM_PROFILES: Record<PostFXProfileName, BloomProfile> = {
+  solar:     { threshold: 0.35, strength: 1.45, radius: 0.50 },
+  luna:      { threshold: 0.40, strength: 1.35, radius: 0.35 },
+  blackHole: { threshold: 0.45, strength: 1.25, radius: 0.22 },
+};
+
 export type BloomSettings = {
   enabled: boolean;
   strength: number;  // typical: 0.4 - 1.8
@@ -94,6 +117,18 @@ export class PostFXSystem {
 
   private settings: PostFXSettings;
 
+  // ----------------------------------------------------------
+  // Profiles + modulation
+  // ----------------------------------------------------------
+  private profile: PostFXProfileName = "blackHole";
+  private bloomBase: BloomProfile = { ...BLOOM_PROFILES.blackHole };
+
+  // 0..1 from audio (or other continuous driver)
+  private bloomAudio = 0;
+
+  // cinematic multiplier (1 = normal)
+  private bloomCinematic = 1.0;
+
   constructor(deps: PostFXDeps) {
     this.renderer = deps.renderer;
     this.scene = deps.scene;
@@ -122,6 +157,14 @@ export class PostFXSystem {
     );
     this.bloomPass.enabled = this.settings.bloom.enabled;
     this.composer.addPass(this.bloomPass);
+
+    // Initialize base from current settings so profiles don’t “jump” unexpectedly.
+    // (Profiles can still override when you call setProfile.)
+    this.bloomBase = {
+      threshold: this.settings.bloom.threshold,
+      strength: this.settings.bloom.strength,
+      radius: this.settings.bloom.radius,
+    };
   }
 
   /** Swap scene/camera without rebuilding the whole pipeline. */
@@ -148,19 +191,77 @@ export class PostFXSystem {
     this.bloomPass.enabled = enabled;
   }
 
+  /**
+   * Manual bloom override (editor knobs).
+   * This also updates the active base profile values so audio/cinematic modulation
+   * continues to behave predictably.
+   */
   public setBloom(params: Partial<Omit<BloomSettings, "enabled">>): void {
-    if (typeof params.strength === "number") {
-      this.settings.bloom.strength = Math.max(0, params.strength);
-      this.bloomPass.strength = this.settings.bloom.strength;
-    }
-    if (typeof params.radius === "number") {
-      this.settings.bloom.radius = Math.max(0, params.radius);
-      this.bloomPass.radius = this.settings.bloom.radius;
-    }
     if (typeof params.threshold === "number") {
-      this.settings.bloom.threshold = clamp01(params.threshold);
-      this.bloomPass.threshold = this.settings.bloom.threshold;
+      const v = clamp01(params.threshold);
+      this.settings.bloom.threshold = v;
+      this.bloomBase.threshold = v;
+      this.bloomPass.threshold = v;
     }
+
+    if (typeof params.radius === "number") {
+      const v = Math.max(0, params.radius);
+      this.settings.bloom.radius = v;
+      this.bloomBase.radius = v;
+      this.bloomPass.radius = v;
+    }
+
+    if (typeof params.strength === "number") {
+      const v = Math.max(0, params.strength);
+      this.settings.bloom.strength = v;
+      this.bloomBase.strength = v;
+      // strength is modulated, so apply through helper:
+      this.applyBloomStrength();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Profiles
+  // ----------------------------------------------------------
+
+  public getProfile(): PostFXProfileName {
+    return this.profile;
+  }
+
+  public setProfile(name: PostFXProfileName): void {
+    this.profile = name;
+    this.bloomBase = { ...BLOOM_PROFILES[name] };
+
+    // Keep settings in sync (so DebugOverlay/UI reads the truth)
+    this.settings.bloom.threshold = this.bloomBase.threshold;
+    this.settings.bloom.radius = this.bloomBase.radius;
+    this.settings.bloom.strength = this.bloomBase.strength;
+
+    // Apply immediately
+    this.bloomPass.threshold = this.bloomBase.threshold;
+    this.bloomPass.radius = this.bloomBase.radius;
+    this.applyBloomStrength();
+  }
+
+  /** 0..1 energy driver (audio RMS, etc.). */
+  public setBloomAudio(value01: number): void {
+    this.bloomAudio = clamp01(value01);
+    this.applyBloomStrength();
+  }
+
+  /** Cinematic multiplier (1 = normal). */
+  public setBloomCinematic(multiplier: number): void {
+    this.bloomCinematic = Math.max(0, multiplier);
+    this.applyBloomStrength();
+  }
+
+  private applyBloomStrength(): void {
+    // gentle curve: keeps tiny audio from jittering bloom
+    const a = this.bloomAudio;
+    const audioBoost = 1.0 + (a * a) * 0.65;
+
+    const strength = this.bloomBase.strength * audioBoost * this.bloomCinematic;
+    this.bloomPass.strength = Math.max(0, strength);
   }
 
   /** Call from your resize handler. */
@@ -189,6 +290,10 @@ export class PostFXSystem {
       this.renderer.render(this.scene, this.camera);
       return;
     }
+
+    // Keep bloom strength consistent even if callers only update bloomAudio intermittently.
+    // (Cheap and helps prevent “stale” bloom after profile swaps.)
+    this.applyBloomStrength();
 
     this.composer.render();
   }

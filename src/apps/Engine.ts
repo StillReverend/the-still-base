@@ -1,11 +1,14 @@
 // src/apps/Engine.ts
 
 import * as THREE from "three";
+
 import type { EventBus } from "../core/EventBus";
 import type { Config } from "../core/Config";
 import type { SaveManager } from "../core/SaveManager";
+
 import { SceneManager } from "./SceneManager";
 import type { SceneContext, SceneController, SceneName } from "./SceneTypes";
+
 import { DebugOverlay } from "./DebugOverlay";
 import { CameraSystem } from "../systems/CameraSystem";
 import { ControlSystem } from "../systems/ControlSystem";
@@ -32,9 +35,11 @@ export class Engine {
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly postFX: PostFXSystem;
+
   private readonly camera: THREE.PerspectiveCamera;
   private readonly cameraSystem: CameraSystem;
   private readonly controlSystem: ControlSystem;
+
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
 
@@ -43,6 +48,8 @@ export class Engine {
 
   private debugOverlay: DebugOverlay | null = null;
 
+  private lastRenderScene: THREE.Scene | null = null;
+
   constructor(deps: EngineDeps) {
     this.canvas = deps.canvas;
     this.bus = deps.bus;
@@ -50,6 +57,7 @@ export class Engine {
     this.save = deps.save;
     this.resolveScene = deps.resolveScene;
 
+    // Renderer
     this.renderer = new THREE.WebGLRenderer({
       canvas: this.canvas,
       antialias: true,
@@ -58,6 +66,7 @@ export class Engine {
     this.renderer.setPixelRatio(this.config.pixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
 
+    // Camera
     this.camera = new THREE.PerspectiveCamera(
       60,
       window.innerWidth / window.innerHeight,
@@ -77,32 +86,18 @@ export class Engine {
       config: this.config,
     });
 
+    // Scene manager
     this.sceneManager = new SceneManager(this.save);
 
-    const ctx: SceneContext = {
-      renderer: this.renderer,
-      camera: this.camera,
-      config: this.config,
-      bus: this.bus,
-      save: this.save,
-    };
-    this.sceneManager.attachContext(ctx);
-
-    // Initial scene
-    const initialScene = deps.initialSceneFactory();
-    this.sceneManager.switchSceneImmediately(initialScene);
-
-    // PostFX pipeline (composer + bloom). Safe to add now.
-    // We initialize it with the current scene, and we’ll keep it updated in the loop.
-    const current = this.sceneManager.getCurrentScene();
+    // PostFX pipeline (Engine-owned, single instance for the whole app).
+    // Seed with a placeholder scene; we’ll retarget to the real scene after switching.
     this.postFX = new PostFXSystem({
       renderer: this.renderer,
-      scene: current?.scene ?? new THREE.Scene(),
+      scene: new THREE.Scene(),
       camera: this.camera,
       width: window.innerWidth,
       height: window.innerHeight,
       pixelRatio: this.config.pixelRatio,
-      // Optional: start subtle; tune later
       settings: {
         enabled: true,
         bloom: {
@@ -113,6 +108,28 @@ export class Engine {
         },
       },
     });
+
+    // Attach shared context (includes postFX)
+    const ctx: SceneContext = {
+      renderer: this.renderer,
+      camera: this.camera,
+      config: this.config,
+      bus: this.bus,
+      save: this.save,
+      postFX: this.postFX,
+    };
+    this.sceneManager.attachContext(ctx);
+
+    // Initial scene
+    const initialScene = deps.initialSceneFactory();
+    this.sceneManager.switchSceneImmediately(initialScene);
+
+    // Ensure PostFX targets the active scene immediately
+    const current = this.sceneManager.getCurrentScene();
+    if (current) {
+      this.postFX.setTargets(current.scene, this.camera);
+      this.lastRenderScene = current.scene;
+    }
 
     // Listen for scene switch events
     this.bus.on<SceneSwitchPayload>("scene:switch", (payload) => {
@@ -166,8 +183,10 @@ export class Engine {
 
     const current = this.sceneManager.getCurrentScene();
     if (current) {
-      // Keep PostFX aimed at the active scene
-      this.postFX.setTargets(current.scene, this.camera);
+      if (this.lastRenderScene !== current.scene) {
+        this.postFX.setTargets(current.scene, this.camera);
+        this.lastRenderScene = current.scene;
+      }
       this.postFX.render();
     }
 

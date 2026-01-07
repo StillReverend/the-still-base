@@ -1,20 +1,25 @@
 // src/apps/SceneTypes.ts
 
 import * as THREE from "three";
+
 import type { EventBus } from "../core/EventBus";
 import type { Config } from "../core/Config";
 import type { SaveManager } from "../core/SaveManager";
+import type { PostFXSystem } from "../systems/PostFXSystem";
 
 // Keep this union in sync with our actual scenes
 export type SceneName = "BootScene" | "DemoScene";
 
-export interface SceneContext {
+export type SceneContext = {
   renderer: THREE.WebGLRenderer;
   camera: THREE.PerspectiveCamera;
   config: Config;
   bus: EventBus;
   save: SaveManager;
-}
+
+  // Engine-owned PostFX pipeline (single instance)
+  postFX: PostFXSystem;
+};
 
 export interface SceneController {
   /** Unique identifier for the scene */

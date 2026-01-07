@@ -1,3 +1,5 @@
+// src/systems/CoreSystem.ts
+
 // ============================================================
 // THE STILL — P03
 // CoreSystem.ts
@@ -13,8 +15,7 @@
 //
 // Notes:
 //  - This does NOT know about constellations, stars, or audio yet.
-//  - Black hole / sun / lunar visual differences will be layered
-//    in later phases; here we just provide phase + shrink hooks.
+//  - Black hole / sun / lunar visual differences are handled via CoreStates.
 // ============================================================
 
 import * as THREE from "three";
@@ -27,9 +28,10 @@ import { ClockSystem } from "./ClockSystem";
 import { TimeSystem } from "./TimeSystem";
 import { PresenceSystem } from "./PresenceSystem";
 
-// P03.1 bolt-on visuals
 import type { CoreStateName } from "./CoreStates";
 import { CoreStates } from "./CoreStates";
+
+import type { PostFXSystem, PostFXProfileName } from "./PostFXSystem";
 
 export type CorePhase = "black_hole" | "solar" | "lunar";
 
@@ -37,6 +39,12 @@ export interface CoreSystemDeps {
   bus: EventBus;
   config: Config;
   save: SaveManager;
+
+  /**
+   * Optional: Engine-owned PostFX pipeline.
+   * Keep optional so CoreSystem can run without PostFX.
+   */
+  postFX?: PostFXSystem;
 }
 
 export class CoreSystem {
@@ -54,17 +62,19 @@ export class CoreSystem {
   private readonly time: TimeSystem;
   private readonly presence: PresenceSystem;
 
-  // P03.1: bolt-on core visuals (blackHole / sol / luna)
   private coreStates: CoreStates | null = null;
 
+  private postFX: PostFXSystem | null = null;
+
   private phase: CorePhase = "black_hole";
-  /** 0..1 where 0 = largest (start of guided) and 1 = fully shrunk. */
   private shrinkLevel = 0;
 
   constructor(deps: CoreSystemDeps) {
     this.bus = deps.bus;
     this.config = deps.config;
     this.save = deps.save;
+
+    this.postFX = deps.postFX ?? null;
 
     this.root = new THREE.Group();
     this.root.name = "CoreSystemRoot";
@@ -75,8 +85,6 @@ export class CoreSystem {
 
     this.buildCoreBody();
 
-    // P03.1: Create bolt-on states and hide placeholders.
-    // Keep placeholders alive for now so we can roll back easily.
     this.coreStates = new CoreStates({
       parent: this.coreGroup,
       radius: 7.9,
@@ -89,22 +97,16 @@ export class CoreSystem {
     this.clock = new ClockSystem();
     this.time = new TimeSystem();
 
-    // Presence is a world-state driver (P04)
     this.presence = new PresenceSystem();
     this.presence.enableDebugHotkeys();
-    // If you want console control too, uncomment:
-    // this.presence.devExposeToWindow();
 
     this.root.add(this.clock.getRoot());
     this.root.add(this.time.getRoot());
 
-    // IMPORTANT:
-    // Core root must remain axis-aligned.
-    // Any aesthetic tilt should be applied to visual subgroups,
-    // not the semantic world root (regions, clock, fog depend on this).
-    //this.root.rotation.x = 0.15;
-    //this.root.rotation.y = -0.2;
     this.root.rotation.set(0, 0, 0);
+
+    // Keep PostFX aligned with starting phase (if wired)
+    this.applyPostFXProfileFromPhase(this.phase);
   }
 
   // ----------------------------------------------------------
@@ -112,10 +114,8 @@ export class CoreSystem {
   // ----------------------------------------------------------
 
   private buildCoreBody(): void {
-    // Base radius for the black hole body in P03
     const radius = 3.1;
 
-    // Core sphere (black hole placeholder, dark with subtle spec)
     const coreGeom = new THREE.SphereGeometry(radius, 64, 64);
     const coreMat = new THREE.MeshStandardMaterial({
       color: 0x1a1a40,
@@ -128,7 +128,6 @@ export class CoreSystem {
     this.coreSphere.name = "CoreSphere";
     this.coreGroup.add(this.coreSphere);
 
-    // Simple aura: slightly larger, translucent shell
     const auraGeom = new THREE.SphereGeometry(radius * 1.15, 48, 48);
     const auraMat = new THREE.MeshBasicMaterial({
       color: 0x222244,
@@ -144,8 +143,6 @@ export class CoreSystem {
   }
 
   private mapPhaseToState(phase: CorePhase): CoreStateName {
-    // CoreStates uses: blackHole / sol / luna
-    // CoreSystem phase uses: black_hole / solar / lunar
     switch (phase) {
       case "solar":
         return "sol";
@@ -157,6 +154,23 @@ export class CoreSystem {
     }
   }
 
+  private mapPhaseToPostFXProfile(phase: CorePhase): PostFXProfileName {
+    switch (phase) {
+      case "solar":
+        return "solar";
+      case "lunar":
+        return "luna";
+      case "black_hole":
+      default:
+        return "blackHole";
+    }
+  }
+
+  private applyPostFXProfileFromPhase(phase: CorePhase): void {
+    if (!this.postFX) return;
+    this.postFX.setProfile(this.mapPhaseToPostFXProfile(phase));
+  }
+
   // ----------------------------------------------------------
   // Public API
   // ----------------------------------------------------------
@@ -166,11 +180,9 @@ export class CoreSystem {
   }
 
   public update(dt: number): void {
-    // Presence should drive clock *before* clock renders this frame.
     this.presence.update(dt);
     this.clock.setRingPresenceLevels(this.presence.getClockPresenceLevels());
 
-    // P03.1: drive core visuals (audio stubbed until AudioSystem exists)
     if (this.coreStates) {
       this.coreStates.update(dt, { energy: 0 });
     }
@@ -183,8 +195,12 @@ export class CoreSystem {
     this.clock.setDistanceFactor(distanceFactor);
   }
 
+  public setPostFX(postFX: PostFXSystem | null): void {
+    this.postFX = postFX;
+    this.applyPostFXProfileFromPhase(this.phase);
+  }
+
   public dispose(): void {
-    // Unhook debug listeners if this system gets torn down
     this.presence.disableDebugHotkeys();
 
     if (this.coreStates) {
@@ -208,20 +224,13 @@ export class CoreSystem {
 
     this.clock.dispose();
     this.time.dispose();
+
+    this.postFX = null;
   }
 
-  /**
-   * 0..1 where:
-   *  - 0 = largest, scariest black hole (start of guided experience)
-   *  - 1 = fully shrunk (ready to transition to solar form)
-   *
-   * For P03 this just scales the core group; later we can also
-   * change materials, audio, and particle behavior.
-   */
   public setShrinkLevel(level: number): void {
     this.shrinkLevel = THREE.MathUtils.clamp(level, 0, 1);
 
-    // Map to a reasonable scale range, e.g. 1.0 → 0.3
     const maxScale = 1.0;
     const minScale = 0.3;
     const scale = maxScale - (maxScale - minScale) * this.shrinkLevel;
@@ -233,7 +242,7 @@ export class CoreSystem {
 
   /**
    * Switch between black_hole / solar / lunar phases.
-   * In P03 we just remember the phase; P03.1 forwards to CoreStates.
+   * CoreStates changes visuals, PostFX profile follows phase.
    */
   public setPhase(phase: CorePhase): void {
     this.phase = phase;
@@ -242,7 +251,6 @@ export class CoreSystem {
       this.coreStates.setState(this.mapPhaseToState(phase));
     }
 
-    // Stub: in future, adjust materials by phase beyond CoreStates
-    // e.g. audio behavior, particles, etc.
+    this.applyPostFXProfileFromPhase(phase);
   }
 }

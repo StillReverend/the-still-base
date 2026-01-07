@@ -82,7 +82,7 @@ export class ClockSystem {
 
     this.pointsPerRing = config.pointsPerRing ?? 12;
 
-    const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.01, 0.0, 1.0);
+    const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.31, 0.0, 1.0);
     const maxTail = THREE.MathUtils.clamp(config.maxTailLength ?? 0.97, 0.0, 1.0);
 
     const baseRadius = 10.0;
@@ -90,37 +90,37 @@ export class ClockSystem {
 
     // Hour ring (12)
     this.hourRing = new RingPoints({
-      radius: baseRadius + gap * 7,
-      thickness: 0.4,
+      radius: baseRadius + gap * 7.9,
+      thickness: 0.79,
       points: this.pointsPerRing,
-      falloffFactor: 0.35,
-      minTailLength: minTail + 0.1,
+      falloffFactor: 0.31,
+      minTailLength: minTail,
       maxTailLength: maxTail,
-      baseColor: new THREE.Color(0xd4af37),
+      baseColor: new THREE.Color(0xffffed),
     });
     this.root.add(this.hourRing.points);
 
     // Minute ring (60)
     this.minuteRing = new RingPoints({
-      radius: baseRadius + gap * 2.5,
-      thickness: 0.3,
+      radius: baseRadius + gap * 3.1,
+      thickness: 0.31,
       points: this.pointsPerRing * 5,
-      falloffFactor: 0.35,
-      minTailLength: minTail + 0.01,
+      falloffFactor: 0.31,
+      minTailLength: minTail,
       maxTailLength: maxTail,
-      baseColor: new THREE.Color(0x7fd0ff),
+      baseColor: new THREE.Color(0xffffed),
     });
     this.root.add(this.minuteRing.points);
 
     // Second ring (360)
     this.secondRing = new RingPoints({
-      radius: baseRadius,
-      thickness: 0.2,
+      radius: baseRadius * 1.0,
+      thickness: 0.10,
       points: this.pointsPerRing * 30,
-      falloffFactor: 0.35,
+      falloffFactor: 0.31,
       minTailLength: minTail,
       maxTailLength: maxTail,
-      baseColor: new THREE.Color(0xff4f9a),
+      baseColor: new THREE.Color(0xffffed),
     });
     this.root.add(this.secondRing.points);
 
