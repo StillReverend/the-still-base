@@ -96,7 +96,7 @@ export class ClockSystem {
       falloffFactor: 0.31,
       minTailLength: minTail,
       maxTailLength: maxTail,
-      baseColor: new THREE.Color(0xffffed),
+      baseColor: new THREE.Color(0xd4af37),
     });
     this.root.add(this.hourRing.points);
 
@@ -108,7 +108,7 @@ export class ClockSystem {
       falloffFactor: 0.31,
       minTailLength: minTail,
       maxTailLength: maxTail,
-      baseColor: new THREE.Color(0xffffed),
+      baseColor: new THREE.Color(0xd4af37),
     });
     this.root.add(this.minuteRing.points);
 
@@ -120,7 +120,7 @@ export class ClockSystem {
       falloffFactor: 0.31,
       minTailLength: minTail,
       maxTailLength: maxTail,
-      baseColor: new THREE.Color(0xffffed),
+      baseColor: new THREE.Color(0xd4af37),
     });
     this.root.add(this.secondRing.points);
 

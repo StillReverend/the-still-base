@@ -89,20 +89,23 @@ type StateBundle = {
   dispose: () => void;
 };
 
-const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+const clamp01 = (v: number): number => {
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(1, Math.max(0, v));
+};
 
 const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   blackHole: {
     glowIntensity: 0.31,
     ringIntensity: 1.90, // ← bump slightly for a stronger event horizon
-    ringColor: 0xccccff,
+    ringColor: 0xffffed,
     glowColor: 0xccccff,
     enableRealLight: true,
     realLightIntensity: 0.35,
   },
   sol: {
     glowIntensity: 0.31,
-    ringIntensity: 0.85,
+    ringIntensity: 0.79,
     ringColor: 0xffffed,
     glowColor: 0xffa23a,
     enableRealLight: true,

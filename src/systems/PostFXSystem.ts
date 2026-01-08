@@ -36,6 +36,9 @@ type BloomProfile = {
  * - solar: hot neon lens bleed
  * - luna: quieter photographic glow
  * - blackHole: restrained, sharp highlights only
+ *
+ * IMPORTANT:
+ * If blackHole threshold is too low, any single-frame artifact can “flash”.
  */
 const BLOOM_PROFILES: Record<PostFXProfileName, BloomProfile> = {
   solar:     { threshold: 0.30, strength: 1.45, radius: 0.50 },
@@ -45,8 +48,8 @@ const BLOOM_PROFILES: Record<PostFXProfileName, BloomProfile> = {
 
 export type BloomSettings = {
   enabled: boolean;
-  strength: number;  // typical: 0.4 - 1.8
-  radius: number;    // typical: 0.0 - 1.0
+  strength: number; // typical: 0.4 - 1.8
+  radius: number; // typical: 0.0 - 1.0
   threshold: number; // typical: 0.0 - 1.0
 };
 
@@ -70,7 +73,10 @@ export type PostFXDeps = {
   settings?: Partial<PostFXSettings>;
 };
 
-const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+const clamp01 = (v: number): number => {
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(1, Math.max(0, v));
+};
 
 const defaultSettings: PostFXSettings = {
   enabled: true,
@@ -95,8 +101,8 @@ function mergeSettings(override?: Partial<PostFXSettings>): PostFXSettings {
     },
   };
 
-  merged.bloom.strength = Math.max(0, merged.bloom.strength);
-  merged.bloom.radius = Math.max(0, merged.bloom.radius);
+  merged.bloom.strength = Number.isFinite(merged.bloom.strength) ? Math.max(0, merged.bloom.strength) : 0;
+  merged.bloom.radius = Number.isFinite(merged.bloom.radius) ? Math.max(0, merged.bloom.radius) : 0;
   merged.bloom.threshold = clamp01(merged.bloom.threshold);
 
   return merged;
@@ -129,6 +135,7 @@ export class PostFXSystem {
   // cinematic multiplier (1 = normal)
   private bloomCinematic = 1.0;
 
+  // Cache so we don’t thrash bloomPass every frame
   private lastAppliedStrength = -1;
 
   constructor(deps: PostFXDeps) {
@@ -149,7 +156,6 @@ export class PostFXSystem {
     this.renderPass = new RenderPass(this.scene, this.camera);
     this.composer.addPass(this.renderPass);
 
-    // Bloom
     const res = new THREE.Vector2(this.width, this.height);
     this.bloomPass = new UnrealBloomPass(
       res,
@@ -160,13 +166,16 @@ export class PostFXSystem {
     this.bloomPass.enabled = this.settings.bloom.enabled;
     this.composer.addPass(this.bloomPass);
 
-    // Initialize base from current settings so profiles don’t “jump” unexpectedly.
-    // (Profiles can still override when you call setProfile.)
+    // Initialize base from settings so we don’t “jump”
     this.bloomBase = {
       threshold: this.settings.bloom.threshold,
       strength: this.settings.bloom.strength,
       radius: this.settings.bloom.radius,
     };
+
+    // Ensure strength cache starts correct
+    this.lastAppliedStrength = -1;
+    this.applyBloomStrength();
   }
 
   /** Swap scene/camera without rebuilding the whole pipeline. */
@@ -174,7 +183,6 @@ export class PostFXSystem {
     this.scene = scene;
     this.camera = camera;
 
-    // RenderPass expects these to be mutable.
     this.renderPass.scene = scene;
     // @ts-expect-error: RenderPass camera is mutable in practice
     this.renderPass.camera = camera;
@@ -191,6 +199,10 @@ export class PostFXSystem {
   public setBloomEnabled(enabled: boolean): void {
     this.settings.bloom.enabled = enabled;
     this.bloomPass.enabled = enabled;
+
+    // When re-enabling, force a fresh apply so we don’t “wake up” with stale strength
+    this.lastAppliedStrength = -1;
+    if (enabled) this.applyBloomStrength();
   }
 
   /**
@@ -207,17 +219,16 @@ export class PostFXSystem {
     }
 
     if (typeof params.radius === "number") {
-      const v = Math.max(0, params.radius);
+      const v = Number.isFinite(params.radius) ? Math.max(0, params.radius) : 0;
       this.settings.bloom.radius = v;
       this.bloomBase.radius = v;
       this.bloomPass.radius = v;
     }
 
     if (typeof params.strength === "number") {
-      const v = Math.max(0, params.strength);
+      const v = Number.isFinite(params.strength) ? Math.max(0, params.strength) : 0;
       this.settings.bloom.strength = v;
       this.bloomBase.strength = v;
-      // strength is modulated, so apply through helper:
       this.applyBloomStrength();
     }
   }
@@ -234,14 +245,16 @@ export class PostFXSystem {
     this.profile = name;
     this.bloomBase = { ...BLOOM_PROFILES[name] };
 
-    // Keep settings in sync (so DebugOverlay/UI reads the truth)
+    // Keep settings in sync
     this.settings.bloom.threshold = this.bloomBase.threshold;
     this.settings.bloom.radius = this.bloomBase.radius;
     this.settings.bloom.strength = this.bloomBase.strength;
 
-    // Apply immediately
     this.bloomPass.threshold = this.bloomBase.threshold;
     this.bloomPass.radius = this.bloomBase.radius;
+
+    // Force re-apply even if cache was close
+    this.lastAppliedStrength = -1;
     this.applyBloomStrength();
   }
 
@@ -253,22 +266,23 @@ export class PostFXSystem {
 
   /** Cinematic multiplier (1 = normal). */
   public setBloomCinematic(multiplier: number): void {
+    if (!Number.isFinite(multiplier)) return;
     this.bloomCinematic = Math.max(0, multiplier);
     this.applyBloomStrength();
   }
 
   private applyBloomStrength(): void {
+    if (!this.settings.bloom.enabled) return;
+
     const a = this.bloomAudio;
     const audioBoost = 1.0 + (a * a) * 0.65;
 
-    const strength =
-      this.bloomBase.strength *
-      audioBoost *
-      this.bloomCinematic;
+    const rawStrength = this.bloomBase.strength * audioBoost * this.bloomCinematic;
+    if (!Number.isFinite(rawStrength)) return;
 
-    const safeStrength = Math.max(0, strength);
+    const safeStrength = Math.max(0, rawStrength);
 
-    // 🔒 Only apply if it actually changed meaningfully
+    // Only apply if it actually changed meaningfully
     if (Math.abs(safeStrength - this.lastAppliedStrength) > 0.001) {
       this.bloomPass.strength = safeStrength;
       this.lastAppliedStrength = safeStrength;
@@ -286,8 +300,6 @@ export class PostFXSystem {
     }
 
     this.composer.setSize(this.width, this.height);
-
-    // UnrealBloomPass stores its own resolution vector.
     this.bloomPass.setSize(this.width, this.height);
   }
 
@@ -302,26 +314,19 @@ export class PostFXSystem {
       return;
     }
 
-    // Optional: if you still want a “safety refresh”, do it here,
-    // but only if you keep it idempotent (your cached strength version is safe).
-    //this.applyBloomStrength();
-
     this.composer.render();
   }
 
-  /** If you want to add additional passes later. */
   public getComposer(): EffectComposer {
     return this.composer;
   }
 
   public dispose(): void {
-    // Pass cleanup
     this.composer.removePass(this.renderPass);
     this.composer.removePass(this.bloomPass);
 
     this.bloomPass.dispose();
 
-    // Composer render targets (defensive, varies by three version)
     // @ts-expect-error - internal fields exist in three
     this.composer.renderTarget1?.dispose?.();
     // @ts-expect-error - internal fields exist in three
@@ -330,7 +335,6 @@ export class PostFXSystem {
     // @ts-expect-error - composer may have dispose in newer three
     this.composer.dispose?.();
 
-    // Break refs
     // @ts-expect-error: explicit nulling for GC friendliness
     this.composer = null;
     // @ts-expect-error
