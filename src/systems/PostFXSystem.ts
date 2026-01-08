@@ -38,9 +38,9 @@ type BloomProfile = {
  * - blackHole: restrained, sharp highlights only
  */
 const BLOOM_PROFILES: Record<PostFXProfileName, BloomProfile> = {
-  solar:     { threshold: 0.35, strength: 1.45, radius: 0.50 },
-  luna:      { threshold: 0.20, strength: 1.25, radius: 0.40 },
-  blackHole: { threshold: 0.30, strength: 1.35, radius: 0.30 },
+  solar:     { threshold: 0.30, strength: 1.45, radius: 0.50 },
+  luna:      { threshold: 0.20, strength: 1.35, radius: 0.40 },
+  blackHole: { threshold: 0.10, strength: 1.25, radius: 0.30 },
 };
 
 export type BloomSettings = {
@@ -128,6 +128,8 @@ export class PostFXSystem {
 
   // cinematic multiplier (1 = normal)
   private bloomCinematic = 1.0;
+
+  private lastAppliedStrength = -1;
 
   constructor(deps: PostFXDeps) {
     this.renderer = deps.renderer;
@@ -256,12 +258,21 @@ export class PostFXSystem {
   }
 
   private applyBloomStrength(): void {
-    // gentle curve: keeps tiny audio from jittering bloom
     const a = this.bloomAudio;
     const audioBoost = 1.0 + (a * a) * 0.65;
 
-    const strength = this.bloomBase.strength * audioBoost * this.bloomCinematic;
-    this.bloomPass.strength = Math.max(0, strength);
+    const strength =
+      this.bloomBase.strength *
+      audioBoost *
+      this.bloomCinematic;
+
+    const safeStrength = Math.max(0, strength);
+
+    // 🔒 Only apply if it actually changed meaningfully
+    if (Math.abs(safeStrength - this.lastAppliedStrength) > 0.001) {
+      this.bloomPass.strength = safeStrength;
+      this.lastAppliedStrength = safeStrength;
+    }
   }
 
   /** Call from your resize handler. */
@@ -291,9 +302,9 @@ export class PostFXSystem {
       return;
     }
 
-    // Keep bloom strength consistent even if callers only update bloomAudio intermittently.
-    // (Cheap and helps prevent “stale” bloom after profile swaps.)
-    this.applyBloomStrength();
+    // Optional: if you still want a “safety refresh”, do it here,
+    // but only if you keep it idempotent (your cached strength version is safe).
+    //this.applyBloomStrength();
 
     this.composer.render();
   }

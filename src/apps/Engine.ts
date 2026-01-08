@@ -147,6 +147,24 @@ export class Engine {
       this.debugOverlay = new DebugOverlay(this.camera, this.bus);
     }
 
+    if (import.meta.env.DEV) {
+  window.addEventListener("keydown", (e) => {
+    if (e.key.toLowerCase() === "b") {
+      const s = this.postFX.getSettings();
+      this.postFX.setBloomEnabled(!s.bloom.enabled);
+      // eslint-disable-next-line no-console
+      console.log(`[Dev] Bloom ${!s.bloom.enabled ? "ON" : "OFF"}`);
+    }
+
+    if (e.key.toLowerCase() === "p") {
+      const s = this.postFX.getSettings();
+      this.postFX.setEnabled(!s.enabled);
+      // eslint-disable-next-line no-console
+      console.log(`[Dev] PostFX ${!s.enabled ? "ON" : "OFF"}`);
+    }
+  });
+}
+
     window.addEventListener("resize", this.handleResize);
     this.handleResize();
   }
