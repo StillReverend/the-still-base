@@ -16,6 +16,12 @@
 // Notes:
 //  - This does NOT know about constellations, stars, or audio yet.
 //  - Black hole / sun / lunar visual differences are handled via CoreStates.
+//
+// Behavior (P03 update):
+//  - Default phase is driven by local time-of-day (solar/lunar).
+//  - Hotkey toggle enables black_hole override at will.
+//    * Press "V" to toggle black hole override. (V = Void)
+//    * Press "Escape" to clear override (return to time-of-day).
 // ============================================================
 
 import * as THREE from "three";
@@ -26,7 +32,6 @@ import type { SaveManager } from "../core/SaveManager";
 
 import { ClockSystem } from "./ClockSystem";
 import { TimeSystem } from "./TimeSystem";
-import { PresenceSystem } from "./PresenceSystem";
 
 import type { CoreStateName } from "./CoreStates";
 import { CoreStates } from "./CoreStates";
@@ -60,14 +65,25 @@ export class CoreSystem {
 
   private readonly clock: ClockSystem;
   private readonly time: TimeSystem;
-  private readonly presence: PresenceSystem;
 
   private coreStates: CoreStates | null = null;
 
   private postFX: PostFXSystem | null = null;
 
-  private phase: CorePhase = "black_hole";
+  // Phase state
+  private phase: CorePhase = "solar"; // default; will be corrected on first applyDesiredPhase()
   private shrinkLevel = 0;
+
+  // Time-of-day settings (local time)
+  private readonly solarStartHour = 6; // 6 AM inclusive
+  private readonly lunarStartHour = 18; // 6 PM inclusive
+
+  // Override behavior
+  private blackHoleOverride = false;
+  private appliedPhase: CorePhase | null = null;
+
+  // Hotkeys
+  private onKeyDown: ((e: KeyboardEvent) => void) | null = null;
 
   constructor(deps: CoreSystemDeps) {
     this.bus = deps.bus;
@@ -85,28 +101,42 @@ export class CoreSystem {
 
     this.buildCoreBody();
 
+    // Core visual states
     this.coreStates = new CoreStates({
       parent: this.coreGroup,
       radius: 7.9,
       initialState: this.mapPhaseToState(this.phase),
     });
 
+    // Hide placeholder meshes when CoreStates is active
     if (this.coreSphere) this.coreSphere.visible = false;
     if (this.auraSphere) this.auraSphere.visible = false;
 
+    // Clock & Time systems
     this.clock = new ClockSystem();
     this.time = new TimeSystem();
-
-    this.presence = new PresenceSystem();
-    this.presence.enableDebugHotkeys();
 
     this.root.add(this.clock.getRoot());
     this.root.add(this.time.getRoot());
 
     this.root.rotation.set(0, 0, 0);
 
-    // Keep PostFX aligned with starting phase (if wired)
-    this.applyPostFXProfileFromPhase(this.phase);
+    // Hotkeys: V toggles black hole override; Escape clears override.
+    this.onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === "KeyV") {
+        this.blackHoleOverride = !this.blackHoleOverride;
+        this.applyDesiredPhase(true);
+      } else if (e.code === "Escape") {
+        if (this.blackHoleOverride) {
+          this.blackHoleOverride = false;
+          this.applyDesiredPhase(true);
+        }
+      }
+    };
+    window.addEventListener("keydown", this.onKeyDown);
+
+    // Apply initial desired phase (solar/lunar by time-of-day unless overridden)
+    this.applyDesiredPhase(true);
   }
 
   // ----------------------------------------------------------
@@ -172,6 +202,47 @@ export class CoreSystem {
   }
 
   // ----------------------------------------------------------
+  // Time-of-day + override phase logic
+  // ----------------------------------------------------------
+
+  private computeTimeOfDayPhase(): CorePhase {
+    const now = new Date();
+    const h = now.getHours();
+
+    // solar between solarStartHour (inclusive) and lunarStartHour (exclusive)
+    if (h >= this.solarStartHour && h < this.lunarStartHour) return "solar";
+    return "lunar";
+  }
+
+  private getDesiredPhase(): CorePhase {
+    if (this.blackHoleOverride) return "black_hole";
+    return this.computeTimeOfDayPhase();
+  }
+
+  private applyDesiredPhase(force: boolean = false): void {
+    const desired = this.getDesiredPhase();
+    if (!force && this.appliedPhase === desired) return;
+
+    this.appliedPhase = desired;
+    this.phase = desired;
+
+    if (this.coreStates) {
+      this.coreStates.setState(this.mapPhaseToState(desired));
+    }
+
+    this.applyPostFXProfileFromPhase(desired);
+
+    // Optional: let other systems observe phase changes
+    // (No assumptions about EventBus API shape; safe-guarded)
+    try {
+      // @ts-expect-error - EventBus may or may not expose emit()
+      this.bus.emit?.("core:phase", { phase: desired, override: this.blackHoleOverride });
+    } catch {
+      // no-op
+    }
+  }
+
+  // ----------------------------------------------------------
   // Public API
   // ----------------------------------------------------------
 
@@ -180,8 +251,8 @@ export class CoreSystem {
   }
 
   public update(dt: number): void {
-    this.presence.update(dt);
-    this.clock.setRingPresenceLevels(this.presence.getClockPresenceLevels());
+    // Keep phase aligned to time-of-day (unless black hole override is active)
+    this.applyDesiredPhase(false);
 
     if (this.coreStates) {
       this.coreStates.update(dt, { energy: 0 });
@@ -201,7 +272,10 @@ export class CoreSystem {
   }
 
   public dispose(): void {
-    this.presence.disableDebugHotkeys();
+    if (this.onKeyDown) {
+      window.removeEventListener("keydown", this.onKeyDown);
+      this.onKeyDown = null;
+    }
 
     if (this.coreStates) {
       this.coreStates.dispose();
@@ -241,16 +315,41 @@ export class CoreSystem {
   }
 
   /**
-   * Switch between black_hole / solar / lunar phases.
-   * CoreStates changes visuals, PostFX profile follows phase.
+   * Manual phase setter.
+   * NOTE:
+   * - This sets the phase immediately.
+   * - If black hole override is OFF, the next update() will snap back to time-of-day.
+   * - If you want manual lock behavior, we can add a "manualLock" mode later.
    */
   public setPhase(phase: CorePhase): void {
     this.phase = phase;
+    this.appliedPhase = phase;
 
     if (this.coreStates) {
       this.coreStates.setState(this.mapPhaseToState(phase));
     }
 
     this.applyPostFXProfileFromPhase(phase);
+  }
+
+  /**
+   * Toggle black hole override on/off.
+   * When enabled, phase is forced to black_hole until cleared.
+   */
+  public toggleBlackHoleOverride(): void {
+    this.blackHoleOverride = !this.blackHoleOverride;
+    this.applyDesiredPhase(true);
+  }
+
+  /**
+   * Explicitly clear black hole override (returns to time-of-day).
+   */
+  public clearBlackHoleOverride(): void {
+    this.blackHoleOverride = false;
+    this.applyDesiredPhase(true);
+  }
+
+  public isBlackHoleOverrideEnabled(): boolean {
+    return this.blackHoleOverride;
   }
 }

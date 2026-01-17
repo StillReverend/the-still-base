@@ -32,19 +32,25 @@ type BloomProfile = {
 };
 
 /**
- * Baseline bloom looks:
- * - solar: hot neon lens bleed
- * - luna: quieter photographic glow
- * - blackHole: restrained, sharp highlights only
- *
  * IMPORTANT:
- * If blackHole threshold is too low, any single-frame artifact can “flash”.
+ * - If blackHole threshold is too low, any single-frame artifact can “flash”.
+ * - If bloom strength has no ceiling, rare spikes can become visible "pops".
  */
 const BLOOM_PROFILES: Record<PostFXProfileName, BloomProfile> = {
-  solar:     { threshold: 0.30, strength: 1.45, radius: 0.50 },
-  luna:      { threshold: 0.20, strength: 1.35, radius: 0.40 },
-  blackHole: { threshold: 0.10, strength: 1.25, radius: 0.30 },
+  solar: { threshold: 0.20, strength: 1.45, radius: 0.50 },
+  luna: { threshold: 0.20, strength: 1.35, radius: 0.40 },
+
+  // Slightly higher threshold than 0.10 reduces flash susceptibility a lot.
+  // If you want it harsher later, adjust carefully.
+  blackHole: { threshold: 0.20, strength: 1.25, radius: 0.30 },
 };
+
+// Hard safety ceiling for bloom. This is the "anti-pop" seatbelt.
+// If you want hotter bloom, raise gently (ex: 1.9), but do not remove.
+const MAX_BLOOM_STRENGTH = 1.65;
+
+// Prevent micro changes from thrashing the pass.
+const STRENGTH_EPSILON = 0.001;
 
 export type BloomSettings = {
   enabled: boolean;
@@ -78,6 +84,16 @@ const clamp01 = (v: number): number => {
   return Math.min(1, Math.max(0, v));
 };
 
+const clampNonNeg = (v: number): number => {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, v);
+};
+
+const clampStrength = (v: number): number => {
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(MAX_BLOOM_STRENGTH, Math.max(0, v));
+};
+
 const defaultSettings: PostFXSettings = {
   enabled: true,
   bloom: {
@@ -101,8 +117,8 @@ function mergeSettings(override?: Partial<PostFXSettings>): PostFXSettings {
     },
   };
 
-  merged.bloom.strength = Number.isFinite(merged.bloom.strength) ? Math.max(0, merged.bloom.strength) : 0;
-  merged.bloom.radius = Number.isFinite(merged.bloom.radius) ? Math.max(0, merged.bloom.radius) : 0;
+  merged.bloom.strength = clampNonNeg(merged.bloom.strength);
+  merged.bloom.radius = clampNonNeg(merged.bloom.radius);
   merged.bloom.threshold = clamp01(merged.bloom.threshold);
 
   return merged;
@@ -173,9 +189,8 @@ export class PostFXSystem {
       radius: this.settings.bloom.radius,
     };
 
-    // Ensure strength cache starts correct
     this.lastAppliedStrength = -1;
-    this.applyBloomStrength();
+    this.applyBloomStrength(true);
   }
 
   /** Swap scene/camera without rebuilding the whole pipeline. */
@@ -200,9 +215,9 @@ export class PostFXSystem {
     this.settings.bloom.enabled = enabled;
     this.bloomPass.enabled = enabled;
 
-    // When re-enabling, force a fresh apply so we don’t “wake up” with stale strength
+    // Force a fresh apply so we don’t “wake up” with stale strength
     this.lastAppliedStrength = -1;
-    if (enabled) this.applyBloomStrength();
+    if (enabled) this.applyBloomStrength(true);
   }
 
   /**
@@ -219,17 +234,17 @@ export class PostFXSystem {
     }
 
     if (typeof params.radius === "number") {
-      const v = Number.isFinite(params.radius) ? Math.max(0, params.radius) : 0;
+      const v = clampNonNeg(params.radius);
       this.settings.bloom.radius = v;
       this.bloomBase.radius = v;
       this.bloomPass.radius = v;
     }
 
     if (typeof params.strength === "number") {
-      const v = Number.isFinite(params.strength) ? Math.max(0, params.strength) : 0;
+      const v = clampNonNeg(params.strength);
       this.settings.bloom.strength = v;
       this.bloomBase.strength = v;
-      this.applyBloomStrength();
+      this.applyBloomStrength(true);
     }
   }
 
@@ -255,38 +270,43 @@ export class PostFXSystem {
 
     // Force re-apply even if cache was close
     this.lastAppliedStrength = -1;
-    this.applyBloomStrength();
+    this.applyBloomStrength(true);
   }
 
   /** 0..1 energy driver (audio RMS, etc.). */
   public setBloomAudio(value01: number): void {
     this.bloomAudio = clamp01(value01);
-    this.applyBloomStrength();
+    this.applyBloomStrength(false);
   }
 
   /** Cinematic multiplier (1 = normal). */
   public setBloomCinematic(multiplier: number): void {
     if (!Number.isFinite(multiplier)) return;
     this.bloomCinematic = Math.max(0, multiplier);
-    this.applyBloomStrength();
+    this.applyBloomStrength(false);
   }
 
-  private applyBloomStrength(): void {
+  /**
+   * Apply strength with:
+   * - finite guards
+   * - hard cap (prevents single-frame pop)
+   * - epsilon cache
+   */
+  private applyBloomStrength(force: boolean): void {
     if (!this.settings.bloom.enabled) return;
 
-    const a = this.bloomAudio;
+    const a = clamp01(this.bloomAudio);
+
+    // Quadratic-ish boost (smooth, not twitchy)
     const audioBoost = 1.0 + (a * a) * 0.65;
 
     const rawStrength = this.bloomBase.strength * audioBoost * this.bloomCinematic;
-    if (!Number.isFinite(rawStrength)) return;
+    const safeStrength = clampStrength(rawStrength);
 
-    const safeStrength = Math.max(0, rawStrength);
+    if (!force && Math.abs(safeStrength - this.lastAppliedStrength) <= STRENGTH_EPSILON) return;
 
-    // Only apply if it actually changed meaningfully
-    if (Math.abs(safeStrength - this.lastAppliedStrength) > 0.001) {
-      this.bloomPass.strength = safeStrength;
-      this.lastAppliedStrength = safeStrength;
-    }
+    this.bloomPass.strength = safeStrength;
+    this.lastAppliedStrength = safeStrength;
   }
 
   /** Call from your resize handler. */

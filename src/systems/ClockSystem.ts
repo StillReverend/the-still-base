@@ -7,15 +7,13 @@
 //    Hours, Minutes, and Seconds.
 //  - Each ring is a single comet-style trail orbiting the core:
 //      * Bright "head" at the current time position
-//      * Tail length is driven by Presence (0..1)
+//      * Tail length is fixed (configurable via min/max tail settings)
 //  - Driven by local time, independent of audio.
 //
-// Presence behavior (FINALIZED):
-//  - presenceLevel (0..1) controls comet tail length only.
-//  - At presence = 0.0: tail is at its minimum length (minTailLength)
-//  - At presence = 1.0: tail approaches its maximum length (maxTailLength)
-//  - No "filled arc from 12 o'clock" logic. This avoids wrap glitches
-//    and keeps the clock math anchored cleanly to a single reference.
+// Tail behavior (FINALIZED):
+//  - Tail arc is fixed to a constant factor (0..1).
+//  - This keeps the clock math anchored cleanly to a single reference,
+//    with no external state or "presence" concept.
 //
 // Enhancements:
 //  - Global + distance-based intensity scaling
@@ -25,9 +23,25 @@
 //    (logic included but commented out as requested)
 //  - Smooth hour movement (real clock behavior)
 //  - Epsilon boundary tolerance to prevent dot popping
+//
+// Bloom notes:
+//  - We tag these rings onto BLOOM_LAYER so a selective-bloom pipeline
+//    can target them.
+//  - ALSO: we allow intensity to exceed 1.0 (headroom) so bloom has
+//    something bright to grab. (This does nothing harmful without bloom.)
 // ============================================================
 
 import * as THREE from "three";
+
+// If/when you implement selective bloom in PostFX, use this same layer index there.
+const BLOOM_LAYER = 1;
+
+// Bloom needs bright pixels; allow headroom above 1.0 (in linear space).
+// Keep this conservative to avoid “flashy” surprises.
+const BLOOM_HEADROOM_MAX = 2.25;
+
+// Fixed tail factor (0..1). Higher = longer comet tail.
+const FIXED_TAIL_FACTOR = 0.85;
 
 export type ClockColorMode = "classic" | "perRing" | "rainbow" | "vinyl";
 
@@ -36,16 +50,14 @@ export interface ClockSystemConfig {
   pointsPerRing?: number;
 
   /**
-   * Minimum tail factor (0..1), used when presenceLevel = 0.
-   * Examples:
-   *  0.10 -> 10% of orbit
-   *  0.25 -> 25% of orbit
+   * Minimum tail factor (0..1).
+   * This still defines the lower bound of tail arc inside RingPoints.
    */
   minTailLength?: number;
 
   /**
-   * Maximum tail factor (0..1), used when presenceLevel = 1.
-   *  1.0 -> can reach a full ring (gradient still shows head direction)
+   * Maximum tail factor (0..1).
+   * This still defines the upper bound of tail arc inside RingPoints.
    */
   maxTailLength?: number;
 }
@@ -70,12 +82,6 @@ export class ClockSystem {
   private audioMid = 0.0;
   private audioHigh = 0.0;
 
-  // Presence (0..1): 0 = minimal tails, 1 = maximal tails
-  private presenceLevel = 0.0;
-  private hourPresence: number | null = null;
-  private minutePresence: number | null = null;
-  private secondPresence: number | null = null;
-
   constructor(config: ClockSystemConfig = {}) {
     this.root = new THREE.Group();
     this.root.name = "ClockSystem";
@@ -91,8 +97,8 @@ export class ClockSystem {
     // Hour ring (12)
     this.hourRing = new RingPoints({
       radius: baseRadius + gap * 7.9,
-      thickness: 0.79,
-      points: this.pointsPerRing,
+      thickness: 0.70,
+      points: this.pointsPerRing * 144,
       falloffFactor: 0.31,
       minTailLength: minTail,
       maxTailLength: maxTail,
@@ -103,8 +109,8 @@ export class ClockSystem {
     // Minute ring (60)
     this.minuteRing = new RingPoints({
       radius: baseRadius + gap * 3.1,
-      thickness: 0.31,
-      points: this.pointsPerRing * 5,
+      thickness: 0.40,
+      points: this.pointsPerRing * 144,
       falloffFactor: 0.31,
       minTailLength: minTail,
       maxTailLength: maxTail,
@@ -115,14 +121,17 @@ export class ClockSystem {
     // Second ring (360)
     this.secondRing = new RingPoints({
       radius: baseRadius * 1.0,
-      thickness: 0.10,
-      points: this.pointsPerRing * 30,
+      thickness: 0.20,
+      points: this.pointsPerRing * 144,
       falloffFactor: 0.31,
       minTailLength: minTail,
       maxTailLength: maxTail,
       baseColor: new THREE.Color(0xd4af37),
     });
     this.root.add(this.secondRing.points);
+
+    // Tag all rings for bloom targeting (future selective bloom pipeline)
+    this.setBloomLayerEnabled(true);
 
     // Define True North for Rings (presentation transform)
     this.root.rotation.y = -Math.PI / 2;
@@ -137,28 +146,25 @@ export class ClockSystem {
     return out.copy(this.hourRing.getBaseColor());
   }
 
-  // ---------- Presence ----------
+  // ---------- Bloom tagging ----------
 
-  /** 0..1 where 0 = minimal tails, 1 = maximal tails */
-  public setPresenceLevel(value: number): void {
-    this.presenceLevel = THREE.MathUtils.clamp(value, 0, 1);
-    this.clearRingPresenceOverrides();
-  }
+  /**
+   * Enable/disable bloom layer membership for these rings.
+   * NOTE:
+   * - This only matters if your PostFX pipeline is doing selective bloom by layers.
+   * - With your current single-pass UnrealBloomPass, bloom is global.
+   */
+  public setBloomLayerEnabled(enabled: boolean): void {
+    const apply = (obj: THREE.Object3D): void => {
+      obj.traverse((o) => {
+        if (enabled) o.layers.enable(BLOOM_LAYER);
+        else o.layers.disable(BLOOM_LAYER);
+      });
+    };
 
-  public getPresenceLevel(): number {
-    return this.presenceLevel;
-  }
-
-  public setRingPresenceLevels(levels: { hour: number; minute: number; second: number }): void {
-    this.hourPresence = THREE.MathUtils.clamp(levels.hour, 0, 1);
-    this.minutePresence = THREE.MathUtils.clamp(levels.minute, 0, 1);
-    this.secondPresence = THREE.MathUtils.clamp(levels.second, 0, 1);
-  }
-
-  public clearRingPresenceOverrides(): void {
-    this.hourPresence = null;
-    this.minutePresence = null;
-    this.secondPresence = null;
+    apply(this.hourRing.points);
+    apply(this.minuteRing.points);
+    apply(this.secondRing.points);
   }
 
   // ---------- Control knobs ----------
@@ -221,13 +227,11 @@ export class ClockSystem {
     const minuteBoost = 1 + this.audioMid * 0.6;
     const secondBoost = 1 + this.audioHigh * 0.6;
 
-    const pHour = this.hourPresence ?? this.presenceLevel;
-    const pMinute = this.minutePresence ?? this.presenceLevel;
-    const pSecond = this.secondPresence ?? this.presenceLevel;
+    const tail = FIXED_TAIL_FACTOR;
 
-    this.hourRing.updateFill(hourAngle, baseIntensity * hourBoost, pHour, this.colorMode);
-    this.minuteRing.updateFill(minuteAngle, baseIntensity * minuteBoost, pMinute, this.colorMode);
-    this.secondRing.updateFill(secondAngle, baseIntensity * secondBoost, pSecond, this.colorMode);
+    this.hourRing.updateFill(hourAngle, baseIntensity * hourBoost, tail, this.colorMode);
+    this.minuteRing.updateFill(minuteAngle, baseIntensity * minuteBoost, tail, this.colorMode);
+    this.secondRing.updateFill(secondAngle, baseIntensity * secondBoost, tail, this.colorMode);
   }
 
   public dispose(): void {
@@ -283,6 +287,10 @@ class RingPoints {
       blending: THREE.AdditiveBlending,
     });
 
+    // Important for bright/bloomy neon: don’t let renderer tonemap this material down.
+    // (No harm if you later change tone mapping strategies.)
+    this.material.toneMapped = false;
+
     this.baseColor = baseColor.clone();
 
     const clampedFalloff = THREE.MathUtils.clamp(falloffFactor, 0, 1);
@@ -332,7 +340,7 @@ class RingPoints {
   public updateFill(
     headAngle: number,
     intensityScale: number = 1,
-    presenceLevel: number = 0,
+    tailFactor: number = FIXED_TAIL_FACTOR,
     mode: ClockColorMode = "classic",
   ): void {
     const tau = Math.PI * 2;
@@ -341,13 +349,13 @@ class RingPoints {
     let head = headAngle % tau;
     if (head < 0) head += tau;
 
-    const presence = THREE.MathUtils.clamp(presenceLevel, 0, 1);
+    const tail = THREE.MathUtils.clamp(tailFactor, 0, 1);
     const safeIntensityScale = Math.max(0, intensityScale);
 
-    // Tail arc purely based on presence (single-comet model)
+    // Tail arc purely based on fixed tail factor (single-comet model)
     const minArc = Math.max(this.minTailLengthFraction * tau, 1e-4);
     const maxArc = Math.max(this.maxTailLengthFraction * tau, 1e-4);
-    const tailArc = THREE.MathUtils.lerp(minArc, maxArc, presence);
+    const tailArc = THREE.MathUtils.lerp(minArc, maxArc, tail);
 
     const baseR = this.baseColor.r;
     const baseG = this.baseColor.g;
@@ -373,11 +381,14 @@ class RingPoints {
 
         const TAIL_FLOOR = 0.031;
         const shaped = Math.pow(t, this.falloffPower);
+
+        // This produces 0..1-ish, then we multiply by safeIntensityScale.
         intensity = TAIL_FLOOR + (1 - TAIL_FLOOR) * shaped;
       }
 
+      // Allow >1 so bloom can catch it. Cap for safety.
       intensity *= safeIntensityScale;
-      if (intensity > 1) intensity = 1;
+      intensity = Math.min(intensity, BLOOM_HEADROOM_MAX);
 
       const idx = i * 3;
       colors[idx] = baseR * intensity;

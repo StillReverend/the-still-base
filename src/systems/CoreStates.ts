@@ -96,35 +96,32 @@ const clamp01 = (v: number): number => {
 
 const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   blackHole: {
-    glowIntensity: 0.31,
-    ringIntensity: 1.90, // ← bump slightly for a stronger event horizon
+    glowIntensity: 0.0,
+    ringIntensity: 1.9,
     ringColor: 0xffffed,
-    glowColor: 0xccccff,
+    glowColor: 0xffffed,
     enableRealLight: true,
-    realLightIntensity: 0.35,
+    realLightIntensity: 0.99,
   },
   sol: {
-    glowIntensity: 0.31,
+    glowIntensity: 0.0,
     ringIntensity: 0.79,
     ringColor: 0xffffed,
     glowColor: 0xffa23a,
     enableRealLight: true,
-    realLightIntensity: 0.35,
+    realLightIntensity: 0.66,
   },
   luna: {
-    glowIntensity: 0.31,
+    glowIntensity: 0.010,
     ringIntensity: 0.65,
-    ringColor: 0xb8c6ff,
-    glowColor: 0xe6ecff,
+    ringColor: 0x103179,
+    glowColor: 0x093085,
     enableRealLight: true,
-    realLightIntensity: 0.35,
+    realLightIntensity: 0.33,
   },
 };
 
-function mergeTuning(
-  base: CoreStateTuning,
-  override?: Partial<CoreStateTuning>,
-): CoreStateTuning {
+function mergeTuning(base: CoreStateTuning, override?: Partial<CoreStateTuning>): CoreStateTuning {
   if (!override) return { ...base };
   return {
     glowIntensity: override.glowIntensity ?? base.glowIntensity,
@@ -302,7 +299,7 @@ function createLunaRegolithMaterial(): THREE.ShaderMaterial {
     uRim: { value: new THREE.Color(0xe6ecff) },
     uRimStrength: { value: 0.05 },
 
-    uCraterScale: { value: 2.10 },
+    uCraterScale: { value: 2.1 },
     uCraterDepth: { value: 1.0 },
     uLightDir: { value: new THREE.Vector3(0.25, 0.8, 0.35).normalize() },
   };
@@ -402,48 +399,38 @@ function createLunaRegolithMaterial(): THREE.ShaderMaterial {
       float e = clamp(uEnergy, 0.0, 1.0);
       float detail = clamp(uDetail, 0.0, 2.0);
 
-      // Drift to avoid “printed texture”
       float t = uTime * 0.03;
       vec3 p = vObjPos + vec3(t, -t, t * 0.7);
 
       float cr = craterField(p, uCraterScale, detail);
       cr = pow(cr, 1.15);
 
-      // Strong separation: pits and rims
       float pit = smoothstep(0.18, 0.78, cr);
       float rim = smoothstep(0.55, 0.90, cr) - smoothstep(0.90, 0.985, cr);
 
-      // --- ALBEDO (more aggressive) ---
-      // pits go much darker; rims get a modest lift
       vec3 col = mix(uBase, uShadow, pit * (1.10 * uCraterDepth));
       col += uBase * (rim * (0.12 * uCraterDepth));
 
-      // --- MICRO CONTRAST (cheap grit) ---
       float grit = fbm(normalize(p) * (9.0 + detail * 3.0) + vec3(9.3, 1.2, 4.7));
       grit = pow(grit, 1.4);
       col *= (0.88 + 0.22 * grit);
 
-      // --- LIGHTING with floor ---
       vec3 L = normalize(uLightDir);
       float ndl = max(dot(N, L), 0.0);
 
-      float ambient = 0.42; // higher floor keeps body visible
+      float ambient = 0.42;
       float diff = ambient + (1.0 - ambient) * ndl;
 
-      // pits catch less light, rims slightly more
       diff *= mix(1.0, 0.55, pit * uCraterDepth);
       diff *= (1.0 + rim * (0.20 * uCraterDepth));
 
       col *= mix(0.82, 1.20, diff);
 
-      // subtle view rim (bloom will amplify)
       float viewRim = pow(1.0 - max(dot(N, V), 0.0), 2.0);
       col += uRim * (viewRim * uRimStrength);
 
-      // tiny pulse
       col *= (1.0 + e * 0.02);
 
-      // bloom-safe soft compression (gentle)
       col = col / (col + vec3(1.10));
 
       gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
@@ -469,11 +456,11 @@ function createBlackHoleMaterial(): THREE.ShaderMaterial {
     uTime: { value: 0 },
     uEnergy: { value: 0 }, // 0..1 (future audio)
     uDeep: { value: new THREE.Color(0x02020a) },
-    uTint: { value: new THREE.Color(0x0b0b18) }, // faint blue-violet tint
-    uRim: { value: new THREE.Color(0xd4af37) },  // tiny gold rim echo (ties to Sol)
-    uRimStrength: { value: 0.14 },               // keep modest; bloom will amplify
-    uSwirlStrength: { value: 0.22 },             // subtle “accretion motion” hint
-    uDetail: { value: 1.0 },                     // 0..2-ish
+    uTint: { value: new THREE.Color(0x0b0b18) },
+    uRim: { value: new THREE.Color(0xd4af37) },
+    uRimStrength: { value: 0.14 },
+    uSwirlStrength: { value: 0.22 },
+    uDetail: { value: 1.0 },
   };
 
   const vertexShader = /* glsl */ `
@@ -554,14 +541,11 @@ function createBlackHoleMaterial(): THREE.ShaderMaterial {
       vec3 N = normalize(vWNormal);
       vec3 V = normalize(cameraPosition - vWPos);
 
-      // Fresnel-like horizon term: 1 at silhouette, 0 facing camera
       float ndv = clamp(dot(N, V), 0.0, 1.0);
       float rim = pow(1.0 - ndv, 3.0);
 
-      // Object-space direction
       vec3 p = normalize(vObjPos);
 
-      // Swirl coordinates: rotate around Y using time
       float t = uTime;
       float a = t * 0.22;
       mat2 rot = mat2(cos(a), -sin(a), sin(a), cos(a));
@@ -572,17 +556,14 @@ function createBlackHoleMaterial(): THREE.ShaderMaterial {
       float n = fbm(q * (3.2 * d) + vec3(t * 0.05, -t * 0.03, t * 0.04));
       n = pow(n, 1.35);
 
-      // Dark body: almost pure void, with faint tinted movement
       vec3 col = mix(uDeep, uTint, n * (0.18 + uSwirlStrength));
 
-      // Event horizon: a thin bright band near the rim
       float e = clamp(uEnergy, 0.0, 1.0);
       float horizon = smoothstep(0.55, 0.98, rim);
       float band = horizon * (0.10 + e * 0.10);
 
       col += uRim * band * uRimStrength;
 
-      // Bloom-safe compression: keeps it punchy without blowing out
       col = col / (col + vec3(1.35));
 
       gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
@@ -612,8 +593,6 @@ type Glow = {
 };
 
 function createGlow(coreRadius: number): Glow {
-  // IMPORTANT: These start OUTSIDE the core radius so they do not tint the core.
-  // The core (depthTest:true) occludes these shells where they overlap on screen.
   const innerRadius = coreRadius * 1.02;
   const outerRadius = coreRadius * 1.42;
 
@@ -662,26 +641,23 @@ type Ring = {
 };
 
 function createRing(coreRadius: number): Ring {
-  // Ring is a tight band just outside the surface.
   const baseOuterRadius = coreRadius * 1.02;
-
   const geom = new THREE.SphereGeometry(baseOuterRadius, 64, 64);
 
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uColor: { value: new THREE.Color(0xffffff) },
       uIntensity: { value: 1.0 },
-      uPower: { value: 3.2 },   // rim tightness (higher = thinner)
-      uSoft: { value: 0.85 },   // soften/fatten the rim slightly
+      uPower: { value: 3.2 },
+      uSoft: { value: 0.85 },
 
-      // NEW: time + subtle lensing wobble + micro doppler tinting
       uTime: { value: 0.0 },
-      uWobbleStrength: { value: 0.0 },   // 0..~0.06 recommended
-      uWobbleSpeed: { value: 0.7 },      // 0.2..1.2
-      uWobbleScale: { value: 2.1 },      // 1..6
+      uWobbleStrength: { value: 0.0 }, // 0..0.06 recommended
+      uWobbleSpeed: { value: 0.7 },
+      uWobbleScale: { value: 2.1 },
 
-      uDopplerStrength: { value: 0.0 },  // 0..~0.18 recommended
-      uSpinAxis: { value: new THREE.Vector3(0, 1, 0) }, // world-space axis
+      uDopplerStrength: { value: 0.0 }, // 0..0.18 recommended
+      uSpinAxis: { value: new THREE.Vector3(0, 1, 0) },
     },
     vertexShader: /* glsl */ `
       varying vec3 vWorldPos;
@@ -714,7 +690,6 @@ function createRing(coreRadius: number): Ring {
       varying vec3 vWorldPos;
       varying vec3 vWorldNormal;
 
-      // cheap hashy noise (stable, no textures)
       float hash(vec3 p) {
         p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
         p *= 17.0;
@@ -762,58 +737,42 @@ function createRing(coreRadius: number): Ring {
         vec3 N = normalize(vWorldNormal);
         vec3 V = normalize(cameraPosition - vWorldPos);
 
-        // -----------------------------
-        // Lensing wobble (subtle)
-        // Idea: perturb ndv near the silhouette so the horizon “shimmers”
-        // -----------------------------
         float ndv = clamp(dot(N, V), 0.0, 1.0);
 
-        float rimBase = 1.0 - ndv;              // 0 center, 1 silhouette
-        float rimMask = smoothstep(0.25, 1.0, rimBase); // only affect rim-ish area
+        float rimBase = 1.0 - ndv;
+        float rimMask = smoothstep(0.25, 1.0, rimBase);
 
         float t = uTime * uWobbleSpeed;
         float n = fbm(N * uWobbleScale + vec3(t, -t * 0.8, t * 0.6));
-        n = (n * 2.0 - 1.0); // -1..1
+        n = (n * 2.0 - 1.0);
 
-        // Tiny perturbation to ndv makes the rim “wobble” instead of a static line
         float ndvWarped = clamp(ndv + n * uWobbleStrength * rimMask, 0.0, 1.0);
 
-        // Rim term: 1 at silhouette, 0 when facing camera
         float rim = pow(1.0 - ndvWarped, uPower);
-
-        // Soft shaping so it reads like a band, not a harsh line
         rim = smoothstep(0.0, uSoft, rim);
 
-        float a = rim * uIntensity;
+        // NOTE: keep alpha bloom-safe (cap)
+        float a = clamp(rim * uIntensity, 0.0, 0.95);
 
-        // -----------------------------
-        // Micro Doppler tint near horizon
-        // Idea: treat ring as rotating; side moving toward camera gets slightly bluer,
-        // away gets slightly warmer. Keep it *tiny*.
-        // -----------------------------
         vec3 axis = normalize(uSpinAxis);
-        vec3 tangent = normalize(cross(axis, N)); // rotational direction around axis
-
-        // "approach" is + when tangent points toward camera direction
+        vec3 tangent = normalize(cross(axis, N));
         float approach = dot(tangent, V);
 
-        float dopMask = rimMask * a; // only tint where ring is visible
+        float dopMask = rimMask * a;
         float d = clamp(approach * uDopplerStrength, -1.0, 1.0);
 
-        // Warm/cool nudges (super small)
         vec3 cool = vec3(0.08, 0.10, 0.16);
         vec3 warm = vec3(0.16, 0.10, 0.04);
 
         vec3 tint = (d >= 0.0) ? cool * d : warm * (-d);
-
-        vec3 outCol = uColor + tint * dopMask;
+        vec3 outCol = clamp(uColor + tint * dopMask, 0.0, 1.0);
 
         gl_FragColor = vec4(outCol, a);
       }
     `,
     transparent: true,
     depthWrite: false,
-    depthTest: true,                 // keep true so core can occlude the far side
+    depthTest: true,
     blending: THREE.AdditiveBlending,
     side: THREE.FrontSide,
   });
@@ -826,7 +785,7 @@ function createRing(coreRadius: number): Ring {
 }
 
 // ------------------------------------------------------------
-// States (core surface + optional real light only)
+// States
 // ------------------------------------------------------------
 
 function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBundle {
@@ -840,7 +799,6 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
   coreMesh.name = "CoreSurface_blackHole";
   coreMesh.renderOrder = 100;
 
-  // Usually OFF for black hole. If you enable later, keep it extremely subtle.
   const realLight = tuning.enableRealLight
     ? new THREE.PointLight(new THREE.Color(tuning.ringColor), tuning.realLightIntensity, radius * 20)
     : null;
@@ -862,11 +820,6 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
     const q = clamp01(quality.value);
 
     coreMat.uniforms.uTime.value += dt;
-
-    // For now: keep energy near-zero unless you want subtle breathing even pre-audio.
-    // If you want a tiny alive pulse without AudioSystem, uncomment next line:
-    // coreMat.uniforms.uEnergy.value = 0.06 + 0.04 * sin(coreMat.uniforms.uTime.value * 0.6);
-
     coreMat.uniforms.uEnergy.value = energy;
     coreMat.uniforms.uDetail.value = 0.85 + q * 1.0;
 
@@ -878,7 +831,6 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
   const dispose = (): void => {
     group.remove(coreMesh);
     if (realLight) group.remove(realLight);
-
     coreGeom.dispose();
     coreMat.dispose();
   };
@@ -937,7 +889,6 @@ function createSolState(radius: number, tuning: CoreStateTuning): StateBundle {
   const dispose = (): void => {
     group.remove(coreMesh);
     if (realLight) group.remove(realLight);
-
     coreGeom.dispose();
     coreMat.dispose();
   };
@@ -982,22 +933,21 @@ function createLunaState(radius: number, tuning: CoreStateTuning): StateBundle {
   };
 
   const update = (dt: number, audio: CoreAudioFrame, quality: CoreQuality): void => {
-  const energy = clamp01(audio.energy ?? 0);
-  const q = clamp01(quality.value);
+    const energy = clamp01(audio.energy ?? 0);
+    const q = clamp01(quality.value);
 
-  coreMat.uniforms.uTime.value += dt;
-  coreMat.uniforms.uEnergy.value = energy;
-  coreMat.uniforms.uDetail.value = 0.75 + q * 1.0;
+    coreMat.uniforms.uTime.value += dt;
+    coreMat.uniforms.uEnergy.value = energy;
+    coreMat.uniforms.uDetail.value = 0.75 + q * 1.0;
 
-  if (realLight) {
-    realLight.intensity = tuning.realLightIntensity * (0.65 + energy * 0.6);
-  }
-};
+    if (realLight) {
+      realLight.intensity = tuning.realLightIntensity * (0.65 + energy * 0.6);
+    }
+  };
 
   const dispose = (): void => {
     group.remove(coreMesh);
     if (realLight) group.remove(realLight);
-
     coreGeom.dispose();
     coreMat.dispose();
   };
@@ -1026,8 +976,8 @@ export class CoreStates {
   private readonly quality: CoreQuality = { value: 1 };
   private readonly states: Record<CoreStateName, StateBundle>;
 
-  private readonly Glow: Glow;
-  private readonly Ring: Ring;
+  private readonly glow: Glow;
+  private readonly ring: Ring;
 
   private active: CoreStateName;
 
@@ -1044,23 +994,22 @@ export class CoreStates {
       luna: mergeTuning(defaultTuning.luna, deps.tuning?.luna),
     };
 
-    // Create per-state core surface groups (no per-state halo/ring duplication)
     const blackHole = createBlackHoleState(this.radius, tuning.blackHole);
     const sol = createSolState(this.radius, tuning.sol);
     const luna = createLunaState(this.radius, tuning.luna);
 
     this.states = { blackHole, sol, luna };
 
-    // Shared halo + ring (single instances)
-    this.Glow = createGlow(this.radius);
-    this.Ring = createRing(this.radius);
+    this.glow = createGlow(this.radius);
+    this.ring = createRing(this.radius);
 
-    // Layering: core groups first, then shared halo/ring after (but depthTest controls occlusion).
     this.group.add(blackHole.group);
     this.group.add(sol.group);
     this.group.add(luna.group);
-    //this.group.add(this.Glow.group);
-    this.group.add(this.Ring.mesh);
+
+    // Shared halo elements (single instances)
+    this.group.add(this.glow.group);
+    this.group.add(this.ring.mesh);
 
     this.active = deps.initialState ?? "blackHole";
 
@@ -1068,7 +1017,6 @@ export class CoreStates {
     this.states.sol.setVisible(this.active === "sol");
     this.states.luna.setVisible(this.active === "luna");
 
-    // Initialize shared halo/ring colors from the active state
     this.applySharedColorFromState(this.active);
 
     this.parent.add(this.group);
@@ -1104,31 +1052,28 @@ export class CoreStates {
       high: audio?.high,
     };
 
-    // Per-state core update (plasma, real light modulation, etc.)
     this.states[this.active].update(dt, a, this.quality);
 
-    // Shared halo + ring response, driven by ACTIVE state's tuning
+    // Safety: if shared meshes ever get removed/rolled back, don’t hard-crash the engine loop.
+    if (!this.ring?.mat || !this.glow?.innerMat || !this.glow?.outerMat) return;
+
     const t = this.states[this.active].tuning;
     const energy = clamp01(a.energy ?? 0);
 
-    // ----------------------------------------------------------
-    // NEW: time drive + per-state horizon effects
-    // ----------------------------------------------------------
-    const uni = this.Ring.mat.uniforms as any;
+    const uni = this.ring.mat.uniforms as any;
 
-    // Time always advances (even if wobble is zero)
     if (uni.uTime) {
       uni.uTime.value = (uni.uTime.value as number) + dt;
     }
 
-    // Per-state tuning (safe even if some uniforms aren't present yet)
+    // Per-state horizon effects
     if (this.active === "blackHole") {
-      const e = energy; // already computed above
-      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.31 + e * 0.02;; // try 0.03..0.06
+      const e = energy;
+      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.045 + e * 0.015; // ~0.045..0.06
       if (uni.uWobbleSpeed) uni.uWobbleSpeed.value = 0.46;
       if (uni.uWobbleScale) uni.uWobbleScale.value = 3.0;
 
-      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.9 + e * 0.03;; // try 0.08..0.18
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.10 + e * 0.06; // ~0.10..0.16
       if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     } else if (this.active === "sol") {
       if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.012;
@@ -1138,48 +1083,47 @@ export class CoreStates {
       if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.05;
       if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     } else {
-      // luna
       if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.0;
       if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.0;
     }
 
-    // Glow opacity pulse (outer shell expands)
+    // Glow response (subtle, bloom-safe)
     const innerBase = 0.14;
     const innerAmp = 0.14;
     const outerBase = 0.06;
     const outerAmp = 0.12;
 
-    //this.Glow.innerMat.opacity = (innerBase + energy * innerAmp) * t.glowIntensity;
-    //this.Glow.outerMat.opacity = (outerBase + energy * outerAmp) * t.glowIntensity;
+    const glowGain = t.glowIntensity; // state knob (currently 0.0 in your tuning)
+    this.glow.innerMat.opacity = THREE.MathUtils.clamp((innerBase + energy * innerAmp) * glowGain, 0, 0.65);
+    this.glow.outerMat.opacity = THREE.MathUtils.clamp((outerBase + energy * outerAmp) * glowGain, 0, 0.55);
 
     const s = 1.0 + energy * 0.38;
-    //this.Glow.outer.scale.setScalar(s);
+    this.glow.outer.scale.setScalar(s);
 
-    // Ring intensity + slight breathing
-    this.Ring.mat.uniforms.uIntensity.value = (0.65 + energy * 0.85) * t.ringIntensity;
+    // Ring intensity + breathing (THIS is a usual bloom-pop culprit)
+    const ringIntensityRaw = (0.65 + energy * 0.85) * t.ringIntensity;
 
-    // Keep time stepping available if you ever want later (no-op now)
-    void dt;
+    // Bloom-safe cap: keep ring driving bloom but not detonating it.
+    const ringIntensity = THREE.MathUtils.clamp(ringIntensityRaw, 0.0, 0.95);
+
+    if (uni.uIntensity) uni.uIntensity.value = ringIntensity;
   }
 
   public dispose(): void {
     this.parent.remove(this.group);
 
-    // states
     this.states.blackHole.dispose();
     this.states.sol.dispose();
     this.states.luna.dispose();
 
-    // shared glow
-    this.Glow.group.remove(this.Glow.inner, this.Glow.outer);
-    (this.Glow.inner.geometry as THREE.BufferGeometry).dispose();
-    (this.Glow.outer.geometry as THREE.BufferGeometry).dispose();
-    this.Glow.innerMat.dispose();
-    this.Glow.outerMat.dispose();
+    this.glow.group.remove(this.glow.inner, this.glow.outer);
+    (this.glow.inner.geometry as THREE.BufferGeometry).dispose();
+    (this.glow.outer.geometry as THREE.BufferGeometry).dispose();
+    this.glow.innerMat.dispose();
+    this.glow.outerMat.dispose();
 
-    // shared ring
-    this.Ring.mesh.geometry.dispose();
-    this.Ring.mat.dispose();
+    this.ring.mesh.geometry.dispose();
+    this.ring.mat.dispose();
 
     this.group.clear();
   }
@@ -1187,12 +1131,11 @@ export class CoreStates {
   private applySharedColorFromState(state: CoreStateName): void {
     const t = this.states[state].tuning;
 
-    this.Glow.innerMat.color.set(t.glowColor as any);
-    this.Glow.outerMat.color.set(t.glowColor as any);
+    this.glow.innerMat.color.set(t.glowColor as any);
+    this.glow.outerMat.color.set(t.glowColor as any);
 
-    (this.Ring.mat.uniforms.uColor.value as THREE.Color).set(t.ringColor as any);
+    (this.ring.mat.uniforms.uColor.value as THREE.Color).set(t.ringColor as any);
 
-    // If the active state has a real light, keep it colored with ring color.
     const rl = this.states[state].realLight;
     if (rl) rl.color.set(t.ringColor as any);
   }

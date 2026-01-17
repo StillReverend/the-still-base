@@ -91,17 +91,17 @@ export class DemoScene implements SceneController {
 
   private buildLights(): void {
     this.ambientLight = new THREE.AmbientLight(0x404060, 0.6);
-    this.scene.add(this.ambientLight);
+    //this.scene.add(this.ambientLight);
 
     this.keyLight = new THREE.DirectionalLight(0xfff2d1, 1.0);
     this.keyLight.position.set(6, 8, 5);
     this.keyLight.castShadow = false;
-    this.scene.add(this.keyLight);
+    //this.scene.add(this.keyLight);
 
     this.rimLight = new THREE.DirectionalLight(0x6fa9ff, 0.7);
     this.rimLight.position.set(-5, -3, -7);
     this.rimLight.castShadow = false;
-    this.scene.add(this.rimLight);
+    //this.scene.add(this.rimLight);
   }
 
   private buildCoreAndClock(ctx: SceneContext): void {
@@ -113,7 +113,7 @@ export class DemoScene implements SceneController {
     });
 
     // Start in desired phase (change as needed)
-    const phase: CorePhase = "black_hole";
+    const phase: CorePhase = "lunar";
     this.core.setPhase(phase);
 
     // At P03, shrinkLevel = 0 (largest core)
