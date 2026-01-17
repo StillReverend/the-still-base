@@ -50,6 +50,11 @@ export class Engine {
 
   private lastRenderScene: THREE.Scene | null = null;
 
+  // Resize jitter guard (mobile URL bar, subtle viewport “breathing”)
+  private lastResizeW = -1;
+  private lastResizeH = -1;
+  private lastResizePR = -1;
+
   constructor(deps: EngineDeps) {
     this.canvas = deps.canvas;
     this.bus = deps.bus;
@@ -58,11 +63,18 @@ export class Engine {
     this.resolveScene = deps.resolveScene;
 
     // Renderer
+    // ✅ OPAQUE CANVAS: removes “DOM background bleed” flashes.
     this.renderer = new THREE.WebGLRenderer({
       canvas: this.canvas,
       antialias: true,
-      alpha: true,
+      alpha: false,
+      premultipliedAlpha: false,
+      powerPreference: "high-performance",
     });
+
+    // ✅ Stable clear baseline
+    this.renderer.setClearColor(0x000000, 1.0);
+
     this.renderer.setPixelRatio(this.config.pixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
 
@@ -145,25 +157,26 @@ export class Engine {
     // Dev-only debug overlay
     if (import.meta.env.DEV) {
       this.debugOverlay = new DebugOverlay(this.camera, this.bus);
-    }
 
-    if (import.meta.env.DEV) {
-  window.addEventListener("keydown", (e) => {
-    if (e.key.toLowerCase() === "b") {
-      const s = this.postFX.getSettings();
-      this.postFX.setBloomEnabled(!s.bloom.enabled);
-      // eslint-disable-next-line no-console
-      console.log(`[Dev] Bloom ${!s.bloom.enabled ? "ON" : "OFF"}`);
-    }
+      // Dev hotkeys
+      window.addEventListener("keydown", (e) => {
+        const key = e.key.toLowerCase();
 
-    if (e.key.toLowerCase() === "p") {
-      const s = this.postFX.getSettings();
-      this.postFX.setEnabled(!s.enabled);
-      // eslint-disable-next-line no-console
-      console.log(`[Dev] PostFX ${!s.enabled ? "ON" : "OFF"}`);
+        if (key === "b") {
+          const s = this.postFX.getSettings();
+          this.postFX.setBloomEnabled(!s.bloom.enabled);
+          // eslint-disable-next-line no-console
+          console.log(`[Dev] Bloom ${!s.bloom.enabled ? "ON" : "OFF"}`);
+        }
+
+        if (key === "p") {
+          const s = this.postFX.getSettings();
+          this.postFX.setEnabled(!s.enabled);
+          // eslint-disable-next-line no-console
+          console.log(`[Dev] PostFX ${!s.enabled ? "ON" : "OFF"}`);
+        }
+      });
     }
-  });
-}
 
     window.addEventListener("resize", this.handleResize);
     this.handleResize();
@@ -188,46 +201,65 @@ export class Engine {
 
     const dt = Math.min(dtRaw, this.config.maxDeltaTime);
 
+    // Controls -> camera
     const snapshot = this.controlSystem.consumeSnapshot();
     this.cameraSystem.applyControlDeltas(snapshot.rotateDelta, snapshot.dollyDelta);
     this.cameraSystem.update(dt);
 
+    // Scene update
     this.sceneManager.update(dt);
 
-    // Update debug HUD (dev only)
+    // Debug overlay (dev only)
     if (this.debugOverlay) {
       this.debugOverlay.update(dt);
     }
 
+    // Optional dev log: dt spikes often correlate with “pop” moments
+    if (import.meta.env.DEV && dtRaw > 0.05) {
+      // eslint-disable-next-line no-console
+      console.log(`[Perf] dt spike: ${dtRaw.toFixed(3)}s (clamped to ${dt.toFixed(3)}s)`);
+    }
+
+    // Render (PostFX owns rendering)
     const current = this.sceneManager.getCurrentScene();
     if (current) {
       if (this.lastRenderScene !== current.scene) {
         this.postFX.setTargets(current.scene, this.camera);
         this.lastRenderScene = current.scene;
       }
+
+      this.postFX.update(dt);
       this.postFX.render();
     }
 
     requestAnimationFrame(this.loop);
   };
 
-  // IMPORTANT:
-  // Renderer + PostFX must share the SAME capped pixel ratio.
-  // Higher DPR causes bloom threshold shimmer in fullscreen (Solar mode).
-  // pr=1.0 is intentional and stable.
-
   private handleResize = (): void => {
-    const w = window.innerWidth;
-    const h = window.innerHeight;
+    const w = Math.floor(window.innerWidth);
+    const h = Math.floor(window.innerHeight);
 
     const dpr = window.devicePixelRatio || 1;
 
-    // ✅ Known-good anti-flicker cap (start here)
+    // ✅ Keep this conservative for stability
     const pr = Math.min(dpr, 1.0);
 
-    // Renderer + PostFX must agree on pixel ratio to prevent shimmer
+    const ignorePx = 1;
+    const wChanged = Math.abs(w - this.lastResizeW) > ignorePx;
+    const hChanged = Math.abs(h - this.lastResizeH) > ignorePx;
+    const prChanged = Math.abs(pr - this.lastResizePR) > 0.001;
+
+    if (!wChanged && !hChanged && !prChanged) return;
+
+    this.lastResizeW = w;
+    this.lastResizeH = h;
+    this.lastResizePR = pr;
+
     this.renderer.setPixelRatio(pr);
     this.renderer.setSize(w, h, false);
+
+    // ✅ Always re-assert opaque clear after resize
+    this.renderer.setClearColor(0x000000, 1.0);
 
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();

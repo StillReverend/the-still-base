@@ -14,7 +14,19 @@ import { DemoScene } from "./scenes/DemoScene";
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const _three = THREE;
 
-function createCanvasRoot(): HTMLCanvasElement {
+// ------------------------------------------------------------
+// DEV singleton guard (prevents double RAF loops after HMR)
+// ------------------------------------------------------------
+
+type GlobalWithStill = typeof window & {
+  __THE_STILL_ENGINE__?: Engine;
+};
+
+function getGlobal(): GlobalWithStill {
+  return window as GlobalWithStill;
+}
+
+function createOrReuseCanvas(): HTMLCanvasElement {
   let root = document.getElementById("app");
   if (!root) {
     root = document.createElement("div");
@@ -22,9 +34,11 @@ function createCanvasRoot(): HTMLCanvasElement {
     document.body.appendChild(root);
   }
 
+  const existing = document.getElementById("the-still-canvas") as HTMLCanvasElement | null;
+  if (existing) return existing;
+
   const canvas = document.createElement("canvas");
   canvas.id = "the-still-canvas";
-
   root.appendChild(canvas);
   return canvas;
 }
@@ -40,8 +54,24 @@ function resolveScene(name: SceneName): SceneController | null {
   return factory();
 }
 
+function destroyExistingEngineIfAny(): void {
+  const g = getGlobal();
+  if (g.__THE_STILL_ENGINE__) {
+    try {
+      g.__THE_STILL_ENGINE__.dispose();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn("[entry] Error disposing previous Engine (continuing).", err);
+    }
+    g.__THE_STILL_ENGINE__ = undefined;
+  }
+}
+
 function main(): void {
-  const canvas = createCanvasRoot();
+  // ✅ Critical: kill any previous Engine (HMR can leave RAF running)
+  destroyExistingEngineIfAny();
+
+  const canvas = createOrReuseCanvas();
 
   const bus = createEventBus();
   const config = createDefaultConfig();
@@ -62,9 +92,9 @@ function main(): void {
 
   engine.start();
 
+  // Expose in DEV for inspection and to support singleton disposal above
   if (import.meta.env.DEV) {
-    (window as unknown as { __THE_STILL_ENGINE__?: Engine }).__THE_STILL_ENGINE__ =
-      engine;
+    getGlobal().__THE_STILL_ENGINE__ = engine;
 
     window.addEventListener("keydown", (ev) => {
       if (ev.key === "1") {
@@ -76,10 +106,23 @@ function main(): void {
 
     // eslint-disable-next-line no-console
     console.log(
-      `[entry] Initial scene: ${initialSceneName} (lastScene: ${
-        lastScene ?? "none"
-      })`,
+      `[entry] Initial scene: ${initialSceneName} (lastScene: ${lastScene ?? "none"})`,
     );
+  }
+
+  // ✅ HMR cleanup: ensures no zombie RAF loops survive module replacement
+  // This is the single biggest “it came back after save/commit” fix in Vite dev.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const hot = (import.meta as any).hot as { dispose?: (cb: () => void) => void } | undefined;
+  if (hot?.dispose) {
+    hot.dispose(() => {
+      try {
+        engine.dispose();
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[entry] Error disposing Engine during HMR dispose.", err);
+      }
+    });
   }
 }
 

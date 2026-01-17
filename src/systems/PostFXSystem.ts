@@ -2,29 +2,10 @@
 // ============================================================
 // THE STILL — PostFXSystem (robust + CoreSystem-compatible)
 // ------------------------------------------------------------
-// Required API (used across Engine/Core):
-//  - constructor({ renderer, scene, camera, width, height, pixelRatio, settings })
-//  - setTargets(scene, camera)
-//  - setProfile(profileName)
-//  - getSettings()
-//  - setEnabled(enabled)
-//  - setBloomEnabled(enabled)
-//  - update(dtSeconds)
-//  - render()
-//  - resize(w, h, pr)
-//  - dispose()
-//
-// Design goals:
-//  - Rock-solid bloom (no full-screen “flash”)
-//  - Never toggle bloom pass: fade strength to 0
-//  - Resize guards ignore 1px jitter
-//  - Attack/release smoothing + dt clamp
-//  - Profiles = stable look switching w/o rebuilding pipeline
-//
-// Key hardening vs “flash after resize”:
-//  1) Enforce renderer state baseline every render (prevents drift from other systems)
-//  2) After any real resize, prime render targets (two warmup renders with bloom=0)
-//  3) During stabilization frames, snap bloom strength (no smoothing surprise)
+// Key hardening vs “flash”:
+//  - Force opaque clear baseline (black, alpha=1) every render
+//  - Never rely on DOM background (alpha canvas) for stability
+//  - Guard all numeric settings against non-finite values
 // ============================================================
 
 import * as THREE from "three";
@@ -57,13 +38,13 @@ export interface BloomSettings {
 }
 
 export interface StabilitySettings {
-  dtClampSeconds: number; // clamp huge dt spikes (tab focus, hitches)
-  bloomAttack: number; // faster ramp-up
-  bloomRelease: number; // slower ramp-down
-  resizeIgnorePxJitter: number; // ignore +/- N px changes
-  maxBloomStrength: number; // safety clamp for bloom target
-  stabilizationFrames: number; // frames to snap strength after resize
-  primeFrames: number; // warmup renders after resize (bloom=0)
+  dtClampSeconds: number;
+  bloomAttack: number;
+  bloomRelease: number;
+  resizeIgnorePxJitter: number;
+  maxBloomStrength: number;
+  stabilizationFrames: number;
+  primeFrames: number;
 }
 
 export interface PostFXSettings {
@@ -102,7 +83,10 @@ export interface PostFXDeps {
 
 const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
+
 const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
+
+const n = (v: number, fallback: number): number => (isFiniteNumber(v) ? v : fallback);
 
 const expSmooth = (current: number, target: number, speed: number, dt: number): number => {
   const s = Math.max(0, speed);
@@ -158,59 +142,16 @@ const DEFAULT_SETTINGS: PostFXSettings = {
   activeProfile: "default",
 };
 
-/**
- * IMPORTANT: match CoreSystem mapping:
- *  - solar -> "solar"
- *  - lunar -> "luna"
- *  - black_hole -> "blackHole"
- *
- * Also keep aliases ("sun","moon","void") so older code won’t break.
- */
 const DEFAULT_PROFILES: PostFXProfile[] = [
-  {
-    name: "default",
-    enabled: true,
-    bloom: { enabled: true, strength: 1.05, radius: 0.55, threshold: 0.12 },
-  },
-
-  // CoreSystem targets:
-  {
-    name: "solar",
-    enabled: true,
-    bloom: { enabled: true, strength: 1.25, radius: 0.65, threshold: 0.10 },
-  },
-  {
-    name: "luna",
-    enabled: true,
-    bloom: { enabled: true, strength: 0.9, radius: 0.5, threshold: 0.18 },
-  },
-  {
-    name: "blackHole",
-    enabled: true,
-    bloom: { enabled: true, strength: 1.0, radius: 0.6, threshold: 0.14 },
-  },
-
-  // Aliases (safe):
+  { name: "default", enabled: true, bloom: { enabled: true, strength: 1.05, radius: 0.55, threshold: 0.12 } },
+  { name: "solar", enabled: true, bloom: { enabled: true, strength: 1.25, radius: 0.65, threshold: 0.10 } },
+  { name: "luna", enabled: true, bloom: { enabled: true, strength: 0.9, radius: 0.5, threshold: 0.18 } },
+  { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.6, threshold: 0.14 } },
   { name: "sun", enabled: true, bloom: { enabled: true, strength: 1.25, radius: 0.65, threshold: 0.10 } },
   { name: "moon", enabled: true, bloom: { enabled: true, strength: 0.9, radius: 0.5, threshold: 0.18 } },
   { name: "void", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.6, threshold: 0.14 } },
-
   { name: "off", enabled: false, bloom: { enabled: false, strength: 0.0, radius: 0.0, threshold: 1.0 } },
 ];
-
-// ------------------------------------------------------------
-// Renderer baseline enforcement (prevents drift-trigger flashes)
-// ------------------------------------------------------------
-
-type RendererBaseline = {
-  autoClear: boolean;
-  clearColor: THREE.Color;
-  clearAlpha: number;
-  toneMapping: THREE.ToneMapping;
-  toneMappingExposure: number;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  outputColorSpace?: any;
-};
 
 // ------------------------------------------------------------
 // PostFXSystem
@@ -230,27 +171,22 @@ export class PostFXSystem {
   private height = 1;
   private pixelRatio = 1;
 
-  // Bloom smoothing
   private bloomStrengthCurrent = 0;
   private bloomStrengthTarget = 0;
 
-  // Targets
   private targetScene: THREE.Scene;
   private targetCamera: THREE.Camera;
 
-  // Profiles
   private profiles: Map<string, PostFXProfile>;
 
-  // Debug tripwires
   private readonly debugEnabled: boolean;
   private lastLoggedBloomTarget = -999;
 
-  // Renderer baseline enforcement
-  private baseline: RendererBaseline | null = null;
-
-  // Resize stabilization
   private framesToStabilize = 0;
   private primeRendersRemaining = 0;
+
+  // ✅ Opaque baseline (black)
+  private readonly opaqueClearColor = new THREE.Color(0x000000);
 
   constructor(deps: PostFXDeps) {
     this.renderer = deps.renderer;
@@ -270,7 +206,6 @@ export class PostFXSystem {
     const allProfiles = [...DEFAULT_PROFILES, ...(deps.profiles ?? [])];
     this.profiles = new Map(allProfiles.map((p) => [p.name, p]));
 
-    // Composer pipeline (stable, never rebuilt)
     this.composer = new EffectComposer(this.renderer);
     this.composer.setPixelRatio(this.pixelRatio);
     this.composer.setSize(this.width, this.height);
@@ -279,7 +214,7 @@ export class PostFXSystem {
 
     this.bloomPass = new UnrealBloomPass(
       new THREE.Vector2(this.width, this.height),
-      0.0, // strength set dynamically
+      0.0,
       clamp01(this.settings.bloom.radius),
       clamp01(this.settings.bloom.threshold),
     );
@@ -291,21 +226,12 @@ export class PostFXSystem {
     this.composer.addPass(this.bloomPass);
     this.composer.addPass(this.outputPass);
 
-    // Capture baseline renderer state (what the rest of your app “should” see)
-    this.baseline = this.captureBaselineRendererState();
-
-    // Apply initial params
     this.syncBloomStaticParams();
     this.setBloomEnabled(this.settings.bloom.enabled, true);
     this.setEnabled(this.settings.enabled, true);
 
-    // Ensure internal RT sizes are correct
     this.resize(this.width, this.height, this.pixelRatio);
   }
-
-  // ----------------------------------------------------------
-  // CoreSystem compatibility
-  // ----------------------------------------------------------
 
   public setProfile(profileName: PostFXProfileName): void {
     if (this.debugEnabled) {
@@ -328,14 +254,20 @@ export class PostFXSystem {
 
     this.settings = deepMergeSettings(this.settings, next);
 
+    // ✅ sanitize any external/merged numeric values
+    this.settings.bloom.strength = n(this.settings.bloom.strength, DEFAULT_SETTINGS.bloom.strength);
+    this.settings.bloom.radius = n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius);
+    this.settings.bloom.threshold = n(this.settings.bloom.threshold, DEFAULT_SETTINGS.bloom.threshold);
+
+    this.settings.stability.dtClampSeconds = n(this.settings.stability.dtClampSeconds, DEFAULT_SETTINGS.stability.dtClampSeconds);
+    this.settings.stability.bloomAttack = n(this.settings.stability.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack);
+    this.settings.stability.bloomRelease = n(this.settings.stability.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease);
+    this.settings.stability.maxBloomStrength = n(this.settings.stability.maxBloomStrength, DEFAULT_SETTINGS.stability.maxBloomStrength);
+
     this.syncBloomStaticParams();
     this.setEnabled(this.settings.enabled);
     this.setBloomEnabled(this.settings.bloom.enabled);
   }
-
-  // ----------------------------------------------------------
-  // Public API
-  // ----------------------------------------------------------
 
   public getSettings(): PostFXSettings {
     return {
@@ -356,7 +288,7 @@ export class PostFXSystem {
   public setEnabled(enabled: boolean, instant = false): void {
     this.settings.enabled = enabled;
 
-    const base = this.settings.enabled && this.settings.bloom.enabled ? this.settings.bloom.strength : 0;
+    const base = this.settings.enabled && this.settings.bloom.enabled ? n(this.settings.bloom.strength, 0) : 0;
     this.bloomStrengthTarget = Math.max(0, base);
 
     if (instant) {
@@ -368,7 +300,7 @@ export class PostFXSystem {
   public setBloomEnabled(enabled: boolean, instant = false): void {
     this.settings.bloom.enabled = enabled;
 
-    const base = this.settings.enabled && enabled ? this.settings.bloom.strength : 0;
+    const base = this.settings.enabled && enabled ? n(this.settings.bloom.strength, 0) : 0;
     this.bloomStrengthTarget = Math.max(0, base);
 
     if (instant) {
@@ -381,13 +313,18 @@ export class PostFXSystem {
     const st = this.settings.stability;
 
     const dtSafe = isFiniteNumber(dtSeconds) ? dtSeconds : 0;
-    const dtClamp = Math.max(1 / 120, st.dtClampSeconds);
+    const dtClamp = Math.max(1 / 120, n(st.dtClampSeconds, DEFAULT_SETTINGS.stability.dtClampSeconds));
     const dt = clamp(dtSafe, 0, dtClamp);
 
     this.syncBloomStaticParams();
 
-    const base = this.settings.enabled && this.settings.bloom.enabled ? Math.max(0, this.settings.bloom.strength) : 0;
-    this.bloomStrengthTarget = clamp(base, 0, Math.max(0.25, st.maxBloomStrength));
+    const base =
+      this.settings.enabled && this.settings.bloom.enabled
+        ? Math.max(0, n(this.settings.bloom.strength, DEFAULT_SETTINGS.bloom.strength))
+        : 0;
+
+    const maxStrength = Math.max(0.25, n(st.maxBloomStrength, DEFAULT_SETTINGS.stability.maxBloomStrength));
+    this.bloomStrengthTarget = clamp(base, 0, maxStrength);
 
     if (this.debugEnabled && Math.abs(this.bloomStrengthTarget - this.lastLoggedBloomTarget) > 0.15) {
       this.lastLoggedBloomTarget = this.bloomStrengthTarget;
@@ -401,7 +338,6 @@ export class PostFXSystem {
       );
     }
 
-    // After resize, snap strength for a few frames (no smoothing surprises)
     if (this.framesToStabilize > 0) {
       this.bloomStrengthCurrent = this.bloomStrengthTarget;
       this.bloomPass.strength = this.bloomStrengthCurrent;
@@ -409,7 +345,10 @@ export class PostFXSystem {
       return;
     }
 
-    const speed = this.bloomStrengthTarget > this.bloomStrengthCurrent ? st.bloomAttack : st.bloomRelease;
+    const attack = n(st.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack);
+    const release = n(st.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease);
+    const speed = this.bloomStrengthTarget > this.bloomStrengthCurrent ? attack : release;
+
     this.bloomStrengthCurrent = expSmooth(this.bloomStrengthCurrent, this.bloomStrengthTarget, speed, dt);
 
     if (!isFiniteNumber(this.bloomStrengthCurrent)) {
@@ -425,23 +364,21 @@ export class PostFXSystem {
   }
 
   public render(): void {
-    // 1) Enforce renderer baseline every render (prevents “drift flash”)
-    this.applyBaselineRendererState();
+    // ✅ The money shot: force opaque baseline every frame
+    this.renderer.autoClear = true;
+    this.renderer.setClearColor(this.opaqueClearColor, 1.0);
+    this.renderer.clear(true, true, true);
 
-    // 2) Prime render targets after resize: render bloom=0 a couple times
+    // Prime RTs after resize (bloom=0) to avoid RT garbage
     if (this.primeRendersRemaining > 0) {
       this.primeRendersRemaining -= 1;
 
-      const savedStrength = this.bloomPass.strength;
-
-      // Clear explicitly (helps avoid stale RT garbage showing as a flash)
-      this.renderer.clear(true, true, true);
-
+      const saved = this.bloomPass.strength;
       this.bloomPass.strength = 0;
       this.composer.render();
-      this.bloomPass.strength = savedStrength;
+      this.bloomPass.strength = saved;
 
-      // One more clear before the real render (reduces “double image” artifacts)
+      this.renderer.setClearColor(this.opaqueClearColor, 1.0);
       this.renderer.clear(true, true, true);
     }
 
@@ -453,7 +390,7 @@ export class PostFXSystem {
     const h = Math.max(1, Math.floor(height));
     const pr = Math.max(1, pixelRatio);
 
-    const ignore = Math.max(0, this.settings.stability.resizeIgnorePxJitter);
+    const ignore = Math.max(0, n(this.settings.stability.resizeIgnorePxJitter, DEFAULT_SETTINGS.stability.resizeIgnorePxJitter));
 
     const prChanged = Math.abs(pr - this.pixelRatio) > 0.001;
     const wChanged = Math.abs(w - this.width) > ignore;
@@ -472,13 +409,10 @@ export class PostFXSystem {
 
     this.composer.setPixelRatio(this.pixelRatio);
     this.composer.setSize(this.width, this.height);
-
-    // Keep bloom RT sizes matched
     this.bloomPass.setSize(this.width, this.height);
 
-    // Critical hardening after resize
-    this.framesToStabilize = Math.max(0, this.settings.stability.stabilizationFrames);
-    this.primeRendersRemaining = Math.max(0, this.settings.stability.primeFrames);
+    this.framesToStabilize = Math.max(0, n(this.settings.stability.stabilizationFrames, DEFAULT_SETTINGS.stability.stabilizationFrames));
+    this.primeRendersRemaining = Math.max(0, n(this.settings.stability.primeFrames, DEFAULT_SETTINGS.stability.primeFrames));
   }
 
   public dispose(): void {
@@ -486,49 +420,8 @@ export class PostFXSystem {
     if (typeof anyComposer.dispose === "function") anyComposer.dispose();
   }
 
-  // ------------------------------------------------------------
-  // Internal
-  // ------------------------------------------------------------
-
   private syncBloomStaticParams(): void {
-    this.bloomPass.radius = clamp01(this.settings.bloom.radius);
-    this.bloomPass.threshold = clamp01(this.settings.bloom.threshold);
-  }
-
-  private captureBaselineRendererState(): RendererBaseline {
-    const c = new THREE.Color();
-    this.renderer.getClearColor(c);
-    const a = this.renderer.getClearAlpha();
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rAny = this.renderer as any;
-
-    return {
-      // When using EffectComposer, autoClear should be false and composer manages clears.
-      // But we will enforce it in applyBaselineRendererState().
-      autoClear: false,
-      clearColor: c.clone(),
-      clearAlpha: a,
-      toneMapping: this.renderer.toneMapping,
-      toneMappingExposure: this.renderer.toneMappingExposure,
-      outputColorSpace: rAny.outputColorSpace,
-    };
-  }
-
-  private applyBaselineRendererState(): void {
-    if (!this.baseline) return;
-
-    // Enforce the safest composer-friendly state.
-    // If any other system changes these after a resize, this prevents “flash loops.”
-    this.renderer.autoClear = this.baseline.autoClear;
-    this.renderer.setClearColor(this.baseline.clearColor, this.baseline.clearAlpha);
-    this.renderer.toneMapping = this.baseline.toneMapping;
-    this.renderer.toneMappingExposure = this.baseline.toneMappingExposure;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rAny = this.renderer as any;
-    if (typeof rAny.outputColorSpace !== "undefined" && typeof this.baseline.outputColorSpace !== "undefined") {
-      rAny.outputColorSpace = this.baseline.outputColorSpace;
-    }
+    this.bloomPass.radius = clamp01(n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius));
+    this.bloomPass.threshold = clamp01(n(this.settings.bloom.threshold, DEFAULT_SETTINGS.bloom.threshold));
   }
 }

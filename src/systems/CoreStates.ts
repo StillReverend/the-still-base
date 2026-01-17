@@ -4,32 +4,12 @@
 // ------------------------------------------------------------
 // Bolt-on visual layer for the Core.
 //
-// Responsibilities:
-//  - Provide 3 core visual states:
-//      * blackHole
-//      * sol
-//      * luna
-//  - Each state includes:
-//      * Core surface (sphere)
-//  - Shared (single) halo elements (NOT duplicated per state):
-//      * Glow aura (inner + outer shells)
-//      * Light ring (rim band shell; shader-driven, not a torus)
-//      * Optional real light (per-state, for now)
-//  - Provide a minimal public API for CoreSystem to drive:
-//      * setState(...)
-//      * update(dt, audioFrame)
-//      * setQuality(...)
-//      * dispose()
-//
-// Design Notes:
-//  - We intentionally DO NOT draw glow "over" the core sphere.
-//    We achieve this by:
-//      * Making glow shells larger than the core radius (start outside)
-//      * Using depthTest:true + depthWrite:false so the core occludes glow
-//        where they overlap in screen space.
-//  - Glow is NOT Fresnel. It’s two additive shells with different opacities,
-//    which reads as a soft radial falloff without directional gradients.
-//  - Glow + ring colors are driven by active state's tuning (single shared meshes).
+// NOTE (Jan 2026 flash fix):
+//  - Ring shader could produce NaNs when normalizing a zero-length tangent:
+//      tangent = normalize(cross(axis, N));
+//    If axis || N, cross == 0, normalize(0) => NaN on many GPUs.
+//    NaNs + additive blending + bloom => intermittent “white core” flash.
+//  - Fix: safe-tangent construction (fallback axis + doppler gating).
 // ============================================================
 
 import * as THREE from "three";
@@ -291,11 +271,9 @@ function createLunaRegolithMaterial(): THREE.ShaderMaterial {
     uEnergy: { value: 0 }, // 0..1
     uDetail: { value: 1.0 }, // 0..2-ish
 
-    // IMPORTANT: Darker base so bloom doesn’t flatten everything to “white ball”.
     uBase: { value: new THREE.Color(0x8f97a6) },
     uShadow: { value: new THREE.Color(0x2b303a) },
 
-    // Rim should be subtle with bloom
     uRim: { value: new THREE.Color(0xe6ecff) },
     uRimStrength: { value: 0.05 },
 
@@ -448,13 +426,13 @@ function createLunaRegolithMaterial(): THREE.ShaderMaterial {
 }
 
 // ------------------------------------------------------------
-// Black Hole Shader (subtle horizon + swirl, bloom-safe)
+// Black Hole Shader
 // ------------------------------------------------------------
 
 function createBlackHoleMaterial(): THREE.ShaderMaterial {
   const uniforms = {
     uTime: { value: 0 },
-    uEnergy: { value: 0 }, // 0..1 (future audio)
+    uEnergy: { value: 0 },
     uDeep: { value: new THREE.Color(0x02020a) },
     uTint: { value: new THREE.Color(0x0b0b18) },
     uRim: { value: new THREE.Color(0xd4af37) },
@@ -652,11 +630,11 @@ function createRing(coreRadius: number): Ring {
       uSoft: { value: 0.85 },
 
       uTime: { value: 0.0 },
-      uWobbleStrength: { value: 0.0 }, // 0..0.06 recommended
+      uWobbleStrength: { value: 0.0 },
       uWobbleSpeed: { value: 0.7 },
       uWobbleScale: { value: 2.1 },
 
-      uDopplerStrength: { value: 0.0 }, // 0..0.18 recommended
+      uDopplerStrength: { value: 0.0 },
       uSpinAxis: { value: new THREE.Vector3(0, 1, 0) },
     },
     vertexShader: /* glsl */ `
@@ -733,6 +711,13 @@ function createRing(coreRadius: number): Ring {
         return sum;
       }
 
+      // Safe normalize: returns fallback if vector too small
+      vec3 safeNormalize(vec3 v, vec3 fallbackDir) {
+        float len2 = dot(v, v);
+        if (len2 < 1e-8) return normalize(fallbackDir);
+        return v * inversesqrt(len2);
+      }
+
       void main() {
         vec3 N = normalize(vWorldNormal);
         vec3 V = normalize(cameraPosition - vWorldPos);
@@ -751,20 +736,39 @@ function createRing(coreRadius: number): Ring {
         float rim = pow(1.0 - ndvWarped, uPower);
         rim = smoothstep(0.0, uSoft, rim);
 
-        // NOTE: keep alpha bloom-safe (cap)
         float a = clamp(rim * uIntensity, 0.0, 0.95);
 
         vec3 axis = normalize(uSpinAxis);
-        vec3 tangent = normalize(cross(axis, N));
+
+        // ✅ NaN-killer:
+        // If axis is parallel to N, cross(axis, N) = 0 => normalize(0) = NaN.
+        // Make a safe tangent using a fallback axis and gate doppler when unstable.
+        vec3 c = cross(axis, N);
+        float cLen2 = dot(c, c);
+
+        vec3 tangent;
+        if (cLen2 < 1e-8) {
+          // choose a fallback vector not parallel to axis
+          vec3 fallback = (abs(axis.y) > 0.9) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+          tangent = safeNormalize(cross(axis, fallback), vec3(1.0, 0.0, 0.0));
+        } else {
+          tangent = c * inversesqrt(cLen2);
+        }
+
         float approach = dot(tangent, V);
 
         float dopMask = rimMask * a;
-        float d = clamp(approach * uDopplerStrength, -1.0, 1.0);
+
+        // If tangent was unstable, damp doppler contribution (keeps look, avoids NaNs)
+        float dopplerGate = (cLen2 < 1e-8) ? 0.0 : 1.0;
+
+        float d = clamp(approach * uDopplerStrength * dopplerGate, -1.0, 1.0);
 
         vec3 cool = vec3(0.08, 0.10, 0.16);
         vec3 warm = vec3(0.16, 0.10, 0.04);
 
         vec3 tint = (d >= 0.0) ? cool * d : warm * (-d);
+
         vec3 outCol = clamp(uColor + tint * dopMask, 0.0, 1.0);
 
         gl_FragColor = vec4(outCol, a);
@@ -1007,7 +1011,6 @@ export class CoreStates {
     this.group.add(sol.group);
     this.group.add(luna.group);
 
-    // Shared halo elements (single instances)
     this.group.add(this.glow.group);
     this.group.add(this.ring.mesh);
 
@@ -1054,7 +1057,6 @@ export class CoreStates {
 
     this.states[this.active].update(dt, a, this.quality);
 
-    // Safety: if shared meshes ever get removed/rolled back, don’t hard-crash the engine loop.
     if (!this.ring?.mat || !this.glow?.innerMat || !this.glow?.outerMat) return;
 
     const t = this.states[this.active].tuning;
@@ -1066,14 +1068,13 @@ export class CoreStates {
       uni.uTime.value = (uni.uTime.value as number) + dt;
     }
 
-    // Per-state horizon effects
     if (this.active === "blackHole") {
       const e = energy;
-      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.045 + e * 0.015; // ~0.045..0.06
+      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.045 + e * 0.015;
       if (uni.uWobbleSpeed) uni.uWobbleSpeed.value = 0.46;
       if (uni.uWobbleScale) uni.uWobbleScale.value = 3.0;
 
-      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.10 + e * 0.06; // ~0.10..0.16
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.10 + e * 0.06;
       if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     } else if (this.active === "sol") {
       if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.012;
@@ -1087,25 +1088,20 @@ export class CoreStates {
       if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.0;
     }
 
-    // Glow response (subtle, bloom-safe)
     const innerBase = 0.14;
     const innerAmp = 0.14;
     const outerBase = 0.06;
     const outerAmp = 0.12;
 
-    const glowGain = t.glowIntensity; // state knob (currently 0.0 in your tuning)
+    const glowGain = t.glowIntensity;
     this.glow.innerMat.opacity = THREE.MathUtils.clamp((innerBase + energy * innerAmp) * glowGain, 0, 0.65);
     this.glow.outerMat.opacity = THREE.MathUtils.clamp((outerBase + energy * outerAmp) * glowGain, 0, 0.55);
 
     const s = 1.0 + energy * 0.38;
     this.glow.outer.scale.setScalar(s);
 
-    // Ring intensity + breathing (THIS is a usual bloom-pop culprit)
     const ringIntensityRaw = (0.65 + energy * 0.85) * t.ringIntensity;
-
-    // Bloom-safe cap: keep ring driving bloom but not detonating it.
     const ringIntensity = THREE.MathUtils.clamp(ringIntensityRaw, 0.0, 0.95);
-
     if (uni.uIntensity) uni.uIntensity.value = ringIntensity;
   }
 
