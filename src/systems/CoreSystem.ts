@@ -19,9 +19,8 @@
 //
 // Behavior (P03 update):
 //  - Default phase is driven by local time-of-day (solar/lunar).
-//  - Hotkey toggle enables black_hole override at will.
-//    * Press "V" to toggle black hole override. (V = Void)
-//    * Press "Escape" to clear override (return to time-of-day).
+//  - Phase override API is provided for higher-level systems (DebugTools, etc).
+//    * No hotkeys are owned by CoreSystem.
 // ============================================================
 
 import * as THREE from "three";
@@ -82,9 +81,6 @@ export class CoreSystem {
   private blackHoleOverride = false;
   private appliedPhase: CorePhase | null = null;
 
-  // Hotkeys
-  private onKeyDown: ((e: KeyboardEvent) => void) | null = null;
-
   constructor(deps: CoreSystemDeps) {
     this.bus = deps.bus;
     this.config = deps.config;
@@ -104,7 +100,7 @@ export class CoreSystem {
     // Core visual states
     this.coreStates = new CoreStates({
       parent: this.coreGroup,
-      radius: 7.9,
+      radius: 31,
       initialState: this.mapPhaseToState(this.phase),
     });
 
@@ -120,20 +116,6 @@ export class CoreSystem {
     this.root.add(this.time.getRoot());
 
     this.root.rotation.set(0, 0, 0);
-
-    // Hotkeys: V toggles black hole override; Escape clears override.
-    this.onKeyDown = (e: KeyboardEvent) => {
-      if (e.code === "KeyV") {
-        this.blackHoleOverride = !this.blackHoleOverride;
-        this.applyDesiredPhase(true);
-      } else if (e.code === "Escape") {
-        if (this.blackHoleOverride) {
-          this.blackHoleOverride = false;
-          this.applyDesiredPhase(true);
-        }
-      }
-    };
-    window.addEventListener("keydown", this.onKeyDown);
 
     // Apply initial desired phase (solar/lunar by time-of-day unless overridden)
     this.applyDesiredPhase(true);
@@ -272,11 +254,6 @@ export class CoreSystem {
   }
 
   public dispose(): void {
-    if (this.onKeyDown) {
-      window.removeEventListener("keydown", this.onKeyDown);
-      this.onKeyDown = null;
-    }
-
     if (this.coreStates) {
       this.coreStates.dispose();
       this.coreStates = null;
