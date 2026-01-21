@@ -14,6 +14,8 @@
 //
 // Notes:
 //  - Engine owns PostFXSystem (single pipeline). Scenes do NOT construct PostFX.
+//  - IMPORTANT: CameraSystem is the authority that writes camera transforms.
+//    Therefore, we must use EventBus to request a spawn orbit.
 // ============================================================
 
 import * as THREE from "three";
@@ -22,6 +24,7 @@ import type { SceneController, SceneContext, SceneName } from "../apps/SceneType
 
 import type { CorePhase } from "../systems/CoreSystem";
 import { CoreSystem } from "../systems/CoreSystem";
+import { StarSystem } from "../systems/StarSystem";
 
 // P05 (math-only) Regions
 import { RegionSystem } from "../systems/RegionSystem";
@@ -33,6 +36,7 @@ export class DemoScene implements SceneController {
   private ctx: SceneContext | null = null;
 
   private core: CoreSystem | null = null;
+  private starSystem: StarSystem | null = null;
 
   private ambientLight: THREE.AmbientLight | null = null;
   private keyLight: THREE.DirectionalLight | null = null;
@@ -61,6 +65,26 @@ export class DemoScene implements SceneController {
   };
 
   // ----------------------------------------------------------
+  // DEV: DevTools bus hotkeys (core phase)
+  // ----------------------------------------------------------
+
+  private onDevCoreCycle = (): void => {
+    if (!this.core) return;
+
+    if (this.core.isBlackHoleOverrideEnabled()) {
+      this.core.clearBlackHoleOverride();
+      return;
+    }
+
+    this.core.toggleBlackHoleOverride();
+  };
+
+  private onDevCoreClear = (): void => {
+    if (!this.core) return;
+    this.core.clearBlackHoleOverride();
+  };
+
+  // ----------------------------------------------------------
   // init()
   // ----------------------------------------------------------
   public init(ctx: SceneContext): void {
@@ -76,12 +100,23 @@ export class DemoScene implements SceneController {
 
     this.buildLights();
     this.buildCoreAndClock(ctx);
+
+    // ✅ TEMP: simple stars so the world isn't empty
+    this.buildStars();
+
+    // IMPORTANT: Request canonical spawn orbit from CameraSystem (authoritative).
     this.configureCamera(ctx);
 
-    // DEV-only region wireframe overlay
+    // DEV-only region wireframe overlay + dev hotkeys
     if (import.meta.env.DEV) {
       this.buildRegionWireframeOverlay();
-      ctx.bus.on("debug:toggle-regions", this.onToggleRegions);
+
+      // DevTools-driven region overlay toggle
+      ctx.bus.on("dev:regions:toggle", this.onToggleRegions);
+
+      // DevTools-driven core controls
+      ctx.bus.on("dev:core:cycle", this.onDevCoreCycle);
+      ctx.bus.on("dev:core:clear", this.onDevCoreClear);
     }
   }
 
@@ -122,19 +157,41 @@ export class DemoScene implements SceneController {
     this.scene.add(this.core.getRoot());
   }
 
+  // ✅ TEMP: Placeholder stars (will be rewritten later)
+  private buildStars(): void {
+    this.starSystem = new StarSystem(this.scene, {
+      count: 1031,
+      radius: 2026,
+      size: 0.31,
+    });
+  }
+
+  /**
+   * Canonical spawn view:
+   * - Top-down "clock face" view
+   * - Screen up = +Z so 12 o'clock is at top, 3 at right, etc.
+   *
+   * IMPORTANT:
+   * CameraSystem writes camera transforms every frame.
+   * So we request the orbit through the EventBus ("camera:set-orbit").
+   */
   private configureCamera(ctx: SceneContext): void {
-    const camera = ctx.camera;
+    // Tune these as you like:
+    const distance = 490; // matches your current debug vibe (~490)
+    const theta = 0.0; // azimuth (irrelevant when phi ~ 0, but keep stable)
+    const phi = 0.0001; // near-top-down; avoid exact 0 singularity
 
-    const distance = 12;
-    const theta = THREE.MathUtils.degToRad(35);
-    const phi = THREE.MathUtils.degToRad(45);
+    // Crucial: make +Z map to "screen up" for a clock-face view.
+    // With camera above looking down, this defines orientation on the screen.
+    const up = { x: 0, y: 0, z: 1 };
 
-    const x = Math.cos(theta) * Math.cos(phi) * distance;
-    const y = Math.sin(theta) * distance;
-    const z = Math.cos(theta) * Math.sin(phi) * distance;
-
-    camera.position.set(x, y, z);
-    camera.lookAt(0, 0, 0);
+    ctx.bus.emit("camera:set-orbit", {
+      target: { x: 0, y: 0, z: 0 },
+      distance,
+      theta,
+      phi,
+      up,
+    });
   }
 
   // ----------------------------------------------------------
@@ -146,6 +203,7 @@ export class DemoScene implements SceneController {
 
     const root = new THREE.Object3D();
     root.name = "RegionWireframeOverlay";
+    root.visible = false;
 
     const y = 0.02;
 
@@ -262,6 +320,10 @@ export class DemoScene implements SceneController {
     if (this.core) {
       this.core.update(delta);
     }
+
+    if (this.starSystem) {
+      this.starSystem.update(delta);
+    }
   }
 
   // ----------------------------------------------------------
@@ -280,6 +342,11 @@ export class DemoScene implements SceneController {
     for (const d of this.regionDebugDisposables) d.dispose();
     this.regionDebugDisposables = [];
     this.regionSystem = null;
+
+    if (this.starSystem) {
+      this.starSystem.dispose(this.scene);
+      this.starSystem = null;
+    }
 
     if (this.core) {
       this.scene.remove(this.core.getRoot());
@@ -303,6 +370,13 @@ export class DemoScene implements SceneController {
       this.scene.remove(this.rimLight);
       this.rimLight.dispose();
       this.rimLight = null;
+    }
+
+    // DEV listener cleanup
+    if (this.ctx && import.meta.env.DEV) {
+      this.ctx.bus.off("dev:regions:toggle", this.onToggleRegions);
+      this.ctx.bus.off("dev:core:cycle", this.onDevCoreCycle);
+      this.ctx.bus.off("dev:core:clear", this.onDevCoreClear);
     }
 
     this.ctx = null;
