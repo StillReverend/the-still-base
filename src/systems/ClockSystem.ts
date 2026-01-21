@@ -108,14 +108,14 @@ export class ClockSystem {
     const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.31, 0.0, 1.0);
     const maxTail = THREE.MathUtils.clamp(config.maxTailLength ?? 0.97, 0.0, 1.0);
 
-    const baseRadius = 10.0;
-    const gap = 0.79;
+    const baseRadius = 50.0;
+    const gap = 0.100;
 
     // Hour ring (12)
     this.hourRing = new RingPoints(
       {
-        radius: baseRadius + gap * 7.9,
-        thickness: 0.70,
+        radius: baseRadius * 5.0,
+        thickness: 7.0,
         points: this.pointsPerRing * 144,
         falloffFactor: 0.31,
         minTailLength: minTail,
@@ -129,8 +129,8 @@ export class ClockSystem {
     // Minute ring (60)
     this.minuteRing = new RingPoints(
       {
-        radius: baseRadius + gap * 3.1,
-        thickness: 0.40,
+        radius: baseRadius * 4.0,
+        thickness: 5.0,
         points: this.pointsPerRing * 144,
         falloffFactor: 0.31,
         minTailLength: minTail,
@@ -144,8 +144,8 @@ export class ClockSystem {
     // Second ring (360)
     this.secondRing = new RingPoints(
       {
-        radius: baseRadius * 1.0,
-        thickness: 0.20,
+        radius: baseRadius * 2.0,
+        thickness: 2.0,
         points: this.pointsPerRing * 144,
         falloffFactor: 0.31,
         minTailLength: minTail,
@@ -158,9 +158,6 @@ export class ClockSystem {
 
     // Tag all rings for bloom targeting (future selective bloom pipeline)
     this.setBloomLayerEnabled(true);
-
-    // Define True North for Rings (presentation transform)
-    this.root.rotation.y = -Math.PI / 2;
   }
 
   public getRoot(): THREE.Object3D {
