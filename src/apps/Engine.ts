@@ -10,6 +10,8 @@ import { SceneManager } from "./SceneManager";
 import type { SceneContext, SceneController, SceneName } from "./SceneTypes";
 
 import { DebugOverlay } from "./DebugOverlay";
+import { DevTools } from "./DevTools";
+
 import { CameraSystem } from "../systems/CameraSystem";
 import { ControlSystem } from "../systems/ControlSystem";
 import { PostFXSystem } from "../systems/PostFXSystem";
@@ -47,6 +49,7 @@ export class Engine {
   private lastTime = 0;
 
   private debugOverlay: DebugOverlay | null = null;
+  private devTools: DevTools | null = null;
 
   private lastRenderScene: THREE.Scene | null = null;
 
@@ -154,27 +157,18 @@ export class Engine {
       this.sceneManager.requestScene(next);
     });
 
-    // Dev-only debug overlay
+    // Dev-only debug overlay + dev tools
     if (import.meta.env.DEV) {
       this.debugOverlay = new DebugOverlay(this.camera, this.bus);
 
-      // Dev hotkeys
-      window.addEventListener("keydown", (e) => {
-        const key = e.key.toLowerCase();
-
-        if (key === "b") {
-          const s = this.postFX.getSettings();
-          this.postFX.setBloomEnabled(!s.bloom.enabled);
-          // eslint-disable-next-line no-console
-          console.log(`[Dev] Bloom ${!s.bloom.enabled ? "ON" : "OFF"}`);
-        }
-
-        if (key === "p") {
-          const s = this.postFX.getSettings();
-          this.postFX.setEnabled(!s.enabled);
-          // eslint-disable-next-line no-console
-          console.log(`[Dev] PostFX ${!s.enabled ? "ON" : "OFF"}`);
-        }
+      this.devTools = new DevTools({
+        bus: this.bus,
+        postFX: this.postFX,
+        overlay: this.debugOverlay as unknown as {
+          isVisible?: () => boolean;
+          setVisible?: (visible: boolean) => void;
+          toggleVisible?: () => void;
+        },
       });
     }
 
@@ -270,6 +264,11 @@ export class Engine {
   dispose(): void {
     this.stop();
     window.removeEventListener("resize", this.handleResize);
+
+    if (this.devTools) {
+      this.devTools.dispose();
+      this.devTools = null;
+    }
 
     if (this.debugOverlay) {
       this.debugOverlay.dispose();
