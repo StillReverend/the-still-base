@@ -126,9 +126,9 @@ const DEFAULT_SETTINGS: PostFXSettings = {
   enabled: true,
   bloom: {
     enabled: true,
-    strength: 1.05,
-    radius: 0.55,
-    threshold: 0.12,
+    strength: 0.79,
+    radius: 0.31,
+    threshold: 0.10,
   },
   stability: {
     dtClampSeconds: 1 / 30,
@@ -144,8 +144,8 @@ const DEFAULT_SETTINGS: PostFXSettings = {
 
 const DEFAULT_PROFILES: PostFXProfile[] = [
   { name: "default", enabled: true, bloom: { enabled: true, strength: 1.05, radius: 0.55, threshold: 0.12 } },
-  { name: "solar", enabled: true, bloom: { enabled: true, strength: 1.25, radius: 0.65, threshold: 0.10 } },
-  { name: "luna", enabled: true, bloom: { enabled: true, strength: 0.9, radius: 0.5, threshold: 0.18 } },
+  { name: "solar", enabled: true, bloom: { enabled: true, strength: 0.79, radius: 0.65, threshold: 0.10 } },
+  { name: "luna", enabled: true, bloom: { enabled: true, strength: 0.79, radius: 0.5, threshold: 0.18 } },
   { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.6, threshold: 0.14 } },
   { name: "sun", enabled: true, bloom: { enabled: true, strength: 1.25, radius: 0.65, threshold: 0.10 } },
   { name: "moon", enabled: true, bloom: { enabled: true, strength: 0.9, radius: 0.5, threshold: 0.18 } },
