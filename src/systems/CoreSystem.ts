@@ -51,6 +51,16 @@ export interface CoreSystemDeps {
   postFX?: PostFXSystem;
 }
 
+type GateOpenedPayload = {
+  reason?: "ritual" | "manual";
+  atMs?: number;
+};
+
+type ForceBlackHolePayload = {
+  reason?: "midnight" | "boot-enforce" | "manual";
+  atMs?: number;
+};
+
 export class CoreSystem {
   private readonly root: THREE.Group;
 
@@ -116,6 +126,31 @@ export class CoreSystem {
     this.root.add(this.time.getRoot());
 
     this.root.rotation.set(0, 0, 0);
+
+    // --------------------------------------------------------
+    // Gate integration (Phase 1, additive)
+    // --------------------------------------------------------
+    // GateSystem requests a forced black hole on close.
+    this.bus.on<ForceBlackHolePayload>("core:force-black-hole", (payload) => {
+      // Idempotent: if already forced, just re-apply.
+      this.blackHoleOverride = true;
+      this.applyDesiredPhase(true);
+
+      // Optional visibility for debugging
+      try {
+        // @ts-expect-error - EventBus may or may not expose emit()
+        this.bus.emit?.("core:phase", { phase: "black_hole", override: true, source: "gate", payload });
+      } catch {
+        // no-op
+      }
+    });
+
+    // When the gate re-opens, release the forced black hole and return to time-of-day phase.
+    this.bus.on<GateOpenedPayload>("gate:opened", () => {
+      if (!this.blackHoleOverride) return;
+      this.blackHoleOverride = false;
+      this.applyDesiredPhase(true);
+    });
 
     // Apply initial desired phase (solar/lunar by time-of-day unless overridden)
     this.applyDesiredPhase(true);

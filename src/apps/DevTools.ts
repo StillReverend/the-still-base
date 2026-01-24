@@ -210,5 +210,42 @@ export class DevTools {
         this.bus.emit("dev:regions:toggle", {});
       },
     });
+
+    // --------------------------------------------------------
+    // Gate (Phase 1 DEV) — quick test hotkeys
+    // --------------------------------------------------------
+    // G: close the Still immediately (simulate midnight)
+    // Shift+G: open the Still immediately (simulate ritual completion)
+    //
+    // We emit the GateSystem request events so there is zero coupling here.
+    this.register("g", {
+      label: "Gate Close (DEV) — simulate local midnight closure",
+      when: (e) => !e.shiftKey,
+      action: () => {
+        this.bus.emit("gate:request-close", {});
+        // eslint-disable-next-line no-console
+        console.log("[Dev] Gate close requested");
+      },
+    });
+
+    // NOTE: We reuse key="g" by overwriting only if shiftKey is true.
+    // Because bindings map by key, we implement Shift+G as a second check
+    // inside the same binding rather than a separate registration.
+    // This avoids conflicts and keeps lookup O(1).
+    const gBinding = this.bindings.get("g");
+    if (gBinding) {
+      const originalAction = gBinding.action;
+      gBinding.action = (e: KeyboardEvent) => {
+        if (e.shiftKey) {
+          this.bus.emit("gate:request-open", {});
+          // eslint-disable-next-line no-console
+          console.log("[Dev] Gate open requested");
+          return;
+        }
+        originalAction(e);
+      };
+      gBinding.label = "Gate Close/Open (DEV) — G close, Shift+G open";
+      gBinding.when = undefined;
+    }
   }
 }

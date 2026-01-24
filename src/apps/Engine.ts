@@ -15,6 +15,8 @@ import { DevTools } from "./DevTools";
 import { CameraSystem } from "../systems/CameraSystem";
 import { ControlSystem } from "../systems/ControlSystem";
 import { PostFXSystem } from "../systems/PostFXSystem";
+import { PersistenceSystem } from "../systems/PersistenceSystem";
+import { GateSystem } from "../systems/GateSystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -42,6 +44,9 @@ export class Engine {
   private readonly cameraSystem: CameraSystem;
   private readonly controlSystem: ControlSystem;
 
+  private readonly persistence: PersistenceSystem;
+  private readonly gateSystem: GateSystem;
+
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
 
@@ -64,6 +69,16 @@ export class Engine {
     this.config = deps.config;
     this.save = deps.save;
     this.resolveScene = deps.resolveScene;
+
+    // Persistence (Engine-owned, canonical user state)
+    this.persistence = new PersistenceSystem({
+      bus: this.bus,
+      save: this.save,
+      autosaveDebounceMs: 750,
+    });
+
+    // Gate (local wall-clock midnight enforcement)
+    this.gateSystem = new GateSystem(this.bus, this.persistence);
 
     // Renderer
     // ✅ OPAQUE CANVAS: removes “DOM background bleed” flashes.
@@ -161,6 +176,9 @@ export class Engine {
     if (import.meta.env.DEV) {
       this.debugOverlay = new DebugOverlay(this.camera, this.bus);
 
+      // DEV: re-announce persistence so late subscribers can see it in the bus log
+      this.persistence.announceLoaded();
+
       this.devTools = new DevTools({
         bus: this.bus,
         postFX: this.postFX,
@@ -187,6 +205,15 @@ export class Engine {
     this.running = false;
   }
 
+  /** Engine-level access to canonical persistent user state. */
+  getPersistence(): PersistenceSystem {
+    return this.persistence;
+  }
+
+  getGateSystem(): GateSystem {
+    return this.gateSystem;
+  }
+
   private loop = (now: number): void => {
     if (!this.running) return;
 
@@ -199,6 +226,9 @@ export class Engine {
     const snapshot = this.controlSystem.consumeSnapshot();
     this.cameraSystem.applyControlDeltas(snapshot.rotateDelta, snapshot.dollyDelta);
     this.cameraSystem.update(dt);
+
+    // Gate system (local wall-clock)
+    this.gateSystem.update(dt);
 
     // Scene update
     this.sceneManager.update(dt);
@@ -274,6 +304,10 @@ export class Engine {
       this.debugOverlay.dispose();
       this.debugOverlay = null;
     }
+
+    // Persistence: cancel any pending autosave timers
+    this.gateSystem.dispose();
+    this.persistence.dispose();
 
     this.controlSystem.dispose();
     this.postFX.dispose();
