@@ -17,6 +17,7 @@ import { ControlSystem } from "../systems/ControlSystem";
 import { PostFXSystem } from "../systems/PostFXSystem";
 import { PersistenceSystem } from "../systems/PersistenceSystem";
 import { GateSystem } from "../systems/GateSystem";
+import { AudioSystem } from "../systems/AudioSystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -46,6 +47,7 @@ export class Engine {
 
   private readonly persistence: PersistenceSystem;
   private readonly gateSystem: GateSystem;
+  private readonly audioSystem: AudioSystem;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -79,6 +81,13 @@ export class Engine {
 
     // Gate (local wall-clock midnight enforcement)
     this.gateSystem = new GateSystem(this.bus, this.persistence);
+
+    // Audio (Phase 1 skeleton)
+    this.audioSystem = new AudioSystem({
+      bus: this.bus,
+      persistence: this.persistence,
+      defaultFadeMs: 800,
+    });
 
     // Renderer
     // ✅ OPAQUE CANVAS: removes “DOM background bleed” flashes.
@@ -179,6 +188,9 @@ export class Engine {
       // DEV: re-announce persistence so late subscribers can see it in the bus log
       this.persistence.announceLoaded();
 
+      // DEV: announce audio state after overlay subscribes
+      this.audioSystem.announceState("engine:dev-overlay-ready");
+
       this.devTools = new DevTools({
         bus: this.bus,
         postFX: this.postFX,
@@ -214,6 +226,10 @@ export class Engine {
     return this.gateSystem;
   }
 
+  getAudioSystem(): AudioSystem {
+    return this.audioSystem;
+  }
+
   private loop = (now: number): void => {
     if (!this.running) return;
 
@@ -229,6 +245,9 @@ export class Engine {
 
     // Gate system (local wall-clock)
     this.gateSystem.update(dt);
+
+    // Audio (Phase 1 skeleton)
+    this.audioSystem.update(dt);
 
     // Scene update
     this.sceneManager.update(dt);
@@ -304,6 +323,9 @@ export class Engine {
       this.debugOverlay.dispose();
       this.debugOverlay = null;
     }
+
+    // Audio: detach bus handlers
+    this.audioSystem.dispose();
 
     // Persistence: cancel any pending autosave timers
     this.gateSystem.dispose();
