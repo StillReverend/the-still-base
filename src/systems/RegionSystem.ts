@@ -12,7 +12,7 @@
 //  - Persistence/saving, UI overlays, audio modulation
 //  - Any rendering/debug meshes (keep it data + math only)
 
-import { Vector3 } from "three";
+import { Object3D, Vector3 } from "three";
 
 export type RegionId =
   | "JAN"
@@ -38,136 +38,138 @@ export type RegionDefinition = RegionKey & {
   // Soft "bias knobs" that other systems may read later.
   // (No downstream behavior is implemented here.)
   colorBias: {
-    hue: number; // 0..360 (semantic, not literal rendering)
+    hue: number; // 0..360
     sat: number; // 0..1
     lum: number; // 0..1
-  };
-  vibeBias: {
-    warmth: number; // -1..1
-    calm: number; // -1..1
-    intensity: number; // 0..1
   };
 };
 
 export type RegionQueryResult = {
   region: RegionDefinition;
-  weight: number; // 0..1 (how strongly the position belongs to that region)
-  angleRad: number; // world angle used for evaluation
-  distanceToCore: number; // radial distance in XZ plane
+  weight: number; // 0..1
+  angleRad: number; // [0..2pi)
+  distanceToCore: number; // radial distance in the clock plane
 };
 
 export type RegionWeights = Array<{
   region: RegionDefinition;
-  weight: number; // 0..1 (normalized across all 12)
+  weight: number; // normalized so sum = 1
 }>;
 
-export type RegionSystemConfig = {
-  regionCount?: 12; // fixed for now (zodiac-lite). Keep as a literal for stability.
-  // Axis convention:
-  //  - We treat the Core as origin (0,0,0)
-  //  - Regions are wedges around the Y axis.
-  //  - Angle is computed from XZ plane:
-  //      angle = atan2(z, x)
-  // If your world is oriented differently, adjust angle mapping here.
-  baseRotationRad?: number; // rotates the entire region wheel
-  // Soft blending:
-  //  - boundaryBlend: fraction of wedge half-width used as blend zone (0..1)
-  //    e.g. 0.25 means the outer 25% near edges blends to neighbors.
-  boundaryBlend?: number;
-  // Radial weighting:
-  //  - Region membership can optionally bias inward vs outward.
-  //  - Keeping this mild prevents "rings" feeling like hard shells.
-  radialFalloff?: {
-    enabled: boolean;
-    // Start applying radial weighting after this distance (in world units)
-    start: number;
-    // Full effect by this distance (in world units)
-    end: number;
-    // Strength 0..1 (0 disables even if enabled = true)
-    strength: number;
-  };
+export type RadialFalloffConfig = {
+  enabled: boolean;
+  start: number; // start radius where falloff begins
+  end: number; // end radius where falloff reaches max
+  strength: number; // 0..1
 };
 
-const REGION_ORDER: Array<{ id: RegionId; label: string }> = [
-  { id: "JAN", label: "January" },
-  { id: "FEB", label: "February" },
-  { id: "MAR", label: "March" },
-  { id: "APR", label: "April" },
-  { id: "MAY", label: "May" },
-  { id: "JUN", label: "June" },
-  { id: "JUL", label: "July" },
-  { id: "AUG", label: "August" },
-  { id: "SEP", label: "September" },
-  { id: "OCT", label: "October" },
-  { id: "NOV", label: "November" },
-  { id: "DEC", label: "December" },
-];
+export type RegionSystemConfig = {
+  /**
+   * Hard-locked at 12. Kept as config for readability but not user-settable.
+   */
+  regionCount?: 12;
 
-function clamp01(v: number): number {
-  return Math.max(0, Math.min(1, v));
-}
+  /**
+   * Rotation offset applied to the computed angle before wedge selection.
+   *
+   * IMPORTANT:
+   * - Our clock face lives in XZ (Y-up).
+   * - atan2(z, x) => angle where 0 is +X (3 o'clock), pi/2 is +Z (12 o'clock).
+   *
+   * To map months so that:
+   *  - JAN = 1 o'clock
+   *  - FEB = 2 o'clock
+   *  - ...
+   *  - DEC = 12 o'clock
+   *
+   * We want Region 0 center at 1 o'clock (60 degrees from +X).
+   * With wedge centers at (index*wedge + wedge/2) in "angle space",
+   * and since we ADD baseRotation to the measured angle, the region centers
+   * in world land at (centerAngle - baseRotation).
+   *
+   * This yields baseRotation = -45° = -PI/4.
+   */
+  baseRotationRad?: number;
 
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
-}
+  /**
+   * Boundary softness (0..1): defines blend zone size near each wedge edge.
+   * 0 = hard wedges; 1 = very soft/overlapping boundaries.
+   */
+  boundaryBlend?: number;
 
-function smoothstep(edge0: number, edge1: number, x: number): number {
+  /**
+   * Optional radial falloff of region weights based on distance from core.
+   * (Currently only modulates weights; caller decides what to do.)
+   */
+  radialFalloff?: Partial<RadialFalloffConfig>;
+};
+
+const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+
+const normalizeAngleRad = (a: number): number => {
+  const tau = Math.PI * 2;
+  const n = a % tau;
+  return n < 0 ? n + tau : n;
+};
+
+const signedAngleDelta = (a: number, b: number): number => {
+  // Smallest signed difference a-b in [-pi, pi]
+  const tau = Math.PI * 2;
+  let d = (a - b) % tau;
+  if (d > Math.PI) d -= tau;
+  if (d < -Math.PI) d += tau;
+  return d;
+};
+
+const smoothstep = (edge0: number, edge1: number, x: number): number => {
+  if (edge0 === edge1) return x < edge0 ? 0 : 1;
   const t = clamp01((x - edge0) / (edge1 - edge0));
   return t * t * (3 - 2 * t);
-}
+};
 
-/**
- * Smallest signed angular distance from a to b in radians, in [-pi, pi].
- */
-function signedAngleDelta(a: number, b: number): number {
-  let d = a - b;
-  while (d > Math.PI) d -= Math.PI * 2;
-  while (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
+const createDefaultRegions = (): RegionDefinition[] => {
+  const ids: RegionId[] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+  const labels = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ];
 
-/**
- * Maps any angle to [0, 2pi).
- */
-function normalizeAngleRad(angle: number): number {
-  let a = angle % (Math.PI * 2);
-  if (a < 0) a += Math.PI * 2;
-  return a;
-}
+  // Simple hue ramp (stable ordering). You can refine later.
+  const hues = [200, 220, 245, 275, 305, 335, 10, 40, 70, 110, 150, 180];
 
-/**
- * Default region definitions.
- * NOTE: These biases are *semantic placeholders* for later systems.
- * Keep stable IDs + indices. Feel free to tune bias values later without breaking IDs.
- */
-function createDefaultRegions(): RegionDefinition[] {
-  // A gentle wheel of hues (not literal). Even spacing:
-  // 0..330 stepping 30 degrees.
-  // Sat/lum modest to avoid "neon rainbow mandate" in data.
-  return REGION_ORDER.map((r, i) => {
-    const hue = i * 30; // 0..330
-    return {
-      index: i,
-      id: r.id,
-      label: r.label,
-      colorBias: {
-        hue,
-        sat: 0.35,
-        lum: 0.55,
-      },
-      vibeBias: {
-        // Lightly cyclical placeholders
-        warmth: Math.sin((i / 12) * Math.PI * 2) * 0.4,
-        calm: Math.cos((i / 12) * Math.PI * 2) * 0.4,
-        intensity: 0.35,
-      },
-    };
-  });
-}
+  return ids.map((id, i) => ({
+    index: i,
+    id,
+    label: labels[i],
+    colorBias: {
+      hue: hues[i % hues.length],
+      sat: 0.35,
+      lum: 0.55,
+    },
+  }));
+};
 
 export class RegionSystem {
   private readonly config: Required<RegionSystemConfig>;
   private readonly regions: RegionDefinition[];
+
+  // Optional canonical orientation anchor.
+  // If set, we evaluate all region math in ClockFace-local space.
+  private clockFace: Object3D | null = null;
+
+  // Scratch vectors to avoid allocations each query.
+  private readonly _tmpLocal = new Vector3();
+  private readonly _tmpWorld = new Vector3();
 
   // Precomputed wedge size
   private readonly wedgeSizeRad: number;
@@ -178,9 +180,16 @@ export class RegionSystem {
     // Hard-lock regionCount to 12 for stability.
     const regionCount: 12 = 12;
 
+    // Default baseRotationRad maps:
+    //  Region 0 (JAN) -> 1 o'clock
+    //  Region 1 (FEB) -> 2 o'clock
+    //  ...
+    //  Region 11 (DEC) -> 12 o'clock
+    const defaultBaseRotation = -Math.PI / 4;
+
     this.config = {
       regionCount,
-      baseRotationRad: config?.baseRotationRad ?? 0,
+      baseRotationRad: config?.baseRotationRad ?? defaultBaseRotation,
       boundaryBlend: clamp01(config?.boundaryBlend ?? 0.25),
       radialFalloff: {
         enabled: config?.radialFalloff?.enabled ?? false,
@@ -195,6 +204,21 @@ export class RegionSystem {
     this.wedgeSizeRad = (Math.PI * 2) / this.config.regionCount;
     this.halfWedgeRad = this.wedgeSizeRad * 0.5;
     this.blendZoneRad = this.halfWedgeRad * this.config.boundaryBlend;
+  }
+
+  /**
+   * Optional: provide the canonical ClockFace anchor (Object3D).
+   * If set, region math will use ClockFace-local XZ coordinates.
+   */
+  setClockFace(clockFace: Object3D | null): void {
+    this.clockFace = clockFace;
+  }
+
+  /**
+   * Expose resolved config for other systems (e.g., debug overlay alignment).
+   */
+  getConfig(): Readonly<Required<RegionSystemConfig>> {
+    return this.config;
   }
 
   /**
@@ -233,12 +257,10 @@ export class RegionSystem {
     const angle = this.getAngleForPosition(pos);
     const distanceToCore = this.getRadialDistance(pos);
 
-    const raw: Array<{ region: RegionDefinition; weight: number }> = this.regions.map(
-      (region) => ({
-        region,
-        weight: this.computeRegionWeight(region.index, angle, distanceToCore),
-      })
-    );
+    const raw: Array<{ region: RegionDefinition; weight: number }> = this.regions.map((region) => ({
+      region,
+      weight: this.computeRegionWeight(region.index, angle, distanceToCore),
+    }));
 
     // Normalize so weights sum to 1 (unless all are 0, which shouldn't happen)
     const sum = raw.reduce((acc, r) => acc + r.weight, 0);
@@ -269,29 +291,48 @@ export class RegionSystem {
    * Utility: Get region definition by index (0..11).
    */
   getRegionByIndex(index: number): RegionDefinition {
-    const i = ((Math.floor(index) % 12) + 12) % 12;
+    const i = ((index % 12) + 12) % 12;
     return this.regions[i];
   }
 
-  // -----------------------------
-  // Internal math
-  // -----------------------------
+  // ----------------------------------------------------------
+  // Internals
+  // ----------------------------------------------------------
+
+  private getLocalClockPos(worldPos: Vector3): Vector3 {
+    // If no ClockFace is provided, treat world space as clock space.
+    if (!this.clockFace) return worldPos;
+
+    // NOTE:
+    // This relies on the ClockFace having an up-to-date matrixWorld.
+    // (Which Three.js ensures when rendering, but callers should avoid querying
+    // before the scene graph has been updated at least once.)
+    this._tmpWorld.copy(worldPos);
+
+    // Ensure matrixWorld is current (prevents first-frame / pre-render mismatches)
+    this.clockFace.updateWorldMatrix(true, false);
+
+    return this.clockFace.worldToLocal(this._tmpLocal.copy(this._tmpWorld));
+  }
 
   private getAngleForPosition(pos: Vector3): number {
-    // Angle around Y axis using XZ plane
+    // Angle around Y axis using XZ plane in CLOCK SPACE.
     // atan2(z, x) returns [-pi, pi]; normalize to [0, 2pi)
-    const a = Math.atan2(pos.z, pos.x);
+    const p = this.getLocalClockPos(pos);
+
+    const a = Math.atan2(p.z, p.x);
     const rotated = a + this.config.baseRotationRad;
     return normalizeAngleRad(rotated);
   }
 
   private getRadialDistance(pos: Vector3): number {
-    // Radial distance in XZ plane (ignoring Y)
-    return Math.sqrt(pos.x * pos.x + pos.z * pos.z);
+    // Radial distance in XZ plane (ignoring Y) in CLOCK SPACE.
+    const p = this.getLocalClockPos(pos);
+    return Math.sqrt(p.x * p.x + p.z * p.z);
   }
 
   private getRegionCenterAngle(index: number): number {
-    // Center of wedge i
+    // Center of wedge i (in "angle space", BEFORE baseRotation is applied)
     return normalizeAngleRad(index * this.wedgeSizeRad + this.halfWedgeRad);
   }
 
@@ -327,19 +368,17 @@ export class RegionSystem {
       wAngular = 1 - t;
     }
 
-    // Optional radial falloff:
-    // This is intentionally mild. It should feel like bias, not a shell.
-    let wRadial = 1;
-    const rf = this.config.radialFalloff;
-    if (rf.enabled && rf.strength > 0) {
-      const t = smoothstep(rf.start, rf.end, distanceToCore); // 0..1 as we go outward
-      // Apply a gentle attenuation with distance (or invert later if desired).
-      // Current behavior:
-      //  - Near core: multiplier ~1
-      //  - Far out: multiplier ~ (1 - strength)
-      wRadial = lerp(1, 1 - rf.strength, t);
-    }
+    // Optional radial falloff (attenuate weights by distance)
+    if (!this.config.radialFalloff.enabled) return wAngular;
 
-    return clamp01(wAngular * wRadial);
+    const { start, end, strength } = this.config.radialFalloff;
+
+    if (end <= start) return wAngular;
+
+    const t = clamp01((distanceToCore - start) / (end - start));
+    // 0 => no attenuation, 1 => max attenuation
+    const attenuation = 1 - t * strength;
+
+    return wAngular * attenuation;
   }
 }

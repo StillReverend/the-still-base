@@ -45,7 +45,7 @@ const BLOOM_LAYER = 1;
 const BLOOM_HEADROOM_MAX = 2.25;
 
 // Fixed tail factor (0..1). Higher = longer comet tail.
-const FIXED_TAIL_FACTOR = 0.85;
+const FIXED_TAIL_FACTOR = 0;
 
 export type ClockColorMode = "classic" | "perRing" | "rainbow" | "vinyl";
 
@@ -103,6 +103,9 @@ export class ClockSystem {
     this.root = new THREE.Group();
     this.root.name = "ClockSystem";
 
+    // 🔑 Align clock so 12 o’clock = +Z instead of +X
+    this.root.rotation.y = Math.PI / 2;
+
     this.pointsPerRing = config.pointsPerRing ?? 12;
 
     const minTail = THREE.MathUtils.clamp(config.minTailLength ?? 0.31, 0.0, 1.0);
@@ -117,7 +120,7 @@ export class ClockSystem {
         radius: baseRadius * 5.0,
         thickness: 7.0,
         points: this.pointsPerRing * 144,
-        falloffFactor: 0.31,
+        falloffFactor: 1.0,
         minTailLength: minTail,
         maxTailLength: maxTail,
         baseColor: new THREE.Color(0xd4af37),
@@ -132,7 +135,7 @@ export class ClockSystem {
         radius: baseRadius * 4.0,
         thickness: 5.0,
         points: this.pointsPerRing * 144,
-        falloffFactor: 0.31,
+        falloffFactor: 1.0,
         minTailLength: minTail,
         maxTailLength: maxTail,
         baseColor: new THREE.Color(0xd4af37),
@@ -145,9 +148,9 @@ export class ClockSystem {
     this.secondRing = new RingPoints(
       {
         radius: baseRadius * 2.0,
-        thickness: 2.0,
+        thickness: 3.0,
         points: this.pointsPerRing * 144,
-        falloffFactor: 0.31,
+        falloffFactor: 1.0,
         minTailLength: minTail,
         maxTailLength: maxTail,
         baseColor: new THREE.Color(0xd4af37),

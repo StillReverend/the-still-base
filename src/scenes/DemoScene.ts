@@ -35,6 +35,11 @@ export class DemoScene implements SceneController {
 
   private ctx: SceneContext | null = null;
 
+  // ----------------------------------------------------------
+  // Canonical ClockFace anchor (visual + mathematical truth)
+  // ----------------------------------------------------------
+  private clockFace: THREE.Object3D | null = null;
+
   private core: CoreSystem | null = null;
   private starSystem: StarSystem | null = null;
 
@@ -98,6 +103,10 @@ export class DemoScene implements SceneController {
     // Space-like background
     this.scene.background = new THREE.Color(0x020208);
 
+    // Create the canonical truth anchor FIRST.
+    // Everything that cares about "clock center/orientation" should hang off this.
+    this.buildClockFace();
+
     this.buildLights();
     this.buildCoreAndClock(ctx);
 
@@ -123,6 +132,22 @@ export class DemoScene implements SceneController {
   // ----------------------------------------------------------
   // Scene construction
   // ----------------------------------------------------------
+
+  private buildClockFace(): void {
+    const root = new THREE.Object3D();
+    root.name = "ClockFace";
+
+    // Truth decision:
+    // - Y-up world
+    // - Clock face lives on XZ plane
+    // - Rotation axis is Y
+    // - Origin is the visual + mathematical center
+    root.position.set(0, 0, 0);
+    root.rotation.set(0, 0, 0);
+
+    this.scene.add(root);
+    this.clockFace = root;
+  }
 
   private buildLights(): void {
     this.ambientLight = new THREE.AmbientLight(0x404060, 0.6);
@@ -154,7 +179,14 @@ export class DemoScene implements SceneController {
     // At P03, shrinkLevel = 0 (largest core)
     this.core.setShrinkLevel(0);
 
-    this.scene.add(this.core.getRoot());
+    // Core must be parented under ClockFace so it can never drift from our truth anchor.
+    if (!this.clockFace) {
+      // Should never happen because buildClockFace() runs first.
+      this.scene.add(this.core.getRoot());
+      return;
+    }
+
+    this.clockFace.add(this.core.getRoot());
   }
 
   // ✅ TEMP: Placeholder stars (will be rewritten later)
@@ -185,8 +217,14 @@ export class DemoScene implements SceneController {
     // With camera above looking down, this defines orientation on the screen.
     const up = { x: 0, y: 0, z: 1 };
 
+    // Target the ClockFace origin (future-proof if we ever offset the whole face).
+    const target = new THREE.Vector3(0, 0, 0);
+    if (this.clockFace) {
+      this.clockFace.getWorldPosition(target);
+    }
+
     ctx.bus.emit("camera:set-orbit", {
-      target: { x: 0, y: 0, z: 0 },
+      target: { x: target.x, y: target.y, z: target.z },
       distance,
       theta,
       phi,
@@ -200,6 +238,11 @@ export class DemoScene implements SceneController {
 
   private buildRegionWireframeOverlay(): void {
     this.regionSystem = new RegionSystem();
+
+    // Bind RegionSystem to the canonical clock anchor so its math uses ClockFace-local XZ.
+    if (this.clockFace) {
+      this.regionSystem.setClockFace(this.clockFace);
+    }
 
     const root = new THREE.Object3D();
     root.name = "RegionWireframeOverlay";
@@ -215,8 +258,19 @@ export class DemoScene implements SceneController {
     const count = regions.length;
     const wedgeSize = (Math.PI * 2) / count;
 
+    // IMPORTANT:
+    // RegionSystem applies baseRotationRad to angles BEFORE wedge selection.
+    // A wedge boundary occurs where:
+    //   adjustedAngle = i * wedgeSize
+    //   atan2(z, x) + baseRotationRad = i*wedgeSize
+    //   atan2(z, x) = i*wedgeSize - baseRotationRad
+    //
+    // So to draw the true boundaries, we subtract baseRotationRad here.
+    const baseRotationRad = this.regionSystem.getConfig().baseRotationRad;
+
     for (let i = 0; i < count; i++) {
-      const angle = i * wedgeSize;
+      const angle = i * wedgeSize - baseRotationRad;
+
       const x = Math.cos(angle) * spokeRadius;
       const z = Math.sin(angle) * spokeRadius;
 
@@ -284,7 +338,13 @@ export class DemoScene implements SceneController {
     addRing(systemRadius, `SystemRadius_${systemRadius}`, 0.25);
     addRing(universeRadius, `UniverseRadius_${universeRadius}`, 0.18);
 
-    this.scene.add(root);
+    // Parent the overlay under ClockFace so it can never drift from the clock truth.
+    if (this.clockFace) {
+      this.clockFace.add(root);
+    } else {
+      this.scene.add(root);
+    }
+
     this.regionDebugRoot = root;
 
     // eslint-disable-next-line no-console
@@ -336,7 +396,11 @@ export class DemoScene implements SceneController {
     }
 
     if (this.regionDebugRoot) {
-      this.scene.remove(this.regionDebugRoot);
+      if (this.clockFace) {
+        this.clockFace.remove(this.regionDebugRoot);
+      } else {
+        this.scene.remove(this.regionDebugRoot);
+      }
       this.regionDebugRoot = null;
     }
     for (const d of this.regionDebugDisposables) d.dispose();
@@ -349,9 +413,18 @@ export class DemoScene implements SceneController {
     }
 
     if (this.core) {
-      this.scene.remove(this.core.getRoot());
+      if (this.clockFace) {
+        this.clockFace.remove(this.core.getRoot());
+      } else {
+        this.scene.remove(this.core.getRoot());
+      }
       this.core.dispose();
       this.core = null;
+    }
+
+    if (this.clockFace) {
+      this.scene.remove(this.clockFace);
+      this.clockFace = null;
     }
 
     if (this.ambientLight) {
