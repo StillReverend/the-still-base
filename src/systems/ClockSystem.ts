@@ -42,7 +42,7 @@ const BLOOM_LAYER = 1;
 
 // Bloom needs bright pixels; allow headroom above 1.0 (in linear space).
 // Keep this conservative to avoid “flashy” surprises.
-const BLOOM_HEADROOM_MAX = 2.25;
+const BLOOM_HEADROOM_MAX = 2.0;
 
 // Fixed tail factor (0..1). Higher = longer comet tail.
 const FIXED_TAIL_FACTOR = 0;

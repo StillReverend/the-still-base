@@ -110,7 +110,7 @@ export class CoreSystem {
     // Core visual states
     this.coreStates = new CoreStates({
       parent: this.coreGroup,
-      radius: 31,
+      radius: 79,
       initialState: this.mapPhaseToState(this.phase),
     });
 
@@ -275,7 +275,7 @@ export class CoreSystem {
       this.coreStates.update(dt, { energy: 0 });
     }
 
-    this.clock.update(dt);
+    //this.clock.update(dt);
     this.time.update(dt);
   }
 

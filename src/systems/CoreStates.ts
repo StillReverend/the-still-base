@@ -92,7 +92,7 @@ const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
     realLightIntensity: 0.66,
   },
   luna: {
-    glowIntensity: 0.010,
+    glowIntensity: 0.0,
     ringIntensity: 0.65,
     ringColor: 0x103179,
     glowColor: 0x093085,
@@ -736,7 +736,7 @@ function createRing(coreRadius: number): Ring {
         float rim = pow(1.0 - ndvWarped, uPower);
         rim = smoothstep(0.0, uSoft, rim);
 
-        float a = clamp(rim * uIntensity, 0.0, 0.95);
+        float a = clamp(rim * uIntensity, 0.0, 1.0);
 
         vec3 axis = normalize(uSpinAxis);
 

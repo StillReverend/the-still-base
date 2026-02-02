@@ -192,9 +192,10 @@ export class DemoScene implements SceneController {
   // ✅ TEMP: Placeholder stars (will be rewritten later)
   private buildStars(): void {
     this.starSystem = new StarSystem(this.scene, {
-      count: 1031,
+      count: 31,
       radius: 2026,
-      size: 0.31,
+      size: 1.5,
+      exclusionRadius: 100,
     });
   }
 
