@@ -61,6 +61,15 @@ type ForceBlackHolePayload = {
   atMs?: number;
 };
 
+type AudioFramePayload = {
+  frame?: {
+    energy?: number;
+    low?: number;
+    mid?: number;
+    high?: number;
+  };
+};
+
 export class CoreSystem {
   private readonly root: THREE.Group;
 
@@ -90,6 +99,13 @@ export class CoreSystem {
   // Override behavior
   private blackHoleOverride = false;
   private appliedPhase: CorePhase | null = null;
+
+  // --------------------------------------------------------
+  // Audio-reactive core (Phase 1, additive)
+  // --------------------------------------------------------
+  // AudioSystem emits "audio:frame" with normalized bands; we cache the latest
+  // and feed it into CoreStates.update() each frame.
+  private lastAudioFrame = { energy: 0, low: 0, mid: 0, high: 0 };
 
   constructor(deps: CoreSystemDeps) {
     this.bus = deps.bus;
@@ -126,6 +142,22 @@ export class CoreSystem {
     this.root.add(this.time.getRoot());
 
     this.root.rotation.set(0, 0, 0);
+
+    // --------------------------------------------------------
+    // Audio integration (Phase 1, additive)
+    // --------------------------------------------------------
+    // Cache latest frame for CoreStates.update()
+    this.bus.on<AudioFramePayload>("audio:frame", (payload) => {
+      const f = payload?.frame;
+      if (!f) return;
+
+      this.lastAudioFrame = {
+        energy: clamp01(f.energy ?? this.lastAudioFrame.energy),
+        low: clamp01(f.low ?? this.lastAudioFrame.low),
+        mid: clamp01(f.mid ?? this.lastAudioFrame.mid),
+        high: clamp01(f.high ?? this.lastAudioFrame.high),
+      };
+    });
 
     // --------------------------------------------------------
     // Gate integration (Phase 1, additive)
@@ -272,7 +304,8 @@ export class CoreSystem {
     this.applyDesiredPhase(false);
 
     if (this.coreStates) {
-      this.coreStates.update(dt, { energy: 0 });
+      // Feed real audio energy into CoreStates (Phase 1)
+      this.coreStates.update(dt, this.lastAudioFrame);
     }
 
     //this.clock.update(dt);
@@ -365,3 +398,8 @@ export class CoreSystem {
     return this.blackHoleOverride;
   }
 }
+
+const clamp01 = (v: number): number => {
+  const n = Number.isFinite(v) ? v : 0;
+  return Math.min(1, Math.max(0, n));
+};

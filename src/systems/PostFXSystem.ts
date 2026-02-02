@@ -6,6 +6,10 @@
 //  - Force opaque clear baseline (black, alpha=1) every render
 //  - Never rely on DOM background (alpha canvas) for stability
 //  - Guard all numeric settings against non-finite values
+//
+// Audio-reactive bloom (Feb 2026):
+//  - Optional setAudioEnergy(0..1) input
+//  - Base bloom from profile + audio boost (smoothed)
 // ============================================================
 
 import * as THREE from "three";
@@ -188,6 +192,16 @@ export class PostFXSystem {
   // ✅ Opaque baseline (black)
   private readonly opaqueClearColor = new THREE.Color(0x000000);
 
+  // ------------------------------------------------------------
+  // Audio-driven bloom (optional)
+  // ------------------------------------------------------------
+  private audioEnergyCurrent = 0; // smoothed 0..1
+  private audioEnergyTarget = 0; // last input 0..1
+
+  // "MORE" knobs (safe defaults)
+  private audioBloomGain = 1.05; // strength added at peak energy
+  private audioBloomMin = 0.0; // constant offset (usually 0)
+
   constructor(deps: PostFXDeps) {
     this.renderer = deps.renderer;
 
@@ -233,6 +247,15 @@ export class PostFXSystem {
     this.resize(this.width, this.height, this.pixelRatio);
   }
 
+  /**
+   * Feed audio energy (0..1) into PostFX so bloom can react.
+   * Call once per frame BEFORE postfx.update(dt).
+   */
+  public setAudioEnergy(energy01: number): void {
+    const e = clamp01(isFiniteNumber(energy01) ? energy01 : 0);
+    this.audioEnergyTarget = e;
+  }
+
   public setProfile(profileName: PostFXProfileName): void {
     if (this.debugEnabled) {
       // eslint-disable-next-line no-console
@@ -259,10 +282,19 @@ export class PostFXSystem {
     this.settings.bloom.radius = n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius);
     this.settings.bloom.threshold = n(this.settings.bloom.threshold, DEFAULT_SETTINGS.bloom.threshold);
 
-    this.settings.stability.dtClampSeconds = n(this.settings.stability.dtClampSeconds, DEFAULT_SETTINGS.stability.dtClampSeconds);
+    this.settings.stability.dtClampSeconds = n(
+      this.settings.stability.dtClampSeconds,
+      DEFAULT_SETTINGS.stability.dtClampSeconds,
+    );
     this.settings.stability.bloomAttack = n(this.settings.stability.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack);
-    this.settings.stability.bloomRelease = n(this.settings.stability.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease);
-    this.settings.stability.maxBloomStrength = n(this.settings.stability.maxBloomStrength, DEFAULT_SETTINGS.stability.maxBloomStrength);
+    this.settings.stability.bloomRelease = n(
+      this.settings.stability.bloomRelease,
+      DEFAULT_SETTINGS.stability.bloomRelease,
+    );
+    this.settings.stability.maxBloomStrength = n(
+      this.settings.stability.maxBloomStrength,
+      DEFAULT_SETTINGS.stability.maxBloomStrength,
+    );
 
     this.syncBloomStaticParams();
     this.setEnabled(this.settings.enabled);
@@ -323,8 +355,23 @@ export class PostFXSystem {
         ? Math.max(0, n(this.settings.bloom.strength, DEFAULT_SETTINGS.bloom.strength))
         : 0;
 
+    // ------------------------------------------------------------
+    // Audio energy smoothing (uses bloom attack/release feel)
+    // ------------------------------------------------------------
+    const attackE = Math.max(0, n(st.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack)) * 1.35;
+    const releaseE = Math.max(0, n(st.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease)) * 0.85;
+    const speedE = this.audioEnergyTarget > this.audioEnergyCurrent ? attackE : releaseE;
+
+    this.audioEnergyCurrent = expSmooth(this.audioEnergyCurrent, this.audioEnergyTarget, speedE, dt);
+    if (!isFiniteNumber(this.audioEnergyCurrent)) this.audioEnergyCurrent = 0;
+
+    // Expand energy so "quiet vs loud" is obvious.
+    const lifted = clamp01((this.audioEnergyCurrent - 0.02) * 1.9);
+    const punch = clamp01(Math.pow(lifted, 0.42)); // <1 => more pop at mid levels
+    const audioBoost = this.audioBloomMin + punch * this.audioBloomGain;
+
     const maxStrength = Math.max(0.25, n(st.maxBloomStrength, DEFAULT_SETTINGS.stability.maxBloomStrength));
-    this.bloomStrengthTarget = clamp(base, 0, maxStrength);
+    this.bloomStrengthTarget = clamp(base + audioBoost, 0, maxStrength);
 
     if (this.debugEnabled && Math.abs(this.bloomStrengthTarget - this.lastLoggedBloomTarget) > 0.15) {
       this.lastLoggedBloomTarget = this.bloomStrengthTarget;
@@ -390,7 +437,10 @@ export class PostFXSystem {
     const h = Math.max(1, Math.floor(height));
     const pr = Math.max(1, pixelRatio);
 
-    const ignore = Math.max(0, n(this.settings.stability.resizeIgnorePxJitter, DEFAULT_SETTINGS.stability.resizeIgnorePxJitter));
+    const ignore = Math.max(
+      0,
+      n(this.settings.stability.resizeIgnorePxJitter, DEFAULT_SETTINGS.stability.resizeIgnorePxJitter),
+    );
 
     const prChanged = Math.abs(pr - this.pixelRatio) > 0.001;
     const wChanged = Math.abs(w - this.width) > ignore;
@@ -411,7 +461,10 @@ export class PostFXSystem {
     this.composer.setSize(this.width, this.height);
     this.bloomPass.setSize(this.width, this.height);
 
-    this.framesToStabilize = Math.max(0, n(this.settings.stability.stabilizationFrames, DEFAULT_SETTINGS.stability.stabilizationFrames));
+    this.framesToStabilize = Math.max(
+      0,
+      n(this.settings.stability.stabilizationFrames, DEFAULT_SETTINGS.stability.stabilizationFrames),
+    );
     this.primeRendersRemaining = Math.max(0, n(this.settings.stability.primeFrames, DEFAULT_SETTINGS.stability.primeFrames));
   }
 

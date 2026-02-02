@@ -35,7 +35,7 @@ export class PlasmaRingSystem {
     );
 
     const mat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
+      color: 0xffffed,
       metalness: 0.0,
       roughness: 0.35,
 

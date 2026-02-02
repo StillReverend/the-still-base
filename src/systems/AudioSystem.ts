@@ -108,6 +108,22 @@ export class AudioSystem {
   private musicStartOffsetSec = 0; // offset passed into start()
 
   // ----------------------------------------------------------
+  // Audio frame (FFT -> bands) for reactive systems
+  // ----------------------------------------------------------
+
+  private fftBins: Uint8Array | null = null;
+
+  // Throttle bus emissions to avoid log spam.
+  private readonly frameHz = 30;
+  private lastFrameEmitCtxTime = -1;
+
+  // Smoothed bands (0..1). Keeps the Core from jittering like a caffeinated firefly.
+  private smoothedEnergy = 0;
+  private smoothedLow = 0;
+  private smoothedMid = 0;
+  private smoothedHigh = 0;
+
+  // ----------------------------------------------------------
   // Bus wiring
   // ----------------------------------------------------------
 
@@ -389,6 +405,9 @@ export class AudioSystem {
 
       this.applyGainsFromState("fade:update");
     }
+
+    // Emit audio:frame for reactive systems (Core, rings, etc.)
+    this.maybeEmitAudioFrame("update");
   }
 
   dispose(): void {
@@ -409,6 +428,7 @@ export class AudioSystem {
     }
 
     this.decoded.clear();
+    this.fftBins = null;
 
     if (this.audioCtx) {
       try { void this.audioCtx.close(); } catch {}
@@ -447,6 +467,9 @@ export class AudioSystem {
     this.musicGain.connect(this.masterGain);
     this.masterGain.connect(this.analyser);
     this.analyser.connect(ctx.destination);
+
+    // Allocate FFT buffer once
+    this.fftBins = new Uint8Array(this.analyser.frequencyBinCount);
 
     this.applyGainsFromState("graph:init");
     this.emit("audio:graph", { reason: "graph:init" });
@@ -578,6 +601,89 @@ export class AudioSystem {
     }
 
     return Array.from(new Set(urls));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reactive frame emission (FFT -> energy/low/mid/high)
+  // ---------------------------------------------------------------------------
+
+  private maybeEmitAudioFrame(reason: string): void {
+    if (!this.audioCtx) return;
+    if (!this.analyser) return;
+    if (!this.fftBins) return;
+    if (!this.state.isUnlocked) return;
+
+    // Throttle: ~30fps using AudioContext time (stable, monotonic)
+    const now = this.audioCtx.currentTime;
+    const interval = 1 / Math.max(1, this.frameHz);
+
+    if (this.lastFrameEmitCtxTime >= 0 && now - this.lastFrameEmitCtxTime < interval) return;
+
+    // Capture the previous timestamp BEFORE updating lastFrameEmitCtxTime
+    const prev = this.lastFrameEmitCtxTime >= 0 ? this.lastFrameEmitCtxTime : now - interval;
+    this.lastFrameEmitCtxTime = now;
+
+    // Pull frequency-domain data (0..255)
+    this.analyser.getByteFrequencyData(this.fftBins);
+
+    const sr = this.audioCtx.sampleRate || 48000;
+    const binCount = this.fftBins.length;
+    const nyquist = sr * 0.5;
+    const hzPerBin = nyquist / Math.max(1, binCount);
+
+    // Bands (Hz). These are intentionally broad for "vibe" not science lab.
+    const lowHz: [number, number] = [40, 250];
+    const midHz: [number, number] = [250, 2000];
+    const highHz: [number, number] = [2000, 8000];
+
+    const low = this.avgBand01(lowHz[0], lowHz[1], hzPerBin);
+    const mid = this.avgBand01(midHz[0], midHz[1], hzPerBin);
+    const high = this.avgBand01(highHz[0], highHz[1], hzPerBin);
+
+    // Energy: weighted blend (low carries “pulse”, highs carry “sparkle”)
+    const rawEnergy = clamp01(low * 0.5 + mid * 0.35 + high * 0.15);
+
+    // Smooth for aesthetics (time-based one-pole)
+    const dt = Math.max(0.000001, now - prev);
+    const alpha = clamp01(1 - Math.exp(-dt * 10)); // ~fast but not twitchy
+
+    this.smoothedLow = lerp(this.smoothedLow, low, alpha);
+    this.smoothedMid = lerp(this.smoothedMid, mid, alpha);
+    this.smoothedHigh = lerp(this.smoothedHigh, high, alpha);
+    this.smoothedEnergy = lerp(this.smoothedEnergy, rawEnergy, alpha);
+
+    this.emit("audio:frame", {
+      reason,
+      frame: {
+        energy: clamp01(this.smoothedEnergy),
+        low: clamp01(this.smoothedLow),
+        mid: clamp01(this.smoothedMid),
+        high: clamp01(this.smoothedHigh),
+      },
+      isPlaying: this.state.isPlaying,
+      trackId: this.state.activeTrackId,
+      atCtxTime: now,
+    });
+  }
+
+  private avgBand01(hzLo: number, hzHi: number, hzPerBin: number): number {
+    if (!this.fftBins) return 0;
+
+    const lo = Math.max(0, Math.floor(hzLo / Math.max(0.000001, hzPerBin)));
+    const hi = Math.min(this.fftBins.length - 1, Math.ceil(hzHi / Math.max(0.000001, hzPerBin)));
+
+    if (hi <= lo) return 0;
+
+    let sum = 0;
+    let count = 0;
+
+    for (let i = lo; i <= hi; i++) {
+      sum += this.fftBins[i] ?? 0;
+      count++;
+    }
+
+    const avg = count > 0 ? sum / count : 0;
+    return clamp01(avg / 255);
   }
 
   // ---------------------------------------------------------------------------

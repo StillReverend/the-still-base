@@ -23,6 +23,21 @@ interface CameraTelemetryOverlay {
 
 type AnyBusHandler = (...args: unknown[]) => void;
 
+type AudioFrame = {
+  energy: number;
+  low: number;
+  mid: number;
+  high: number;
+};
+
+type AudioFramePayload = {
+  frame?: AudioFrame;
+  isPlaying?: boolean;
+  trackId?: string | null;
+  atCtxTime?: number;
+  reason?: string;
+};
+
 const isTypingTarget = (target: EventTarget | null): boolean => {
   if (!target) return false;
   const el = target as HTMLElement;
@@ -72,6 +87,13 @@ const unpackAnyArgs = (args: unknown[]): { name: string; payload: unknown } | nu
   return { name: "[unknown-event]", payload: args[0] };
 };
 
+const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+
+const fmt01 = (v: unknown): string => {
+  const n = typeof v === "number" && Number.isFinite(v) ? clamp01(v) : 0;
+  return n.toFixed(2);
+};
+
 export class DebugOverlay {
   private readonly camera: THREE.PerspectiveCamera;
   private readonly bus: EventBus;
@@ -84,6 +106,11 @@ export class DebugOverlay {
 
   private readonly hasMemoryAPI: boolean;
   private lastTelemetry: CameraTelemetryOverlay | null = null;
+
+  // Audio frame (dev readout)
+  private lastAudioFrame: AudioFrame | null = null;
+  private lastAudioFrameIsPlaying: boolean | null = null;
+  private lastAudioFrameTrackId: string | null = null;
 
   // DEV panels/toggles
   private showBusLog = false;
@@ -142,6 +169,22 @@ export class DebugOverlay {
     // Camera telemetry section (separate from bus log)
     this.bus.on<CameraTelemetryOverlay>("camera:telemetry", (payload) => {
       this.lastTelemetry = payload;
+    });
+
+    // Audio reactive readout (separate from bus log)
+    this.bus.on<AudioFramePayload>("audio:frame", (payload) => {
+      const f = payload?.frame;
+      if (!f) return;
+
+      this.lastAudioFrame = {
+        energy: clamp01(f.energy),
+        low: clamp01(f.low),
+        mid: clamp01(f.mid),
+        high: clamp01(f.high),
+      };
+
+      this.lastAudioFrameIsPlaying = !!payload?.isPlaying;
+      this.lastAudioFrameTrackId = payload?.trackId ?? null;
     });
 
     if (import.meta.env.DEV) {
@@ -225,6 +268,21 @@ export class DebugOverlay {
       "  Shift+E: include camera:telemetry in bus log",
       "  T: toggle camera telemetry section",
     ];
+
+    // Audio frame readout (if present)
+    if (this.lastAudioFrame) {
+      const f = this.lastAudioFrame;
+      const play = this.lastAudioFrameIsPlaying ? "PLAY" : "PAUSE";
+      const tr = this.lastAudioFrameTrackId ? ` "${this.lastAudioFrameTrackId}"` : "";
+
+      lines.push(
+        "",
+        `audio frame: ${play}${tr}`,
+        `  Energy: ${fmt01(f.energy)} Low: ${fmt01(f.low)} Mid: ${fmt01(f.mid)} High: ${fmt01(f.high)}`,
+      );
+    } else {
+      lines.push("", "audio frame: (waiting for audio:frame)");
+    }
 
     if (this.lastTelemetry && this.showCameraTelemetrySection) {
       lines.push(

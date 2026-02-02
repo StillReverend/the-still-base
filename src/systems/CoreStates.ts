@@ -37,6 +37,14 @@ export type CoreStateTuning = {
   glowIntensity: number;
   /** Base ring brightness multiplier for the state. */
   ringIntensity: number;
+
+  /**
+   * Audio response multiplier for this state.
+   * 1.0 = normal, >1.0 = stronger, <1.0 = subtler.
+   * This is the "knob" to avoid revisiting logic again.
+   */
+  audioPunch: number;
+
   /** Base ring color for the state. */
   ringColor: THREE.ColorRepresentation;
   /** Base glow color for the state. */
@@ -77,7 +85,8 @@ const clamp01 = (v: number): number => {
 const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   blackHole: {
     glowIntensity: 0.0,
-    ringIntensity: 1.9,
+    ringIntensity: 0.79,
+    audioPunch: 2.25,
     ringColor: 0xffffed,
     glowColor: 0xffffed,
     enableRealLight: true,
@@ -86,14 +95,16 @@ const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   sol: {
     glowIntensity: 0.0,
     ringIntensity: 0.79,
-    ringColor: 0xffffed,
-    glowColor: 0xffa23a,
+    audioPunch: 1.35,
+    ringColor: 0xd4af37,
+    glowColor: 0xffffed,
     enableRealLight: true,
-    realLightIntensity: 0.66,
+    realLightIntensity: 0.9,
   },
   luna: {
     glowIntensity: 0.0,
-    ringIntensity: 0.65,
+    ringIntensity: 0.79,
+    audioPunch: 1.15,
     ringColor: 0x103179,
     glowColor: 0x093085,
     enableRealLight: true,
@@ -106,6 +117,7 @@ function mergeTuning(base: CoreStateTuning, override?: Partial<CoreStateTuning>)
   return {
     glowIntensity: override.glowIntensity ?? base.glowIntensity,
     ringIntensity: override.ringIntensity ?? base.ringIntensity,
+    audioPunch: override.audioPunch ?? base.audioPunch,
     ringColor: override.ringColor ?? base.ringColor,
     glowColor: override.glowColor ?? base.glowColor,
     enableRealLight: override.enableRealLight ?? base.enableRealLight,
@@ -125,7 +137,7 @@ function createSolPlasmaMaterial(): THREE.ShaderMaterial {
     uColorMid: { value: new THREE.Color(0xd4af37) },
     uColorHot: { value: new THREE.Color(0xffffed) },
     uLightDir: { value: new THREE.Vector3(0.25, 0.8, 0.35).normalize() },
-    uDetail: { value: 1.0 }, // quality knob, 0..2-ish
+    uDetail: { value: 1.5 }, // quality knob, 0..2-ish
   };
 
   const vertexShader = /* glsl */ `
@@ -436,7 +448,7 @@ function createBlackHoleMaterial(): THREE.ShaderMaterial {
     uDeep: { value: new THREE.Color(0x02020a) },
     uTint: { value: new THREE.Color(0x0b0b18) },
     uRim: { value: new THREE.Color(0xd4af37) },
-    uRimStrength: { value: 0.14 },
+    uRimStrength: { value: 0.31 },
     uSwirlStrength: { value: 0.22 },
     uDetail: { value: 1.0 },
   };
@@ -538,7 +550,7 @@ function createBlackHoleMaterial(): THREE.ShaderMaterial {
 
       float e = clamp(uEnergy, 0.0, 1.0);
       float horizon = smoothstep(0.55, 0.98, rim);
-      float band = horizon * (0.10 + e * 0.10);
+      float band = horizon * (0.08 + e * 0.55);   // MUCH bigger swing
 
       col += uRim * band * uRimStrength;
 
@@ -624,7 +636,7 @@ function createRing(coreRadius: number): Ring {
 
   const mat = new THREE.ShaderMaterial({
     uniforms: {
-      uColor: { value: new THREE.Color(0xffffff) },
+      uColor: { value: new THREE.Color(0xffffed) },
       uIntensity: { value: 1.0 },
       uPower: { value: 3.2 },
       uSoft: { value: 0.85 },
@@ -820,15 +832,31 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
   };
 
   const update = (dt: number, audio: CoreAudioFrame, quality: CoreQuality): void => {
-    const energy = clamp01(audio.energy ?? 0);
+    // Base energy from AudioSystem (0..1)
+    const rawEnergy = clamp01(audio.energy ?? 0);
+
+    // Perceptual lift (black hole): expands low/mid energy, avoids harsh peaks
+    const energy = clamp01(Math.pow(rawEnergy * 2.0, 0.7));
+
     const q = clamp01(quality.value);
 
+    // Time + core noise detail
     coreMat.uniforms.uTime.value += dt;
     coreMat.uniforms.uEnergy.value = energy;
     coreMat.uniforms.uDetail.value = 0.85 + q * 1.0;
 
+    // 🔥 Audio-driven visual emphasis
+    if (coreMat.uniforms.uRimStrength) {
+      coreMat.uniforms.uRimStrength.value = 0.12 + energy * 0.35;
+    }
+
+    if (coreMat.uniforms.uSwirlStrength) {
+      coreMat.uniforms.uSwirlStrength.value = 0.18 + energy * 0.35;
+    }
+
+    // Real light follows energy subtly
     if (realLight) {
-      realLight.intensity = tuning.realLightIntensity * (0.35 + energy * 0.5);
+      realLight.intensity = tuning.realLightIntensity * (0.35 + energy * 0.6);
     }
   };
 
@@ -1068,24 +1096,42 @@ export class CoreStates {
       uni.uTime.value = (uni.uTime.value as number) + dt;
     }
 
+    // State-tunable punch (the knob)
+    const punch = Math.max(0, t.audioPunch ?? 1.0);
+
+    // Perceptual curve: makes low->mid move, and loud moments pop.
+    const e = THREE.MathUtils.clamp(energy, 0, 1);
+    const eBoost = THREE.MathUtils.clamp(Math.pow(e, 0.55) * punch, 0, 3.0);
+
     if (this.active === "blackHole") {
-      const e = energy;
-      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.045 + e * 0.015;
+      // Scale wobble/doppler with punch too (so BH can feel alive)
+      const w = THREE.MathUtils.clamp(0.10 + eBoost * 0.015, 0.0, 0.18);
+      const d = THREE.MathUtils.clamp(0.10 + eBoost * 0.06, 0.0, 0.40);
+
+      if (uni.uWobbleStrength) uni.uWobbleStrength.value = w;
       if (uni.uWobbleSpeed) uni.uWobbleSpeed.value = 0.46;
       if (uni.uWobbleScale) uni.uWobbleScale.value = 3.0;
 
-      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.10 + e * 0.06;
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = d;
       if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     } else if (this.active === "sol") {
-      if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.012;
+      // Sol stays tasteful, but still responds
+      const w = THREE.MathUtils.clamp(0.012 + eBoost * 0.01, 0.0, 0.06);
+      const d = THREE.MathUtils.clamp(0.05 + eBoost * 0.02, 0.0, 0.16);
+
+      if (uni.uWobbleStrength) uni.uWobbleStrength.value = w;
       if (uni.uWobbleSpeed) uni.uWobbleSpeed.value = 0.75;
       if (uni.uWobbleScale) uni.uWobbleScale.value = 2.0;
 
-      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.05;
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = d;
       if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     } else {
+      // Luna: keep it calmer, but you can raise audioPunch to taste
+      const d = THREE.MathUtils.clamp(eBoost * 0.02, 0.0, 0.10);
+
       if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.0;
-      if (uni.uDopplerStrength) uni.uDopplerStrength.value = 0.0;
+      if (uni.uDopplerStrength) uni.uDopplerStrength.value = d;
+      if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     }
 
     const innerBase = 0.14;
@@ -1100,9 +1146,11 @@ export class CoreStates {
     const s = 1.0 + energy * 0.38;
     this.glow.outer.scale.setScalar(s);
 
-    const ringIntensityRaw = (0.65 + energy * 0.85) * t.ringIntensity;
-    const ringIntensity = THREE.MathUtils.clamp(ringIntensityRaw, 0.0, 0.95);
-    if (uni.uIntensity) uni.uIntensity.value = ringIntensity;
+    // Base ring + audio lift (now state-tunable via audioPunch)
+    const ringIntensity = (0.55 + eBoost * 1.25) * t.ringIntensity;
+
+    // Let it go above 1.0 (additive ring loves this). Keep a sane ceiling.
+    if (uni.uIntensity) uni.uIntensity.value = THREE.MathUtils.clamp(ringIntensity, 0.0, 2.25);
   }
 
   public dispose(): void {
