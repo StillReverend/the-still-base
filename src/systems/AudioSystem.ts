@@ -1,16 +1,21 @@
 // src/systems/AudioSystem.ts
 // ============================================================
 // THE STILL — Phase 1
-// AudioSystem (Skeleton)
+// AudioSystem (Playback MVP)
 // ------------------------------------------------------------
 // Responsibilities:
 //  - Engine-owned audio state + playback orchestration (no UI)
 //  - Listen/respond to Gate + Dev events via EventBus
 //  - Persist player settings via PersistenceSystem
 //
+// MVP:
+//  - WebAudio unlock + minimal graph (music channel only for now)
+//  - Load + play an mp3 (trackId -> url candidates) via fetch + decode
+//  - Play/Pause/Seek/Volume; emits audio:state + diagnostics
+//
 // Notes:
-//  - This is intentionally a skeleton: it focuses on state, events, and fades.
-//  - Actual track loading/decoding + WebAudio graph will be added next.
+//  - Track catalog is intentionally "best-effort" URL resolution right now.
+//    We'll formalize this into a proper TrackRegistry later.
 // ============================================================
 
 import type { EventBus } from "../core/EventBus";
@@ -22,10 +27,10 @@ export type AudioSystemState = {
   activeTrackId: string | null;
   isPlaying: boolean;
 
-  /** Logical playhead in seconds (skeleton advances this in update). */
+  /** Playhead in seconds (authoritative once WebAudio is running). */
   timeSec: number;
 
-  /** Duration (seconds) if known; null in skeleton until we load media. */
+  /** Duration (seconds) if known; null until media is decoded. */
   durationSec: number | null;
 
   shuffle: boolean;
@@ -34,11 +39,17 @@ export type AudioSystemState = {
   /** User volume preference (0..1). */
   volume: number;
 
-  /** Effective volume after fades/ducking (0..1). */
+  /** Effective volume after fades (0..1). */
   effectiveVolume: number;
 
   /** True when Gate has forced silence (or other system-level mute). */
   systemMuted: boolean;
+
+  /** Browser audio is unlocked (AudioContext is running). */
+  isUnlocked: boolean;
+
+  /** Last unlock/playback related error (dev only). */
+  lastError: string | null;
 };
 
 type FadeState = {
@@ -56,7 +67,6 @@ export interface AudioSystemDeps {
 
   /**
    * Default fade duration used by system-level fades (Gate close).
-   * Keeping this short makes the Still feel deliberate, not abrupt.
    */
   defaultFadeMs?: number;
 }
@@ -64,7 +74,6 @@ export interface AudioSystemDeps {
 export class AudioSystem {
   private readonly bus: EventBus;
   private readonly persistence: PersistenceSystem;
-
   private readonly defaultFadeSec: number;
 
   private state: AudioSystemState;
@@ -80,6 +89,34 @@ export class AudioSystem {
 
   private prevPlayingBeforeSystemMute = false;
 
+  // ----------------------------------------------------------
+  // WebAudio
+  // ----------------------------------------------------------
+
+  private audioCtx: AudioContext | null = null;
+  private readonly AudioContextCtor: (new () => AudioContext) | null =
+    (globalThis.AudioContext ?? (globalThis as any).webkitAudioContext ?? null);
+
+  private masterGain: GainNode | null = null;
+  private musicGain: GainNode | null = null;
+  private analyser: AnalyserNode | null = null;
+
+  private decoded: Map<string, AudioBuffer> = new Map();
+
+  private musicSource: AudioBufferSourceNode | null = null;
+  private musicStartAtCtxTime = 0; // ctx.currentTime at start()
+  private musicStartOffsetSec = 0; // offset passed into start()
+
+  // ----------------------------------------------------------
+  // Bus wiring
+  // ----------------------------------------------------------
+
+  private handlers: Array<{
+    event: string;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    fn: (payload: any) => void;
+  }> = [];
+
   constructor(deps: AudioSystemDeps) {
     this.bus = deps.bus;
     this.persistence = deps.persistence;
@@ -88,17 +125,19 @@ export class AudioSystem {
     const user = this.persistence.getState();
 
     this.state = {
-      activeTrackId: user.audio.activeTrackId,
+      activeTrackId: user.audio.activeTrackId ?? null,
       isPlaying: false,
-      timeSec: 0,
-      durationSec: null,
+      timeSec: user.audio.timeSec ?? 0,
+      durationSec: user.audio.durationSec ?? null,
 
-      shuffle: user.audio.shuffle,
-      repeat: user.audio.repeat,
-      volume: user.audio.volume,
+      shuffle: user.audio.shuffle ?? false,
+      repeat: user.audio.repeat ?? "off",
+      volume: clamp01(user.audio.volume ?? 0.85),
 
-      effectiveVolume: user.audio.volume,
+      effectiveVolume: clamp01(user.audio.volume ?? 0.85),
       systemMuted: false,
+      isUnlocked: false,
+      lastError: null,
     };
 
     this.attachBusHandlers();
@@ -108,7 +147,7 @@ export class AudioSystem {
   }
 
   // ---------------------------------------------------------------------------
-  // Public API (Engine/systems can call; UI will call via events later)
+  // Public API
   // ---------------------------------------------------------------------------
 
   getState(): AudioSystemState {
@@ -119,51 +158,147 @@ export class AudioSystem {
    * DEV/Diagnostics: re-emit current state (useful when DebugOverlay subscribes after init).
    */
   announceState(reason = "audio:announce"): void {
+    this.persistPlayer(reason);
     this.emitState(reason);
   }
 
+  /**
+   * Unlock browser audio via a user gesture (pointerdown/keydown).
+   */
+  async unlock(reason = "audio:unlock"): Promise<void> {
+    if (this.state.isUnlocked) {
+      this.emitState(reason);
+      return;
+    }
+
+    if (!this.AudioContextCtor) {
+      this.state.lastError = "AudioContext is not available in this browser.";
+      this.emit("audio:unlock-failed", { reason: "no-audiocontext" });
+      this.emitState("audio:unlock-failed");
+      return;
+    }
+
+    try {
+      if (!this.audioCtx) this.audioCtx = new this.AudioContextCtor();
+      if (this.audioCtx.state !== "running") await this.audioCtx.resume();
+
+      this.state.isUnlocked = this.audioCtx.state === "running";
+      this.state.lastError = null;
+
+      if (this.state.isUnlocked) this.buildGraph();
+
+      this.emit("audio:unlocked", { state: this.audioCtx.state });
+      this.emitState(reason);
+
+      // If user previously hit play while locked, resume intent.
+      if (this.prevPlayingBeforeSystemMute && !this.state.systemMuted) {
+        this.prevPlayingBeforeSystemMute = false;
+        void this.play("audio:auto-resume-after-unlock");
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.state.lastError = msg;
+      this.emit("audio:unlock-failed", { reason: "exception", message: msg });
+      this.emitState("audio:unlock-failed");
+    }
+  }
 
   setTrack(trackId: string | null, reason = "audio:set-track"): void {
     if (this.state.activeTrackId === trackId) return;
+
+    const wasPlaying = this.state.isPlaying;
+    if (wasPlaying) this.pause("audio:set-track-stop");
+
     this.state.activeTrackId = trackId;
     this.state.timeSec = 0;
     this.state.durationSec = null;
 
-    this.persistence.setAudioPlayer({ activeTrackId: trackId }, reason);
+    this.persistence.setAudioPlayer({ activeTrackId: trackId, timeSec: 0, durationSec: null }, reason);
+    this.emit("audio:set-track", { trackId });
     this.emitState(reason);
+
+    if (wasPlaying) void this.play("audio:set-track-restart");
   }
 
-  play(reason = "audio:play"): void {
+  async play(reason = "audio:play"): Promise<void> {
     if (this.state.systemMuted) {
-      // Remember intent; Gate will resume when it opens.
       this.prevPlayingBeforeSystemMute = true;
       this.emitState(reason);
       return;
     }
 
+    if (!this.state.isUnlocked) {
+      this.prevPlayingBeforeSystemMute = true;
+      this.emit("audio:unlock-required", {});
+      this.emitState("audio:unlock-required");
+      return;
+    }
+
     if (this.state.isPlaying) return;
-    this.state.isPlaying = true;
-    this.emit("audio:play", { trackId: this.state.activeTrackId });
-    this.emitState(reason);
+
+    if (!this.state.activeTrackId) {
+      this.state.lastError = "No activeTrackId set. (Try audio:set-track first)";
+      this.emit("audio:play-failed", { reason: "no-track" });
+      this.emitState("audio:play-failed");
+      return;
+    }
+
+    try {
+      await this.ensureGraph();
+
+      const buffer = await this.getDecodedBuffer(this.state.activeTrackId);
+      this.state.durationSec = buffer.duration;
+
+      const startAt = clampFinite(this.state.timeSec, 0, Math.max(0, buffer.duration - 0.0001));
+
+      this.startMusicSource(buffer, startAt, reason);
+
+      this.state.isPlaying = true;
+      this.state.lastError = null;
+
+      this.emit("audio:play", { trackId: this.state.activeTrackId });
+      this.emitState(reason);
+      this.persistPlayer(reason);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.state.lastError = msg;
+      this.emit("audio:play-failed", { reason: "exception", message: msg });
+      this.emitState("audio:play-failed");
+    }
   }
 
   pause(reason = "audio:pause"): void {
     if (!this.state.isPlaying) return;
+
+    this.updatePlayheadFromCtxTime();
+    this.stopMusicSource("pause");
+
     this.state.isPlaying = false;
     this.emit("audio:pause", { trackId: this.state.activeTrackId });
     this.emitState(reason);
+    this.persistPlayer(reason);
   }
 
   togglePlay(reason = "audio:toggle"): void {
     if (this.state.isPlaying) this.pause(reason);
-    else this.play(reason);
+    else void this.play(reason);
   }
 
   seek(timeSec: number, reason = "audio:seek"): void {
     const t = Math.max(0, Number.isFinite(timeSec) ? timeSec : 0);
     this.state.timeSec = t;
+
     this.emit("audio:seek", { timeSec: t, trackId: this.state.activeTrackId });
     this.emitState(reason);
+
+    if (this.state.isPlaying) {
+      this.updatePlayheadFromCtxTime();
+      this.stopMusicSource("seek");
+      this.state.isPlaying = false;
+      void this.play("audio:seek-restart");
+    }
+
+    this.persistPlayer(reason);
   }
 
   setVolume(volume01: number, reason = "audio:volume"): void {
@@ -173,10 +308,11 @@ export class AudioSystem {
     this.state.volume = v;
     this.persistence.setAudioPlayer({ volume: v }, reason);
 
-    // If no fade is active, update effective volume immediately.
     if (!this.fade.active) {
       this.state.effectiveVolume = this.computeEffectiveVolume();
     }
+
+    this.applyGainsFromState(reason);
 
     this.emit("audio:volume", { volume: v });
     this.emitState(reason);
@@ -199,22 +335,15 @@ export class AudioSystem {
     this.emitState(reason);
   }
 
-  /**
-   * System-level mute to silence all audio (Gate close).
-   * This does NOT clear user volume or preferences.
-   */
   fadeToSilence(reason: AudioFadeReason = "system", durationSec?: number): void {
     const dur = Math.max(0, durationSec ?? this.defaultFadeSec);
 
-    // Preserve intent if currently playing.
     this.prevPlayingBeforeSystemMute = this.state.isPlaying;
-
     this.state.systemMuted = true;
-    this.startFade(this.state.effectiveVolume, 0, dur, reason);
 
-    // We intentionally stop logical playback when system mutes.
-    // When resumeSystemAudio() is called, we restore play intent.
-    this.state.isPlaying = false;
+    if (this.state.isPlaying) this.pause("audio:system-mute");
+
+    this.startFade(this.state.effectiveVolume, 0, dur, reason);
 
     this.emit("audio:fade-to-silence", { reason, durationSec: dur });
     this.emitState("audio:fade-to-silence");
@@ -228,13 +357,10 @@ export class AudioSystem {
     const target = this.computeEffectiveVolume({ ignoreFade: true });
     this.startFade(this.state.effectiveVolume, target, dur, reason);
 
-    // Restore intent (if we were playing pre-mute)
     if (this.prevPlayingBeforeSystemMute) {
-      this.state.isPlaying = true;
-      this.emit("audio:play", { trackId: this.state.activeTrackId });
+      this.prevPlayingBeforeSystemMute = false;
+      void this.play("audio:resume-system-audio");
     }
-
-    this.prevPlayingBeforeSystemMute = false;
 
     this.emit("audio:resume", { reason, durationSec: dur });
     this.emitState("audio:resume");
@@ -245,14 +371,13 @@ export class AudioSystem {
   // ---------------------------------------------------------------------------
 
   update(dt: number): void {
-    // Advance a logical playhead until real media timing arrives.
-    if (this.state.isPlaying && !this.state.systemMuted) {
-      this.state.timeSec += Math.max(0, dt);
+    if (this.state.isPlaying) {
+      this.updatePlayheadFromCtxTime();
     }
 
     if (this.fade.active) {
       const d = Math.max(0.000001, this.fade.duration);
-      this.fade.t = clamp01(this.fade.t + dt / d);
+      this.fade.t = clamp01(this.fade.t + Math.max(0, dt) / d);
 
       const v = lerp(this.fade.from, this.fade.to, this.fade.t);
       this.state.effectiveVolume = clamp01(v);
@@ -261,35 +386,231 @@ export class AudioSystem {
         this.fade.active = false;
         this.state.effectiveVolume = this.computeEffectiveVolume();
       }
+
+      this.applyGainsFromState("fade:update");
     }
   }
 
   dispose(): void {
     this.detachBusHandlers();
+    this.stopMusicSource("dispose");
+
+    if (this.analyser) {
+      try { this.analyser.disconnect(); } catch {}
+      this.analyser = null;
+    }
+    if (this.musicGain) {
+      try { this.musicGain.disconnect(); } catch {}
+      this.musicGain = null;
+    }
+    if (this.masterGain) {
+      try { this.masterGain.disconnect(); } catch {}
+      this.masterGain = null;
+    }
+
+    this.decoded.clear();
+
+    if (this.audioCtx) {
+      try { void this.audioCtx.close(); } catch {}
+      this.audioCtx = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // WebAudio internals
+  // ---------------------------------------------------------------------------
+
+  private async ensureGraph(): Promise<void> {
+    if (!this.state.isUnlocked) return;
+    if (!this.audioCtx) return;
+
+    if (this.audioCtx.state !== "running") {
+      await this.audioCtx.resume();
+      this.state.isUnlocked = this.audioCtx.state === "running";
+    }
+
+    if (!this.masterGain) this.buildGraph();
+  }
+
+  private buildGraph(): void {
+    if (!this.audioCtx) return;
+    if (this.masterGain) return;
+
+    const ctx = this.audioCtx;
+
+    this.masterGain = ctx.createGain();
+    this.musicGain = ctx.createGain();
+
+    this.analyser = ctx.createAnalyser();
+    this.analyser.fftSize = 2048;
+
+    this.musicGain.connect(this.masterGain);
+    this.masterGain.connect(this.analyser);
+    this.analyser.connect(ctx.destination);
+
+    this.applyGainsFromState("graph:init");
+    this.emit("audio:graph", { reason: "graph:init" });
+  }
+
+  private applyGainsFromState(reason: string): void {
+    if (!this.audioCtx) return;
+
+    const master = this.safeGain(this.state.effectiveVolume);
+
+    if (this.masterGain) this.masterGain.gain.value = master;
+    if (this.musicGain) this.musicGain.gain.value = 1;
+
+    this.emit("audio:graph", { reason, master, ctxState: this.audioCtx.state });
+  }
+
+  private async getDecodedBuffer(trackId: string): Promise<AudioBuffer> {
+    const cached = this.decoded.get(trackId);
+    if (cached) return cached;
+
+    if (!this.audioCtx) throw new Error("AudioContext not ready.");
+
+    const urls = this.getTrackUrlCandidates(trackId);
+    let lastErr: unknown = null;
+
+    for (const url of urls) {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+        const arr = await res.arrayBuffer();
+
+        const audioBuf = await this.decodeArrayBuffer(arr);
+        this.decoded.set(trackId, audioBuf);
+
+        this.emit("audio:track-decoded", { trackId, url, durationSec: audioBuf.duration });
+        return audioBuf;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    throw new Error(`Failed to load track "${trackId}". Tried: ${urls.join(", ")}. Last error: ${msg}`);
+  }
+
+  private decodeArrayBuffer(arr: ArrayBuffer): Promise<AudioBuffer> {
+    if (!this.audioCtx) return Promise.reject(new Error("AudioContext not ready."));
+    const ctx = this.audioCtx;
+
+    return new Promise((resolve, reject) => {
+      try {
+        const p = ctx.decodeAudioData(arr, resolve, reject);
+        if (p && typeof (p as any).then === "function") {
+          (p as Promise<AudioBuffer>).then(resolve).catch(reject);
+        }
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  private startMusicSource(buffer: AudioBuffer, offsetSec: number, reason: string): void {
+    if (!this.audioCtx || !this.musicGain) throw new Error("Audio graph not ready.");
+
+    this.stopMusicSource("restart");
+
+    const src = this.audioCtx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(this.musicGain);
+
+    const offset = clampFinite(offsetSec, 0, Math.max(0, buffer.duration - 0.0001));
+
+    this.musicSource = src;
+    this.musicStartAtCtxTime = this.audioCtx.currentTime;
+    this.musicStartOffsetSec = offset;
+
+    src.onended = () => {
+      if (this.musicSource !== src) return;
+
+      this.state.timeSec = buffer.duration;
+      this.state.isPlaying = false;
+      this.musicSource = null;
+
+      this.emit("audio:ended", { trackId: this.state.activeTrackId });
+      this.emitState("audio:ended");
+      this.persistPlayer("audio:ended");
+    };
+
+    src.start(0, offset);
+    this.emit("audio:music-start", { reason, offsetSec: offset, durationSec: buffer.duration });
+  }
+
+  private stopMusicSource(reason: string): void {
+    if (!this.musicSource) return;
+
+    const src = this.musicSource;
+    this.musicSource = null;
+
+    try { src.onended = null; } catch {}
+    try { src.stop(); } catch {}
+    try { src.disconnect(); } catch {}
+
+    this.emit("audio:music-stop", { reason });
+  }
+
+  private updatePlayheadFromCtxTime(): void {
+    if (!this.audioCtx) return;
+    if (!this.musicSource) return;
+
+    const elapsed = Math.max(0, this.audioCtx.currentTime - this.musicStartAtCtxTime);
+    const t = this.musicStartOffsetSec + elapsed;
+
+    if (Number.isFinite(t)) this.state.timeSec = t;
+  }
+
+  private getTrackUrlCandidates(trackId: string): string[] {
+    const name = trackId;
+
+    const urls: string[] = [];
+    urls.push(`/assets/audio/${name}.mp3`);
+    urls.push(`/audio/${name}.mp3`);
+    urls.push(`/${name}.mp3`);
+
+    const lower = name.toLowerCase();
+    if (lower !== name) {
+      urls.push(`/assets/audio/${lower}.mp3`);
+      urls.push(`/audio/${lower}.mp3`);
+      urls.push(`/${lower}.mp3`);
+    }
+
+    return Array.from(new Set(urls));
   }
 
   // ---------------------------------------------------------------------------
   // EventBus wiring
   // ---------------------------------------------------------------------------
 
-  private handlers: Array<{
-    event: string;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    fn: (payload: any) => void;
-  }> = [];
-
   private attachBusHandlers(): void {
-    // Dev + UI events (later UI will emit these)
-    this.bind("audio:set-track", (p: { trackId: string | null }) => this.setTrack(p?.trackId ?? null));
-    this.bind("audio:play-request", () => this.play("audio:play-request"));
+    this.bind("audio:unlock-request", () => {
+      void this.unlock("audio:unlock-request");
+    });
+
+    this.bind("audio:announce", () => this.announceState("audio:announce"));
+
+    this.bind("audio:set-track", (p: { trackId: string | null }) => this.setTrack(p?.trackId ?? null, "audio:set-track"));
+    this.bind("audio:play-request", () => { void this.play("audio:play-request"); });
     this.bind("audio:pause-request", () => this.pause("audio:pause-request"));
     this.bind("audio:toggle-request", () => this.togglePlay("audio:toggle-request"));
     this.bind("audio:seek", (p: { timeSec: number }) => this.seek(p?.timeSec ?? 0, "audio:seek"));
+
+    this.bind("audio:seek-nudge", (p: { deltaSec: number }) => {
+      const d = Number.isFinite(p?.deltaSec) ? p.deltaSec : 0;
+      this.seek(this.state.timeSec + d, "audio:seek-nudge");
+    });
+
     this.bind("audio:set-volume", (p: { volume: number }) => this.setVolume(p?.volume ?? this.state.volume, "audio:set-volume"));
+    this.bind("audio:volume-nudge", (p: { delta: number }) => {
+      const d = Number.isFinite(p?.delta) ? p.delta : 0;
+      this.setVolume(this.state.volume + d, "audio:volume-nudge");
+    });
+
     this.bind("audio:set-shuffle", (p: { shuffle: boolean }) => this.setShuffle(!!p?.shuffle, "audio:set-shuffle"));
     this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) => this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"));
 
-    // Gate/system events
     this.bind("audio:fade-to-silence", (p: { reason?: AudioFadeReason; durationSec?: number }) =>
       this.fadeToSilence(p?.reason ?? "system", p?.durationSec)
     );
@@ -298,7 +619,6 @@ export class AudioSystem {
       this.resumeSystemAudio(p?.reason ?? "system", p?.durationSec)
     );
 
-    // Safety: Gate can also emit these
     this.bind("gate:closing", () => this.fadeToSilence("gate"));
     this.bind("gate:opening", () => this.resumeSystemAudio("gate"));
   }
@@ -329,6 +649,21 @@ export class AudioSystem {
     this.bus.emit("audio:state", { state: this.getState(), reason });
   }
 
+  private persistPlayer(reason: string): void {
+    this.persistence?.setAudioPlayer?.(
+      {
+        activeTrackId: this.state.activeTrackId,
+        isPlaying: this.state.isPlaying,
+        timeSec: this.state.timeSec,
+        durationSec: this.state.durationSec,
+        shuffle: this.state.shuffle,
+        repeat: this.state.repeat,
+        volume: this.state.volume,
+      },
+      reason
+    );
+  }
+
   private startFade(from: number, to: number, durationSec: number, reason: AudioFadeReason): void {
     this.fade = {
       active: durationSec > 0,
@@ -341,6 +676,7 @@ export class AudioSystem {
 
     if (!this.fade.active) {
       this.state.effectiveVolume = clamp01(to);
+      this.applyGainsFromState("fade:instant");
     }
   }
 
@@ -349,7 +685,18 @@ export class AudioSystem {
     if (!opts?.ignoreFade && this.fade.active) return this.state.effectiveVolume;
     return clamp01(this.state.volume);
   }
+
+  private safeGain(v: number): number {
+    if (!Number.isFinite(v)) return 0;
+    return clamp01(v);
+  }
 }
 
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+
+const clampFinite = (v: number, lo: number, hi: number): number => {
+  if (!Number.isFinite(v)) return lo;
+  if (hi <= lo) return lo;
+  return Math.min(hi, Math.max(lo, v));
+};

@@ -82,7 +82,7 @@ export class Engine {
     // Gate (local wall-clock midnight enforcement)
     this.gateSystem = new GateSystem(this.bus, this.persistence);
 
-    // Audio (Phase 1 skeleton)
+    // Audio (Phase 1)
     this.audioSystem = new AudioSystem({
       bus: this.bus,
       persistence: this.persistence,
@@ -181,7 +181,7 @@ export class Engine {
       this.sceneManager.requestScene(next);
     });
 
-    // Dev-only debug overlay + dev tools
+    // DEV-only debug overlay + dev tools
     if (import.meta.env.DEV) {
       this.debugOverlay = new DebugOverlay(this.camera, this.bus);
 
@@ -190,6 +190,10 @@ export class Engine {
 
       // DEV: announce audio state after overlay subscribes
       this.audioSystem.announceState("engine:dev-overlay-ready");
+
+      // Browser gesture unlock + (optional) dev autostart
+      this.setupAudioUnlockGestures();
+      this.setupAutoStartMusicOnFirstGesture("Lift");
 
       this.devTools = new DevTools({
         bus: this.bus,
@@ -200,6 +204,13 @@ export class Engine {
           toggleVisible?: () => void;
         },
       });
+    } else {
+      // In PROD, we still need browser gesture unlock.
+      this.setupAudioUnlockGestures();
+
+      // If you want Lift.mp3 to start for real users too, keep this enabled.
+      // If you prefer “silent until UI exists”, comment it out.
+      this.setupAutoStartMusicOnFirstGesture("Lift");
     }
 
     window.addEventListener("resize", this.handleResize);
@@ -246,7 +257,7 @@ export class Engine {
     // Gate system (local wall-clock)
     this.gateSystem.update(dt);
 
-    // Audio (Phase 1 skeleton)
+    // Audio
     this.audioSystem.update(dt);
 
     // Scene update
@@ -309,6 +320,80 @@ export class Engine {
 
     this.postFX.resize(w, h, pr);
   };
+
+  // ---------------------------------------------------------------------------
+  // Audio unlock (browser gesture)
+  // ---------------------------------------------------------------------------
+
+  private audioUnlockArmed = false;
+
+  /**
+   * Browsers require a user gesture to start audio. We arm a one-time gesture
+   * listener that requests unlock on first pointer/key interaction.
+   */
+  private setupAudioUnlockGestures(): void {
+    if (this.audioUnlockArmed) return;
+    this.audioUnlockArmed = true;
+
+    const fire = (): void => {
+      window.removeEventListener("pointerdown", fire);
+      window.removeEventListener("keydown", fire);
+      this.bus.emit("audio:unlock-request", {});
+    };
+
+    window.addEventListener("pointerdown", fire, { once: true });
+    window.addEventListener("keydown", fire, { once: true });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 1: Auto-start a background track on first gesture
+  // ---------------------------------------------------------------------------
+
+  private autoStartMusicArmed = false;
+
+  /**
+   * Starts a named track (e.g. "Lift") after the first user gesture.
+   * We wait for "audio:unlocked" before requesting play to avoid races.
+   */
+  private setupAutoStartMusicOnFirstGesture(trackId: string): void {
+    if (this.autoStartMusicArmed) return;
+    this.autoStartMusicArmed = true;
+
+    let fired = false;
+
+    const fire = (): void => {
+      if (fired) return;
+      fired = true;
+
+      window.removeEventListener("pointerdown", fire);
+      window.removeEventListener("keydown", fire);
+
+      // Set track immediately (id is used to resolve Lift.mp3).
+      this.bus.emit("audio:set-track", { trackId });
+
+      // Once unlocked, request play.
+      const onUnlocked = (): void => {
+        this.bus.off("audio:unlocked", onUnlocked as unknown as (payload: unknown) => void);
+        this.bus.emit("audio:play-request", {});
+      };
+
+      // If we’re already unlocked for some reason, just play.
+      const state = this.audioSystem.getState();
+      if (state.isUnlocked) {
+        this.bus.emit("audio:play-request", {});
+        return;
+      }
+
+      // Wait for unlock completion.
+      this.bus.on("audio:unlocked", onUnlocked as unknown as (payload: unknown) => void);
+
+      // Trigger unlock.
+      this.bus.emit("audio:unlock-request", {});
+    };
+
+    window.addEventListener("pointerdown", fire, { once: true });
+    window.addEventListener("keydown", fire, { once: true });
+  }
 
   dispose(): void {
     this.stop();

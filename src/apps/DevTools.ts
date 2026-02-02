@@ -212,6 +212,56 @@ export class DevTools {
     });
 
     // --------------------------------------------------------
+    // Audio (Phase 1 skeleton) — DEV hotkeys
+    // --------------------------------------------------------
+
+    // Unlock browser audio (required before any sound can play)
+    this.register("u", {
+      label: "Unlock Audio (user gesture)",
+      action: () => {
+        this.bus.emit("audio:unlock-request", {});
+      },
+    });
+
+    // Space toggles play/pause intent
+    this.register(" ", {
+      label: "Audio Toggle Play/Pause",
+      action: () => {
+        this.bus.emit("audio:toggle-request", {});
+      },
+    });
+
+    // Volume down/up
+    this.register("-", {
+      label: "Audio Volume Down",
+      action: () => {
+        this.bus.emit("audio:volume-nudge", { delta: -0.05 });
+      },
+    });
+
+    this.register("=", {
+      label: "Audio Volume Up",
+      action: () => {
+        this.bus.emit("audio:volume-nudge", { delta: 0.05 });
+      },
+    });
+
+    // Seek back/forward
+    this.register("[", {
+      label: "Audio Seek Back 5s",
+      action: () => {
+        this.bus.emit("audio:seek-nudge", { deltaSec: -5 });
+      },
+    });
+
+    this.register("]", {
+      label: "Audio Seek Forward 5s",
+      action: () => {
+        this.bus.emit("audio:seek-nudge", { deltaSec: 5 });
+      },
+    });
+
+    // --------------------------------------------------------
     // Gate (Phase 1 DEV) — quick test hotkeys
     // --------------------------------------------------------
     // G: close the Still immediately (simulate midnight)
