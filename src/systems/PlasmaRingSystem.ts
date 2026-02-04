@@ -35,7 +35,7 @@ export class PlasmaRingSystem {
     );
 
     const mat = new THREE.MeshStandardMaterial({
-      color: 0xffffed,
+      color: 0xfffdd0,
       metalness: 0.0,
       roughness: 0.35,
 
@@ -102,7 +102,7 @@ export class PlasmaRingSystem {
   private applyPalette(): void {
     const c =
       this.palette === "indigo" ? 0x103179 :
-      this.palette === "cream" ? 0xffffed :
+      this.palette === "cream" ? 0xfffdd0 :
       0xd4af37; // gold
 
     this.ring.material.emissive.setHex(c);

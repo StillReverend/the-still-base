@@ -72,9 +72,9 @@ export class StarSystem {
     this.geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
 
     this.material = new THREE.PointsMaterial({
-      color: 0xffffed,
+      color: 0xffdd70,
       size,
-      sizeAttenuation: true,
+      sizeAttenuation: false,
       transparent: true,
       opacity: 0.9,
       depthWrite: false,

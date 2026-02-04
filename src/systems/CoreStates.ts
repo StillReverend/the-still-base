@@ -30,6 +30,18 @@ export type CoreAudioFrame = {
   mid?: number;
   /** 0..1 high band energy (optional). */
   high?: number;
+
+  /**
+   * Optional: peak-hold energy (0..1) from AudioSystem.
+   * If present, we can use it for "big moment" visuals that linger slightly.
+   */
+  peak?: number;
+
+  /**
+   * Optional: onset/transient (0..1) from AudioSystem.
+   * If present, we can use it for quick "note pop" hits.
+   */
+  onset?: number;
 };
 
 export type CoreStateTuning = {
@@ -84,31 +96,31 @@ const clamp01 = (v: number): number => {
 
 const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   blackHole: {
-    glowIntensity: 0.0,
+    glowIntensity: 0,
     ringIntensity: 0.79,
     audioPunch: 2.25,
-    ringColor: 0xffffed,
-    glowColor: 0xffffed,
+    ringColor: 0xfffdd0,
+    glowColor: 0xfffdd0,
     enableRealLight: true,
     realLightIntensity: 0.99,
   },
   sol: {
-    glowIntensity: 0.0,
+    glowIntensity: 0,
     ringIntensity: 0.79,
-    audioPunch: 1.35,
-    ringColor: 0xd4af37,
-    glowColor: 0xffffed,
+    audioPunch: 1.75,
+    ringColor: 0xffdd70,
+    glowColor: 0xfffdd0,
     enableRealLight: true,
-    realLightIntensity: 0.9,
+    realLightIntensity: 0.99,
   },
   luna: {
-    glowIntensity: 0.0,
-    ringIntensity: 0.79,
-    audioPunch: 1.15,
-    ringColor: 0x103179,
-    glowColor: 0x093085,
+    glowIntensity: 0,
+    ringIntensity: 0.50,
+    audioPunch: 1.75,
+    ringColor: 0xffffed,
+    glowColor: 0xfffdd0,
     enableRealLight: true,
-    realLightIntensity: 0.33,
+    realLightIntensity: 0.99,
   },
 };
 
@@ -124,6 +136,16 @@ function mergeTuning(base: CoreStateTuning, override?: Partial<CoreStateTuning>)
     realLightIntensity: override.realLightIntensity ?? base.realLightIntensity,
   };
 }
+
+// ------------------------------------------------------------
+// NEW: Per-state fill tuning (threshold + curve) for Sol/Luna/BlackHole
+// ------------------------------------------------------------
+
+const fillEdgesByState: Record<CoreStateName, { start: number; end: number; curve: number }> = {
+  blackHole: { start: 0.85, end: 0.94, curve: 0.97 },
+  sol: { start: 0.50, end: 1.26, curve: 0.53 },
+  luna: { start: 0.50, end: 0.85, curve: 0.85 },
+};
 
 // ------------------------------------------------------------
 // Sol Plasma Shader
@@ -445,9 +467,9 @@ function createBlackHoleMaterial(): THREE.ShaderMaterial {
   const uniforms = {
     uTime: { value: 0 },
     uEnergy: { value: 0 },
-    uDeep: { value: new THREE.Color(0x02020a) },
-    uTint: { value: new THREE.Color(0x0b0b18) },
-    uRim: { value: new THREE.Color(0xd4af37) },
+    uDeep: { value: new THREE.Color(0x000000) },
+    uTint: { value: new THREE.Color(0x171717) },
+    uRim: { value: new THREE.Color(0x000000) },
     uRimStrength: { value: 0.31 },
     uSwirlStrength: { value: 0.22 },
     uDetail: { value: 1.0 },
@@ -590,7 +612,7 @@ function createGlow(coreRadius: number): Glow {
   const outerGeom = new THREE.SphereGeometry(outerRadius, 64, 64);
 
   const innerMat = new THREE.MeshBasicMaterial({
-    color: 0xffffff,
+    color: 0xfffdd0,
     transparent: true,
     opacity: 0.31,
     depthWrite: false,
@@ -600,7 +622,7 @@ function createGlow(coreRadius: number): Glow {
   });
 
   const outerMat = new THREE.MeshBasicMaterial({
-    color: 0xffffff,
+    color: 0xfffdd0,
     transparent: true,
     opacity: 0.31,
     depthWrite: false,
@@ -636,10 +658,10 @@ function createRing(coreRadius: number): Ring {
 
   const mat = new THREE.ShaderMaterial({
     uniforms: {
-      uColor: { value: new THREE.Color(0xffffed) },
+      uColor: { value: new THREE.Color(0xfffdd0) },
       uIntensity: { value: 1.0 },
-      uPower: { value: 3.2 },
-      uSoft: { value: 0.85 },
+      uPower: { value: 3.1 },
+      uSoft: { value: 0.79 },
 
       uTime: { value: 0.0 },
       uWobbleStrength: { value: 0.0 },
@@ -648,6 +670,12 @@ function createRing(coreRadius: number): Ring {
 
       uDopplerStrength: { value: 0.0 },
       uSpinAxis: { value: new THREE.Vector3(0, 1, 0) },
+
+      // NEW: "fill" amount (0..1). 0 = normal rim ring, 1 = full-disc (sphere surface).
+      // This is the knob for your "plasma ring expands inward to fill the whole sphere" vibe.
+      uFill: { value: 0.0 },
+      // NEW: how softly the fill blends into the rim. Higher = softer edge.
+      uFillSoft: { value: 0.22 },
     },
     vertexShader: /* glsl */ `
       varying vec3 vWorldPos;
@@ -676,6 +704,9 @@ function createRing(coreRadius: number): Ring {
 
       uniform float uDopplerStrength;
       uniform vec3  uSpinAxis;
+
+      uniform float uFill;
+      uniform float uFillSoft;
 
       varying vec3 vWorldPos;
       varying vec3 vWorldNormal;
@@ -748,19 +779,27 @@ function createRing(coreRadius: number): Ring {
         float rim = pow(1.0 - ndvWarped, uPower);
         rim = smoothstep(0.0, uSoft, rim);
 
-        float a = clamp(rim * uIntensity, 0.0, 1.0);
+        float fill = clamp(uFill, 0.0, 1.0);
+
+        float disc = 1.0 - ndvWarped;
+
+        float thresh = mix(1.0, 0.0, fill);
+
+        float soft = max(0.0001, uFillSoft);
+        float fillMask = smoothstep(thresh - soft, thresh + soft, disc);
+
+        float aRing = clamp(rim * uIntensity, 0.0, 1.0);
+        float aFill = clamp(fillMask * uIntensity, 0.0, 1.0) * 0.85;
+
+        float a = clamp(max(aRing, aFill), 0.0, 1.0);
 
         vec3 axis = normalize(uSpinAxis);
 
-        // ✅ NaN-killer:
-        // If axis is parallel to N, cross(axis, N) = 0 => normalize(0) = NaN.
-        // Make a safe tangent using a fallback axis and gate doppler when unstable.
         vec3 c = cross(axis, N);
         float cLen2 = dot(c, c);
 
         vec3 tangent;
         if (cLen2 < 1e-8) {
-          // choose a fallback vector not parallel to axis
           vec3 fallback = (abs(axis.y) > 0.9) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
           tangent = safeNormalize(cross(axis, fallback), vec3(1.0, 0.0, 0.0));
         } else {
@@ -769,9 +808,8 @@ function createRing(coreRadius: number): Ring {
 
         float approach = dot(tangent, V);
 
-        float dopMask = rimMask * a;
+        float dopMask = clamp((rimMask * aRing) + (aFill * 0.25), 0.0, 1.0);
 
-        // If tangent was unstable, damp doppler contribution (keeps look, avoids NaNs)
         float dopplerGate = (cLen2 < 1e-8) ? 0.0 : 1.0;
 
         float d = clamp(approach * uDopplerStrength * dopplerGate, -1.0, 1.0);
@@ -832,20 +870,16 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
   };
 
   const update = (dt: number, audio: CoreAudioFrame, quality: CoreQuality): void => {
-    // Base energy from AudioSystem (0..1)
     const rawEnergy = clamp01(audio.energy ?? 0);
 
-    // Perceptual lift (black hole): expands low/mid energy, avoids harsh peaks
     const energy = clamp01(Math.pow(rawEnergy * 2.0, 0.7));
 
     const q = clamp01(quality.value);
 
-    // Time + core noise detail
     coreMat.uniforms.uTime.value += dt;
     coreMat.uniforms.uEnergy.value = energy;
     coreMat.uniforms.uDetail.value = 0.85 + q * 1.0;
 
-    // 🔥 Audio-driven visual emphasis
     if (coreMat.uniforms.uRimStrength) {
       coreMat.uniforms.uRimStrength.value = 0.12 + energy * 0.35;
     }
@@ -854,7 +888,6 @@ function createBlackHoleState(radius: number, tuning: CoreStateTuning): StateBun
       coreMat.uniforms.uSwirlStrength.value = 0.18 + energy * 0.35;
     }
 
-    // Real light follows energy subtly
     if (realLight) {
       realLight.intensity = tuning.realLightIntensity * (0.35 + energy * 0.6);
     }
@@ -1013,6 +1046,15 @@ export class CoreStates {
 
   private active: CoreStateName;
 
+  // ---------------------------------------------------------------------------
+  // Local transient detector state (kept for compatibility/fallback)
+  // ---------------------------------------------------------------------------
+  private prevEnergy: number = 0;
+  private notePop: number = 0; // 0..1-ish, fast-decay transient
+
+  // NEW: local peak-hold (fallback if AudioSystem doesn't provide frame.peak)
+  private peakHold: number = 0;
+
   constructor(deps: CoreStatesDeps) {
     this.parent = deps.parent;
     this.radius = deps.radius;
@@ -1081,6 +1123,8 @@ export class CoreStates {
       low: audio?.low,
       mid: audio?.mid,
       high: audio?.high,
+      peak: audio?.peak,
+      onset: audio?.onset,
     };
 
     this.states[this.active].update(dt, a, this.quality);
@@ -1096,16 +1140,67 @@ export class CoreStates {
       uni.uTime.value = (uni.uTime.value as number) + dt;
     }
 
-    // State-tunable punch (the knob)
+    // -------------------------------------------------------------------------
+    // Derive note transient:
+    // - Prefer AudioSystem onset if provided
+    // - Otherwise fallback to local energy-delta detector
+    // -------------------------------------------------------------------------
+    let onset = clamp01((a.onset as number) ?? 0);
+
+    if (!Number.isFinite(onset) || onset <= 0) {
+      const dE = Math.max(0, energy - this.prevEnergy);
+      this.prevEnergy = energy;
+
+      const decayPerSec = 8.5;
+      const decay = Math.exp(-decayPerSec * Math.max(0, dt));
+      this.notePop = Math.min(1, Math.max(this.notePop * decay, dE * 10.0));
+      onset = clamp01(this.notePop);
+    } else {
+      this.prevEnergy = energy;
+      this.notePop = onset;
+    }
+
+    // -------------------------------------------------------------------------
+    // Peak-hold:
+    // - Prefer AudioSystem peak if provided
+    // - Otherwise maintain a local peakHold that decays slowly
+    // -------------------------------------------------------------------------
+    let peak = clamp01((a.peak as number) ?? 0);
+    if (!Number.isFinite(peak) || peak <= 0) {
+      const decayPerSec = 0.42;
+      if (energy >= this.peakHold) this.peakHold = energy;
+      else this.peakHold = Math.max(energy, this.peakHold - decayPerSec * Math.max(0, dt));
+      peak = clamp01(this.peakHold);
+    } else {
+      this.peakHold = peak;
+    }
+
     const punch = Math.max(0, t.audioPunch ?? 1.0);
 
-    // Perceptual curve: makes low->mid move, and loud moments pop.
     const e = THREE.MathUtils.clamp(energy, 0, 1);
-    const eBoost = THREE.MathUtils.clamp(Math.pow(e, 0.55) * punch, 0, 3.0);
+
+    const sustained = Math.pow(e, 0.55);
+
+    const transient = onset * 0.79;
+
+    const eBoost = THREE.MathUtils.clamp((sustained + transient) * punch, 0, 3.0);
+
+    // -------------------------------------------------------------------------
+    // Ring "fill" behavior at peaks (PER-STATE tuned)
+    // -------------------------------------------------------------------------
+    const fillBase = peak;
+    const fillSpice = onset * 0.35;
+    const fillRaw = clamp01(fillBase + fillSpice);
+
+    const f = fillEdgesByState[this.active];
+    const fill = Math.pow(smoothstep01(f.start, f.end, fillRaw), f.curve);
+
+    if (uni.uFill) uni.uFill.value = fill;
+
+    if (uni.uFillSoft) uni.uFillSoft.value = THREE.MathUtils.clamp(0.16 + (1.0 - e) * 0.10, 0.10, 0.28);
 
     if (this.active === "blackHole") {
-      // Scale wobble/doppler with punch too (so BH can feel alive)
-      const w = THREE.MathUtils.clamp(0.10 + eBoost * 0.015, 0.0, 0.18);
+      const w = THREE.MathUtils.clamp(0.79 + eBoost * 0.015, 0.0, 0.18);
       const d = THREE.MathUtils.clamp(0.10 + eBoost * 0.06, 0.0, 0.40);
 
       if (uni.uWobbleStrength) uni.uWobbleStrength.value = w;
@@ -1115,7 +1210,6 @@ export class CoreStates {
       if (uni.uDopplerStrength) uni.uDopplerStrength.value = d;
       if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     } else if (this.active === "sol") {
-      // Sol stays tasteful, but still responds
       const w = THREE.MathUtils.clamp(0.012 + eBoost * 0.01, 0.0, 0.06);
       const d = THREE.MathUtils.clamp(0.05 + eBoost * 0.02, 0.0, 0.16);
 
@@ -1126,7 +1220,6 @@ export class CoreStates {
       if (uni.uDopplerStrength) uni.uDopplerStrength.value = d;
       if (uni.uSpinAxis) (uni.uSpinAxis.value as THREE.Vector3).set(0, 1, 0).normalize();
     } else {
-      // Luna: keep it calmer, but you can raise audioPunch to taste
       const d = THREE.MathUtils.clamp(eBoost * 0.02, 0.0, 0.10);
 
       if (uni.uWobbleStrength) uni.uWobbleStrength.value = 0.0;
@@ -1146,11 +1239,11 @@ export class CoreStates {
     const s = 1.0 + energy * 0.38;
     this.glow.outer.scale.setScalar(s);
 
-    // Base ring + audio lift (now state-tunable via audioPunch)
-    const ringIntensity = (0.55 + eBoost * 1.25) * t.ringIntensity;
+    const fillBonus = 1.0 + fill * 0.55;
 
-    // Let it go above 1.0 (additive ring loves this). Keep a sane ceiling.
-    if (uni.uIntensity) uni.uIntensity.value = THREE.MathUtils.clamp(ringIntensity, 0.0, 2.25);
+    const ringIntensity = (0.55 + eBoost * 1.25) * t.ringIntensity * fillBonus;
+
+    if (uni.uIntensity) uni.uIntensity.value = THREE.MathUtils.clamp(ringIntensity, 0.0, 2.75);
   }
 
   public dispose(): void {
@@ -1184,3 +1277,12 @@ export class CoreStates {
     if (rl) rl.color.set(t.ringColor as any);
   }
 }
+
+// ------------------------------------------------------------
+// Helpers (local)
+// ------------------------------------------------------------
+
+const smoothstep01 = (edge0: number, edge1: number, x: number): number => {
+  const t = clamp01((x - edge0) / Math.max(1e-6, edge1 - edge0));
+  return t * t * (3 - 2 * t);
+};

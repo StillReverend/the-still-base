@@ -84,7 +84,7 @@ export interface CameraRigOptions {
 // Default: TRUE free-orbit (no gate, allows roll)
 const DEFAULT_OPTIONS: CameraRigOptions = {
   minDistance: 103.1,
-  maxDistance: 1979,
+  maxDistance: 10000,
 
   minPolarAngle: 0.1,
   maxPolarAngle: Math.PI - 0.1,
@@ -188,7 +188,7 @@ export class CameraSystem {
 
     // Clipping planes
     this.camera.near = 0.5;
-    this.camera.far = 7777;
+    this.camera.far = 15000;
     this.camera.updateProjectionMatrix();
 
     this.registerBusHandlers();

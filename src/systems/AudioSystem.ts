@@ -123,6 +123,26 @@ export class AudioSystem {
   private smoothedMid = 0;
   private smoothedHigh = 0;
 
+  // NEW: "note pop" onset (0..1)
+  private smoothedOnset = 0;
+  private prevRawEnergy = 0;
+
+  // NEW: onset tuning (safe defaults, easy to tweak)
+  // - onsetGain: increases sensitivity to small plucks/notes (quiet tracks)
+  // - onsetAttackHz: how fast onset rises (higher = snappier)
+  // - onsetReleaseHz: how fast onset falls (higher = shorter pop)
+  private readonly onsetGain = 14; // try 10..22
+  private readonly onsetAttackHz = 80; // try 60..140
+  private readonly onsetReleaseHz = 16; // try 10..28
+
+  // Existing smoothing speed for bands/energy
+  private readonly bandSmoothHz = 10; // ~fast but not twitchy
+
+  // NEW: peak hold (0..1) for "big moment" visuals.
+  // Use this when you want the ring to "fill" at musical peaks, even if the peak is brief.
+  private peakHold = 0;
+  private readonly peakDecayPerSec = 0.42; // try 0.25..0.80 (lower = longer hang)
+
   // ----------------------------------------------------------
   // Bus wiring
   // ----------------------------------------------------------
@@ -415,15 +435,21 @@ export class AudioSystem {
     this.stopMusicSource("dispose");
 
     if (this.analyser) {
-      try { this.analyser.disconnect(); } catch {}
+      try {
+        this.analyser.disconnect();
+      } catch {}
       this.analyser = null;
     }
     if (this.musicGain) {
-      try { this.musicGain.disconnect(); } catch {}
+      try {
+        this.musicGain.disconnect();
+      } catch {}
       this.musicGain = null;
     }
     if (this.masterGain) {
-      try { this.masterGain.disconnect(); } catch {}
+      try {
+        this.masterGain.disconnect();
+      } catch {}
       this.masterGain = null;
     }
 
@@ -431,7 +457,9 @@ export class AudioSystem {
     this.fftBins = null;
 
     if (this.audioCtx) {
-      try { void this.audioCtx.close(); } catch {}
+      try {
+        void this.audioCtx.close();
+      } catch {}
       this.audioCtx = null;
     }
   }
@@ -568,9 +596,15 @@ export class AudioSystem {
     const src = this.musicSource;
     this.musicSource = null;
 
-    try { src.onended = null; } catch {}
-    try { src.stop(); } catch {}
-    try { src.disconnect(); } catch {}
+    try {
+      src.onended = null;
+    } catch {}
+    try {
+      src.stop();
+    } catch {}
+    try {
+      src.disconnect();
+    } catch {}
 
     this.emit("audio:music-stop", { reason });
   }
@@ -604,7 +638,7 @@ export class AudioSystem {
   }
 
   // ---------------------------------------------------------------------------
-  // Reactive frame emission (FFT -> energy/low/mid/high)
+  // Reactive frame emission (FFT -> energy/low/mid/high + onset + peakHold)
   // ---------------------------------------------------------------------------
 
   private maybeEmitAudioFrame(reason: string): void {
@@ -619,7 +653,7 @@ export class AudioSystem {
 
     if (this.lastFrameEmitCtxTime >= 0 && now - this.lastFrameEmitCtxTime < interval) return;
 
-    // Capture the previous timestamp BEFORE updating lastFrameEmitCtxTime
+    // Capture previous timestamp BEFORE updating
     const prev = this.lastFrameEmitCtxTime >= 0 ? this.lastFrameEmitCtxTime : now - interval;
     this.lastFrameEmitCtxTime = now;
 
@@ -631,7 +665,7 @@ export class AudioSystem {
     const nyquist = sr * 0.5;
     const hzPerBin = nyquist / Math.max(1, binCount);
 
-    // Bands (Hz). These are intentionally broad for "vibe" not science lab.
+    // Bands (Hz). Broad for vibe, not lab precision.
     const lowHz: [number, number] = [40, 250];
     const midHz: [number, number] = [250, 2000];
     const highHz: [number, number] = [2000, 8000];
@@ -641,16 +675,43 @@ export class AudioSystem {
     const high = this.avgBand01(highHz[0], highHz[1], hzPerBin);
 
     // Energy: weighted blend (low carries “pulse”, highs carry “sparkle”)
-    const rawEnergy = clamp01(low * 0.5 + mid * 0.35 + high * 0.15);
+    const rawEnergy = clamp01(low * 0.30 + mid * 0.60 + high * 0.10);
 
-    // Smooth for aesthetics (time-based one-pole)
+    // dt in seconds between emitted frames
     const dt = Math.max(0.000001, now - prev);
-    const alpha = clamp01(1 - Math.exp(-dt * 10)); // ~fast but not twitchy
+
+    // Smooth energy/bands for aesthetics (time-based one-pole)
+    const alpha = clamp01(1 - Math.exp(-dt * this.bandSmoothHz));
 
     this.smoothedLow = lerp(this.smoothedLow, low, alpha);
     this.smoothedMid = lerp(this.smoothedMid, mid, alpha);
     this.smoothedHigh = lerp(this.smoothedHigh, high, alpha);
     this.smoothedEnergy = lerp(this.smoothedEnergy, rawEnergy, alpha);
+
+    // --------------------------------------------------------
+    // Onset (note pops)
+    // --------------------------------------------------------
+    // Positive delta emphasizes attacks; scaled to become meaningful on quiet tracks.
+    const delta = Math.max(0, rawEnergy - this.prevRawEnergy);
+    this.prevRawEnergy = rawEnergy;
+
+    // Gain + a tiny curve so small deltas still register
+    const onsetTarget = clamp01(Math.pow(delta * this.onsetGain, 0.85));
+
+    // Attack/Release envelope (fast attack, quick-ish release)
+    this.smoothedOnset = smoothAR(this.smoothedOnset, onsetTarget, this.onsetAttackHz, this.onsetReleaseHz, dt);
+
+    // --------------------------------------------------------
+    // Peak hold (for "fill the ring" moments)
+    // --------------------------------------------------------
+    // - instantly catches big peaks
+    // - decays slowly so visuals can "arrive" and linger
+    if (rawEnergy >= this.peakHold) {
+      this.peakHold = rawEnergy;
+    } else {
+      this.peakHold = Math.max(rawEnergy, this.peakHold - this.peakDecayPerSec * dt);
+    }
+    this.peakHold = clamp01(this.peakHold);
 
     this.emit("audio:frame", {
       reason,
@@ -659,6 +720,8 @@ export class AudioSystem {
         low: clamp01(this.smoothedLow),
         mid: clamp01(this.smoothedMid),
         high: clamp01(this.smoothedHigh),
+        onset: clamp01(this.smoothedOnset),
+        peak: this.peakHold,
       },
       isPlaying: this.state.isPlaying,
       trackId: this.state.activeTrackId,
@@ -698,7 +761,9 @@ export class AudioSystem {
     this.bind("audio:announce", () => this.announceState("audio:announce"));
 
     this.bind("audio:set-track", (p: { trackId: string | null }) => this.setTrack(p?.trackId ?? null, "audio:set-track"));
-    this.bind("audio:play-request", () => { void this.play("audio:play-request"); });
+    this.bind("audio:play-request", () => {
+      void this.play("audio:play-request");
+    });
     this.bind("audio:pause-request", () => this.pause("audio:pause-request"));
     this.bind("audio:toggle-request", () => this.togglePlay("audio:toggle-request"));
     this.bind("audio:seek", (p: { timeSec: number }) => this.seek(p?.timeSec ?? 0, "audio:seek"));
@@ -805,4 +870,22 @@ const clampFinite = (v: number, lo: number, hi: number): number => {
   if (!Number.isFinite(v)) return lo;
   if (hi <= lo) return lo;
   return Math.min(hi, Math.max(lo, v));
+};
+
+/**
+ * Attack/Release smoother:
+ * - If target is above current -> attack rate
+ * - If target is below current -> release rate
+ * rates are in "Hz" (higher = faster)
+ */
+const smoothAR = (current: number, target: number, attackHz: number, releaseHz: number, dt: number): number => {
+  const a = Math.max(0, attackHz);
+  const r = Math.max(0, releaseHz);
+  const rate = target > current ? a : r;
+
+  if (rate <= 0) return target;
+
+  const k = 1 - Math.exp(-rate * Math.max(0.000001, dt));
+  const out = current + (target - current) * k;
+  return Number.isFinite(out) ? out : target;
 };

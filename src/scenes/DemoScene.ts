@@ -192,10 +192,10 @@ export class DemoScene implements SceneController {
   // ✅ TEMP: Placeholder stars (will be rewritten later)
   private buildStars(): void {
     this.starSystem = new StarSystem(this.scene, {
-      count: 31,
-      radius: 2026,
+      count: 79,
+      radius: 5000,
       size: 1.5,
-      exclusionRadius: 100,
+      exclusionRadius: 1000,
     });
   }
 
@@ -252,7 +252,7 @@ export class DemoScene implements SceneController {
     const y = 0.02;
 
     const universeRadius = new Date().getFullYear();
-    const systemRadius = 1979;
+    const systemRadius = 8000;
     const spokeRadius = systemRadius;
 
     const regions = this.regionSystem.getRegions();
