@@ -26,3 +26,7 @@ still-file-structure.txt
 
 # Local/dev audio assets (keep out of git)
 public/assets/audio/*.mp3
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
