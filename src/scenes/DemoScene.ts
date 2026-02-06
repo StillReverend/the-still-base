@@ -25,9 +25,14 @@ import type { SceneController, SceneContext, SceneName } from "../apps/SceneType
 import type { CorePhase } from "../systems/CoreSystem";
 import { CoreSystem } from "../systems/CoreSystem";
 import { StarSystem } from "../systems/StarSystem";
+import { RitualSystem } from "../systems/RitualSystem";
 
 // P05 (math-only) Regions
 import { RegionSystem } from "../systems/RegionSystem";
+
+type RitualProgressPayload = {
+  progress01?: number;
+};
 
 export class DemoScene implements SceneController {
   public readonly name: SceneName = "DemoScene";
@@ -42,6 +47,7 @@ export class DemoScene implements SceneController {
 
   private core: CoreSystem | null = null;
   private starSystem: StarSystem | null = null;
+  private ritual: RitualSystem | null = null;
 
   private ambientLight: THREE.AmbientLight | null = null;
   private keyLight: THREE.DirectionalLight | null = null;
@@ -90,6 +96,26 @@ export class DemoScene implements SceneController {
   };
 
   // ----------------------------------------------------------
+  // Ritual -> Stars (stored handlers so we can off() cleanly)
+  // ----------------------------------------------------------
+
+  private onRitualProgress = (p: RitualProgressPayload): void => {
+    if (!this.starSystem) return;
+    const v = typeof p?.progress01 === "number" ? p.progress01 : 0;
+    this.starSystem.setNearRevealTarget01(v);
+  };
+
+  private onRitualCancelled = (): void => {
+    if (!this.starSystem) return;
+    this.starSystem.setNearRevealTarget01(0.33);
+  };
+
+  private onRitualCompleted = (): void => {
+    if (!this.starSystem) return;
+    this.starSystem.setNearRevealTarget01(1.0);
+  };
+
+  // ----------------------------------------------------------
   // init()
   // ----------------------------------------------------------
   public init(ctx: SceneContext): void {
@@ -110,8 +136,29 @@ export class DemoScene implements SceneController {
     this.buildLights();
     this.buildCoreAndClock(ctx);
 
-    // ✅ TEMP: simple stars so the world isn't empty
+    // Stars (FAR + NEAR)
     this.buildStars();
+
+    // Ritual v0 (hold-to-open)
+    if (this.core) {
+      this.ritual = new RitualSystem(
+        {
+          bus: ctx.bus,
+          domElement: ctx.renderer.domElement,
+          camera: ctx.camera,
+          coreRoot: this.core.getRoot(),
+        },
+        {
+          holdDurationMs: 3000, // dev-fast; we’ll tune later
+          enableKeyboardHold: true, // Spacebar ritual for dev
+        },
+      );
+
+      // Ritual -> NEAR star reveal (attach handlers)
+      ctx.bus.on("ritual:core:progress", this.onRitualProgress);
+      ctx.bus.on("ritual:core:cancelled", this.onRitualCancelled);
+      ctx.bus.on("ritual:core:completed", this.onRitualCompleted);
+    }
 
     // IMPORTANT: Request canonical spawn orbit from CameraSystem (authoritative).
     this.configureCamera(ctx);
@@ -189,13 +236,20 @@ export class DemoScene implements SceneController {
     this.clockFace.add(this.core.getRoot());
   }
 
-  // ✅ TEMP: Placeholder stars (will be rewritten later)
   private buildStars(): void {
     this.starSystem = new StarSystem(this.scene, {
-      count: 79,
-      radius: 5000,
-      size: 1.5,
       exclusionRadius: 1000,
+
+      farCount: 250,
+      farRadius: 6500,
+      farSize: 1.1,
+
+      nearCount: 2400,
+      nearInnerRadius: 900,
+      nearOuterRadius: 5000,
+      nearSize: 1.6,
+
+      nearReveal01: 0.33,
     });
   }
 
@@ -385,6 +439,10 @@ export class DemoScene implements SceneController {
     if (this.starSystem) {
       this.starSystem.update(delta);
     }
+
+    if (this.ritual) {
+      this.ritual.update();
+    }
   }
 
   // ----------------------------------------------------------
@@ -408,9 +466,21 @@ export class DemoScene implements SceneController {
     this.regionDebugDisposables = [];
     this.regionSystem = null;
 
+    // Ritual listener cleanup (always)
+    if (this.ctx) {
+      this.ctx.bus.off("ritual:core:progress", this.onRitualProgress);
+      this.ctx.bus.off("ritual:core:cancelled", this.onRitualCancelled);
+      this.ctx.bus.off("ritual:core:completed", this.onRitualCompleted);
+    }
+
     if (this.starSystem) {
       this.starSystem.dispose(this.scene);
       this.starSystem = null;
+    }
+
+    if (this.ritual) {
+      this.ritual.dispose();
+      this.ritual = null;
     }
 
     if (this.core) {

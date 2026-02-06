@@ -34,3 +34,7 @@ public/assets/audio/*.mp3
 # macOS Finder metadata
 .DS_Store
 **/.DS_Store
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store

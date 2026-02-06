@@ -25,7 +25,7 @@
 
 import * as THREE from "three";
 
-import type { EventBus } from "../core/EventBus";
+import type { EventBus, EventHandler } from "../core/EventBus";
 import type { Config } from "../core/Config";
 import type { SaveManager } from "../core/SaveManager";
 
@@ -100,12 +100,21 @@ export class CoreSystem {
   private blackHoleOverride = false;
   private appliedPhase: CorePhase | null = null;
 
+  private disposed = false;
+
   // --------------------------------------------------------
   // Audio-reactive core (Phase 1, additive)
   // --------------------------------------------------------
   // AudioSystem emits "audio:frame" with normalized bands; we cache the latest
   // and feed it into CoreStates.update() each frame.
   private lastAudioFrame = { energy: 0, low: 0, mid: 0, high: 0 };
+
+  // --------------------------------------------------------
+  // EventBus handler refs (for proper cleanup)
+  // --------------------------------------------------------
+  private readonly onAudioFrame: EventHandler<AudioFramePayload>;
+  private readonly onForceBlackHole: EventHandler<ForceBlackHolePayload>;
+  private readonly onGateOpened: EventHandler<GateOpenedPayload>;
 
   constructor(deps: CoreSystemDeps) {
     this.bus = deps.bus;
@@ -144,10 +153,11 @@ export class CoreSystem {
     this.root.rotation.set(0, 0, 0);
 
     // --------------------------------------------------------
-    // Audio integration (Phase 1, additive)
+    // Define handlers (stored for bus.off in dispose)
     // --------------------------------------------------------
+
     // Cache latest frame for CoreStates.update()
-    this.bus.on<AudioFramePayload>("audio:frame", (payload) => {
+    this.onAudioFrame = (payload) => {
       const f = payload?.frame;
       if (!f) return;
 
@@ -157,32 +167,40 @@ export class CoreSystem {
         mid: clamp01(f.mid ?? this.lastAudioFrame.mid),
         high: clamp01(f.high ?? this.lastAudioFrame.high),
       };
-    });
+    };
 
-    // --------------------------------------------------------
-    // Gate integration (Phase 1, additive)
-    // --------------------------------------------------------
     // GateSystem requests a forced black hole on close.
-    this.bus.on<ForceBlackHolePayload>("core:force-black-hole", (payload) => {
+    this.onForceBlackHole = (payload) => {
       // Idempotent: if already forced, just re-apply.
       this.blackHoleOverride = true;
       this.applyDesiredPhase(true);
 
       // Optional visibility for debugging
       try {
-        // @ts-expect-error - EventBus may or may not expose emit()
-        this.bus.emit?.("core:phase", { phase: "black_hole", override: true, source: "gate", payload });
+        this.bus.emit("core:phase", {
+          phase: "black_hole",
+          override: true,
+          source: "gate",
+          payload,
+        });
       } catch {
         // no-op
       }
-    });
+    };
 
     // When the gate re-opens, release the forced black hole and return to time-of-day phase.
-    this.bus.on<GateOpenedPayload>("gate:opened", () => {
+    this.onGateOpened = () => {
       if (!this.blackHoleOverride) return;
       this.blackHoleOverride = false;
       this.applyDesiredPhase(true);
-    });
+    };
+
+    // --------------------------------------------------------
+    // Register handlers
+    // --------------------------------------------------------
+    this.bus.on<AudioFramePayload>("audio:frame", this.onAudioFrame);
+    this.bus.on<ForceBlackHolePayload>("core:force-black-hole", this.onForceBlackHole);
+    this.bus.on<GateOpenedPayload>("gate:opened", this.onGateOpened);
 
     // Apply initial desired phase (solar/lunar by time-of-day unless overridden)
     this.applyDesiredPhase(true);
@@ -282,10 +300,8 @@ export class CoreSystem {
     this.applyPostFXProfileFromPhase(desired);
 
     // Optional: let other systems observe phase changes
-    // (No assumptions about EventBus API shape; safe-guarded)
     try {
-      // @ts-expect-error - EventBus may or may not expose emit()
-      this.bus.emit?.("core:phase", { phase: desired, override: this.blackHoleOverride });
+      this.bus.emit("core:phase", { phase: desired, override: this.blackHoleOverride });
     } catch {
       // no-op
     }
@@ -322,6 +338,14 @@ export class CoreSystem {
   }
 
   public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+
+    // Unhook EventBus listeners (prevents duplicate reactions on scene reload / hot reload)
+    this.bus.off<AudioFramePayload>("audio:frame", this.onAudioFrame);
+    this.bus.off<ForceBlackHolePayload>("core:force-black-hole", this.onForceBlackHole);
+    this.bus.off<GateOpenedPayload>("gate:opened", this.onGateOpened);
+
     if (this.coreStates) {
       this.coreStates.dispose();
       this.coreStates = null;

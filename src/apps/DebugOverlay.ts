@@ -115,6 +115,7 @@ export class DebugOverlay {
   // DEV panels/toggles
   private showBusLog = false;
   private includeCameraTelemetryInBusLog = false; // default OFF
+  private includeAudioFrameInBusLog = false; // default OFF (prevents spam)
   private showCameraTelemetrySection = true;
 
   // Bus log ring buffer
@@ -142,6 +143,11 @@ export class DebugOverlay {
         return;
       }
       this.showBusLog = !this.showBusLog;
+      return;
+    }
+
+    if (key === "a") {
+      this.includeAudioFrameInBusLog = !this.includeAudioFrameInBusLog;
       return;
     }
 
@@ -198,6 +204,11 @@ export class DebugOverlay {
 
           // Filter at CAPTURE time so early events don't get flooded.
           if (name === "camera:telemetry" && !this.includeCameraTelemetryInBusLog) {
+            this.busSkipped += 1;
+            return;
+          }
+
+          if (name === "audio:frame" && !this.includeAudioFrameInBusLog) {
             this.busSkipped += 1;
             return;
           }
@@ -266,6 +277,7 @@ export class DebugOverlay {
       "  R: toggle regions",
       "  E: toggle bus log panel",
       "  Shift+E: include camera:telemetry in bus log",
+      "  A: include/exclude audio:frame in bus log",
       "  T: toggle camera telemetry section",
     ];
 
@@ -300,6 +312,7 @@ export class DebugOverlay {
         "",
         `bus log: ${this.showBusLog ? "ON" : "OFF"} (onAny=${hasOnAny ? "yes" : "no"})`,
         `  camera:telemetry in log: ${this.includeCameraTelemetryInBusLog ? "ON" : "OFF"}`,
+        `  audio:frame in log: ${this.includeAudioFrameInBusLog ? "ON" : "OFF"}`,
         `  skipped: ${this.busSkipped}`,
       );
 
