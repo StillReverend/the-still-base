@@ -115,6 +115,18 @@ export class DemoScene implements SceneController {
     this.starSystem.setNearRevealTarget01(1.0);
   };
 
+  private onAudioFrame = (p: any): void => {
+    const f = p?.frame;
+    if (!f || !this.starSystem) return;
+
+    this.starSystem.setAudioFrame({
+      energy: f.energy,
+      low: f.low,
+      mid: f.mid,
+      high: f.high,
+    });
+  };
+
   // ----------------------------------------------------------
   // init()
   // ----------------------------------------------------------
@@ -138,6 +150,8 @@ export class DemoScene implements SceneController {
 
     // Stars (FAR + NEAR)
     this.buildStars();
+
+    ctx.bus.on("audio:frame", this.onAudioFrame);
 
     // Ritual v0 (hold-to-open)
     if (this.core) {
@@ -468,6 +482,8 @@ export class DemoScene implements SceneController {
 
     // Ritual listener cleanup (always)
     if (this.ctx) {
+      this.ctx.bus.off("audio:frame", this.onAudioFrame);
+
       this.ctx.bus.off("ritual:core:progress", this.onRitualProgress);
       this.ctx.bus.off("ritual:core:cancelled", this.onRitualCancelled);
       this.ctx.bus.off("ritual:core:completed", this.onRitualCompleted);
