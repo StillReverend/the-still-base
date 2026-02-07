@@ -107,7 +107,7 @@ export class Engine {
 
     // Camera
     this.camera = new THREE.PerspectiveCamera(
-      60,
+      50,
       window.innerWidth / window.innerHeight,
       1.0,
       1000,
@@ -193,7 +193,7 @@ export class Engine {
 
       // Browser gesture unlock + (optional) dev autostart
       this.setupAudioUnlockGestures();
-      this.setupAutoStartMusicOnFirstGesture("Lift");
+      this.setupAutoStartMusicOnFirstGesture("Legacy");
 
       this.devTools = new DevTools({
         bus: this.bus,
@@ -210,7 +210,7 @@ export class Engine {
 
       // If you want Lift.mp3 to start for real users too, keep this enabled.
       // If you prefer “silent until UI exists”, comment it out.
-      this.setupAutoStartMusicOnFirstGesture("Lift");
+      this.setupAutoStartMusicOnFirstGesture("Legacy");
     }
 
     window.addEventListener("resize", this.handleResize);

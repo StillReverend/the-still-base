@@ -135,7 +135,7 @@ export class CoreSystem {
     // Core visual states
     this.coreStates = new CoreStates({
       parent: this.coreGroup,
-      radius: 79,
+      radius: 100,
       initialState: this.mapPhaseToState(this.phase),
     });
 
@@ -324,7 +324,7 @@ export class CoreSystem {
       this.coreStates.update(dt, this.lastAudioFrame);
     }
 
-    //this.clock.update(dt);
+    this.clock.update(dt);
     this.time.update(dt);
   }
 

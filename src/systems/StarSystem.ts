@@ -1,18 +1,18 @@
 // ============================================================
-// THE STILL — P03 (StarSystem v0)
+// THE STILL — P03 (StarSystem v0 + BAND)
 // StarSystem.ts
 // ------------------------------------------------------------
-// NOW (simplified + “liquid”):
+// NOW:
 //  - FAR stars: static-ish, subtle
-//  - NEAR stars: ALWAYS exist as a pool, but brightness is modulated per-star
-//    by a smooth audio “intensity” (0..1). No more “reveal by count” popping.
-//  - If audio is NOT playing: NEAR goes fully dark (0 intensity)
-//  - Ritual can override brightness even when audio is NOT playing.
-//  - Shockwave pulse can be "sphere" or "planeXZ" and affects ALL near stars.
+//  - NEAR stars: pool with brightness modulated by audio “intensity” (0..1)
+//    + ritual external lane + shockwave pulse
+//  - BAND stars: true 3D spherical shell starfield driven by low/mid/high bands
+//    (all stars exist; per-star brightness + tint modulated smoothly, no popping)
 //
-// Key idea:
-//  - intensity = max(audioTarget, externalTarget)
-//  - externalTarget auto-decays unless it’s being actively driven (ritual progress)
+// BAND rules:
+//  - If audio is NOT playing: BAND goes true dark (writes zeros)
+//  - NEAR ritual lane stays as-is (BAND does not conflict)
+//  - No per-frame geometry rebuild; stable cached arrays
 // ============================================================
 
 import * as THREE from "three";
@@ -36,6 +36,12 @@ type StarSystemOptions = {
 
   // Starting intensity (0..1). Recommend 0.0 for true darkness until audio.
   nearReveal01?: number;
+
+  // BAND stars (new)
+  bandCount?: number;
+  bandInnerRadius?: number;
+  bandOuterRadius?: number;
+  bandSize?: number;
 };
 
 type AudioFrame = {
@@ -69,6 +75,31 @@ const smoothstep = (edge0: number, edge1: number, x: number): number => {
   return t * t * (3 - 2 * t);
 };
 
+const gate01 = (v: number, on: number, feather: number): number => {
+  const f = Math.max(1e-6, feather);
+  return smoothstep(on, on + f, clamp01(v));
+};
+
+type RGB01 = { r: number; g: number; b: number };
+
+const hexToRgb01 = (hex: number): RGB01 => {
+  const c = new THREE.Color(hex);
+  return { r: c.r, g: c.g, b: c.b };
+};
+
+const normalize3 = (a: number, b: number, c: number): { a: number; b: number; c: number } => {
+  const s = a + b + c;
+  if (s <= 1e-8) return { a: 0, b: 0, c: 0 };
+  return { a: a / s, b: b / s, c: c / s };
+};
+
+const smoothAR = (current: number, target: number, attackPerSec: number, releasePerSec: number, dt: number): number => {
+  const up = target > current;
+  const k = up ? attackPerSec : releasePerSec;
+  const t = 1 - Math.exp(-Math.max(0, k) * Math.max(0, dt));
+  return lerp(current, target, t);
+};
+
 export class StarSystem {
   // FAR
   private farPoints: THREE.Points;
@@ -90,6 +121,27 @@ export class StarSystem {
 
   // Stable per-star brightness variance
   private nearVariance: Float32Array;
+
+  // BAND (new)
+  private bandPoints: THREE.Points;
+  private bandGeom: THREE.BufferGeometry;
+  private bandMat: THREE.PointsMaterial;
+
+  private bandPositions: Float32Array;
+  private bandColors: Float32Array;
+
+  private bandRadii: Float32Array;
+  private bandVariance: Float32Array;
+  private bandPhase: Float32Array; // stable shimmer phase
+
+  // Per-star weights (cached)
+  private bandWLow: Float32Array;
+  private bandWMid: Float32Array;
+  private bandWHigh: Float32Array;
+
+  // BAND spatial info
+  private bandInnerRadius = 0;
+  private bandOuterRadius = 0;
 
   // State
   private readonly exclusionRadius: number;
@@ -135,6 +187,111 @@ export class StarSystem {
   private afterRippleWidthMul = 1.25;
   private afterRippleSpeedMul = 0.92;
 
+  // ==========================================================
+  // BAND — KNOBS (keep these together for Harmony + tuning)
+  // ==========================================================
+
+  // Palette (Harmony will override later)
+  private bandColorLow: RGB01 = hexToRgb01(0xffffed);  // cool low
+  private bandColorMid: RGB01 = hexToRgb01(0xffdd70);  // warm mid
+  private bandColorHigh: RGB01 = hexToRgb01(0xffdd70); // airy high
+
+  // Gating + curves (drives the smoothed levels BEFORE visibility thresholds)
+  private bandGateLow = 0.20;
+  private bandGateMid = 0.40;
+  private bandGateHigh = 0.60
+
+  // ----------------------------------------------------------
+  // Spatial mapping
+  // ----------------------------------------------------------
+
+  // Band mixing / overlap shaping (soft thirds)
+  // overlap01: 0 = sharper zones, 1 = very blended
+  private bandOverlap01 = 0.79;
+
+  // Optional per-band biases (future Harmony “mixing”)
+  private bandBiasLow = 1.0;
+  private bandBiasMid = 1.0;
+  private bandBiasHigh = 1.0;
+
+  // ----------------------------------------------------------
+  // Gain staging (how bright BAND can get once active)
+  // ----------------------------------------------------------
+
+  private bandGainMaster = 1.35;
+  private bandGainLow = 1.10;
+  private bandGainMid = 1.00;
+  private bandGainHigh = 1.25;
+
+  // ----------------------------------------------------------
+  // Visibility thresholds — THIS is what keeps BAND empty
+  // until the music is actually full.
+  // ----------------------------------------------------------
+
+  // Per-band “turn on” levels (0..1).
+  // Stars in that band do NOT appear at all until crossed.
+  private bandOnLow = 0.14;
+  private bandOnMid = 0.18;
+  private bandOnHigh = 0.24;
+
+  // Softness of the on-ramp (0.02 = crisp, 0.06 = smoother)
+  private bandOnFeather = 0.035;
+
+  // Global gate: BAND is completely off until overall energy passes this.
+  // This is the main “verse stays empty, chorus fills the STILL” control.
+  private bandEnergyOn = 0.05;
+  private bandEnergyFeather = 0.06;
+
+  // Final brightness floor.
+  // Even if math produces a tiny value, we write 0 below this.
+  private bandMinVisibleV = 0.06;
+
+  // ----------------------------------------------------------
+  // Response shaping (after bands are ON)
+  // ----------------------------------------------------------
+
+  // Curves (emotional response)
+  private bandCurveLow = 1.10;
+  private bandCurveMid = 1.00;
+  private bandCurveHigh = 0.85;
+
+  // Attack/Release per band (per-second)
+  private bandAttackLow = 2.2;
+  private bandReleaseLow = 1.1;
+
+  private bandAttackMid = 4.2;
+  private bandReleaseMid = 2.0;
+
+  private bandAttackHigh = 8.0;
+  private bandReleaseHigh = 4.1;
+
+  // ----------------------------------------------------------
+  // High shimmer (only applies once highs are truly active)
+  // ----------------------------------------------------------
+
+  private bandHighShimmerAmt = 0.10; // 0..1 (multiplies high level)
+  private bandHighShimmerHz = 0.75;  // cycles/sec (visual shimmer speed)
+
+  // ----------------------------------------------------------
+  // Dark snap (write zeros)
+  // ----------------------------------------------------------
+
+  private bandSnapEps = 0.0025;
+
+  // ----------------------------------------------------------
+  // BAND smoothed state (runtime)
+  // ----------------------------------------------------------
+
+  private bandLevelLow = 0.0;
+  private bandLevelMid = 0.0;
+  private bandLevelHigh = 0.0;
+
+  // Cached “did something change?”
+  private bandLastWriteKey = -1;
+
+  // Internal clock for shimmer (seconds)
+  private tSec = 0;
+
   constructor(scene: THREE.Scene, options: StarSystemOptions = {}) {
     this.exclusionRadius = Math.max(0, options.exclusionRadius ?? 0);
 
@@ -142,7 +299,7 @@ export class StarSystem {
     // FAR (sparse)
     // ----------------------------
     const farCount = Math.max(0, options.farCount ?? 79);
-    const farRadius = Math.max(1, options.farRadius ?? 10000);
+    const farRadius = Math.max(1, options.farRadius ?? 7777);
     const farSize = Math.max(0.1, options.farSize ?? 1.25);
     const farColor = options.farColor ?? 0xffdd70;
 
@@ -171,11 +328,11 @@ export class StarSystem {
     // ----------------------------
     // NEAR (dense pool)
     // ----------------------------
-    const nearCount = Math.max(0, options.nearCount ?? 1031);
-    const nearInnerRadius = Math.max(this.exclusionRadius, options.nearInnerRadius ?? 900);
-    const nearOuterRadius = Math.max(nearInnerRadius + 1, options.nearOuterRadius ?? 7777);
+    const nearCount = Math.max(0, options.nearCount ?? 777);
+    const nearInnerRadius = Math.max(this.exclusionRadius, options.nearInnerRadius ?? 5000);
+    const nearOuterRadius = Math.max(nearInnerRadius + 1, options.nearOuterRadius ?? 10000);
     const nearSize = Math.max(0.1, options.nearSize ?? 1.65);
-    const nearBaseColor = options.nearBaseColor ?? 0xffffed;
+    const nearBaseColor = options.nearBaseColor ?? 0xffdd70;
 
     this.nearMaxRadius = nearOuterRadius;
 
@@ -230,8 +387,80 @@ export class StarSystem {
     this.externalTarget01 = 0.0;
 
     this.applyNearColorsWithPulse(this.nearIntensity01);
-
     (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+
+    // ----------------------------
+    // BAND (new): true 3D shell driven by low/mid/high
+    // ----------------------------
+    const bandCount = Math.max(0, options.bandCount ?? 1337);
+    const bandInnerRadius = Math.max(this.exclusionRadius, options.bandInnerRadius ?? 500);
+    const bandOuterRadius = Math.max(bandInnerRadius + 1, options.bandOuterRadius ?? 2500);
+    const bandSize = Math.max(0.1, options.bandSize ?? 1.45);
+
+    this.bandInnerRadius = bandInnerRadius;
+    this.bandOuterRadius = bandOuterRadius;
+
+    this.bandGeom = new THREE.BufferGeometry();
+
+    this.bandPositions = this.makeShellPositions({
+      count: bandCount,
+      innerRadius: bandInnerRadius,
+      outerRadius: bandOuterRadius,
+    });
+    this.bandGeom.setAttribute("position", new THREE.BufferAttribute(this.bandPositions, 3));
+
+    this.bandColors = new Float32Array(bandCount * 3);
+    this.bandGeom.setAttribute("color", new THREE.BufferAttribute(this.bandColors, 3));
+
+    this.bandMat = new THREE.PointsMaterial({
+      color: 0xffffed, // multiplier
+      vertexColors: true,
+      size: bandSize,
+      sizeAttenuation: false,
+      transparent: true,
+      opacity: 1.0,
+      depthWrite: false,
+    });
+
+    this.bandPoints = new THREE.Points(this.bandGeom, this.bandMat);
+    this.bandPoints.name = "Stars_BAND";
+    scene.add(this.bandPoints);
+
+    // Per-star caches
+    this.bandRadii = new Float32Array(bandCount);
+    this.bandVariance = new Float32Array(bandCount);
+    this.bandPhase = new Float32Array(bandCount);
+
+    this.bandWLow = new Float32Array(bandCount);
+    this.bandWMid = new Float32Array(bandCount);
+    this.bandWHigh = new Float32Array(bandCount);
+
+    for (let i = 0; i < bandCount; i++) {
+      const x = this.bandPositions[i * 3 + 0];
+      const y = this.bandPositions[i * 3 + 1];
+      const z = this.bandPositions[i * 3 + 2];
+      const r = Math.sqrt(x * x + y * y + z * z);
+
+      this.bandRadii[i] = r;
+
+      // variance: BAND wants a little more “emotional” range
+      this.bandVariance[i] = 0.72 + Math.random() * 0.40;
+
+      // stable phase in radians [0..2pi)
+      this.bandPhase[i] = Math.random() * Math.PI * 2;
+
+      // cached band weights from radius (soft thirds with overlap)
+      const t = clamp01((r - bandInnerRadius) / (bandOuterRadius - bandInnerRadius));
+      const w = this.computeBandWeightsFromT(t);
+
+      this.bandWLow[i] = w.low;
+      this.bandWMid[i] = w.mid;
+      this.bandWHigh[i] = w.high;
+    }
+
+    // Start BAND at true dark
+    this.writeBandColors(0, 0, 0);
+    (this.bandGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
   }
 
   // ----------------------------------------------------------
@@ -280,6 +509,39 @@ export class StarSystem {
     if (typeof opts.nearColor === "number") this.nearMat.color.setHex(opts.nearColor);
   }
 
+  // ----------------------------
+  // BAND public API (Harmony-ready)
+  // ----------------------------
+
+  public setBandColors(colors: { low: number; mid: number; high: number }): void {
+    if (typeof colors.low === "number") this.bandColorLow = hexToRgb01(colors.low);
+    if (typeof colors.mid === "number") this.bandColorMid = hexToRgb01(colors.mid);
+    if (typeof colors.high === "number") this.bandColorHigh = hexToRgb01(colors.high);
+
+    // Force a rewrite next update
+    this.bandLastWriteKey = -1;
+  }
+
+  public setBandMixing(opts: Partial<{ overlap01: number; lowBias: number; midBias: number; highBias: number }>): void {
+    if (typeof opts.overlap01 === "number") this.bandOverlap01 = clamp01(opts.overlap01);
+    if (typeof opts.lowBias === "number") this.bandBiasLow = Math.max(0, opts.lowBias);
+    if (typeof opts.midBias === "number") this.bandBiasMid = Math.max(0, opts.midBias);
+    if (typeof opts.highBias === "number") this.bandBiasHigh = Math.max(0, opts.highBias);
+
+    // Recompute cached weights (rare operation)
+    this.recomputeBandWeights();
+    this.bandLastWriteKey = -1;
+  }
+
+  public setBandGains(opts: Partial<{ master: number; low: number; mid: number; high: number }>): void {
+    if (typeof opts.master === "number") this.bandGainMaster = Math.max(0, opts.master);
+    if (typeof opts.low === "number") this.bandGainLow = Math.max(0, opts.low);
+    if (typeof opts.mid === "number") this.bandGainMid = Math.max(0, opts.mid);
+    if (typeof opts.high === "number") this.bandGainHigh = Math.max(0, opts.high);
+
+    this.bandLastWriteKey = -1;
+  }
+
   public triggerRadialPulse(
     opts?: Partial<{
       speed: number;
@@ -325,6 +587,7 @@ export class StarSystem {
   // ----------------------------------------------------------
   public update(dt: number): void {
     const d = Math.max(0, dt);
+    this.tSec += d;
 
     // pulses
     if (this.pulses.length > 0) {
@@ -348,7 +611,7 @@ export class StarSystem {
     let audioTarget = 0.0;
     if (this.audioDriven && this.isAudioPlaying) {
       const e = clamp01(this.lastAudio.energy);
-      const gate = 0.31;
+      const gate = 0.46;
       const raw = smoothstep(gate, 0.79, e);
       const curved = Math.pow(raw, 1.0);
       audioTarget = clamp01(curved);
@@ -361,59 +624,60 @@ export class StarSystem {
 
     // ease intensity
     const t = 1 - Math.exp(-this.nearIntensityEase * d);
-    const prev = this.nearIntensity01;
+    const prevNear = this.nearIntensity01;
     this.nearIntensity01 = lerp(this.nearIntensity01, target, t);
 
     // ----------------------------------------------------------
-    // IMPORTANT: ensure we "write to black"
+    // IMPORTANT: ensure we "write to black" for NEAR
     // ----------------------------------------------------------
-    const shouldBeDark = !this.isAudioPlaying && target <= 0.00001 && this.pulses.length === 0;
+    const nearShouldBeDark = !this.isAudioPlaying && target <= 0.00001 && this.pulses.length === 0;
 
-    // If we should be dark, keep updating while fading down,
-    // and once we're basically black, hard-snap and write zeros.
-    const SNAP_EPS = 0.003; // tune: 0.001..0.01
-    if (shouldBeDark && this.nearIntensity01 < SNAP_EPS) {
+    const NEAR_SNAP_EPS = 0.003; // tune: 0.001..0.01
+    if (nearShouldBeDark && this.nearIntensity01 < NEAR_SNAP_EPS) {
       this.nearIntensity01 = 0.0;
 
       // Force a final write that clears the GPU colors.
       this.applyNearColorsWithPulse(0.0);
       (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
-      return;
+    } else {
+      const nearFadingToDark = nearShouldBeDark && this.nearIntensity01 > 0.0;
+
+      if (
+        Math.abs(this.nearIntensity01 - prevNear) > 0.0 ||
+        this.pulses.length > 0 ||
+        nearFadingToDark
+      ) {
+        this.applyNearColorsWithPulse(this.nearIntensity01);
+        (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+      }
     }
 
-    // GPU update if intensity changed OR pulses animate OR we are fading toward darkness
-    const fadingToDark = shouldBeDark && this.nearIntensity01 > 0.0;
-
-    if (
-      Math.abs(this.nearIntensity01 - prev) > 0.00 ||
-      this.pulses.length > 0 ||
-      fadingToDark
-    ) {
-      this.applyNearColorsWithPulse(this.nearIntensity01);
-      (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
-    }
+    // ----------------------------------------------------------
+    // BAND update (low/mid/high, attack/release, shimmer)
+    // ----------------------------------------------------------
+    this.updateBand(d);
   }
 
   public dispose(scene: THREE.Scene): void {
     scene.remove(this.farPoints);
     scene.remove(this.nearPoints);
+    scene.remove(this.bandPoints);
 
     this.farGeom.dispose();
     this.farMat.dispose();
 
     this.nearGeom.dispose();
     this.nearMat.dispose();
+
+    this.bandGeom.dispose();
+    this.bandMat.dispose();
   }
 
   // ----------------------------------------------------------
   // Internals
   // ----------------------------------------------------------
 
-  private makeShellPositions(params: {
-    count: number;
-    innerRadius: number;
-    outerRadius: number;
-  }): Float32Array {
+  private makeShellPositions(params: { count: number; innerRadius: number; outerRadius: number }): Float32Array {
     const { count, innerRadius, outerRadius } = params;
 
     if (outerRadius <= 0) throw new Error(`[StarSystem] outerRadius must be > 0. Got ${outerRadius}.`);
@@ -522,6 +786,178 @@ export class StarSystem {
       this.nearColors[idx + 0] = rr;
       this.nearColors[idx + 1] = gg;
       this.nearColors[idx + 2] = bb;
+    }
+  }
+
+  // ==========================================================
+  // BAND internals
+  // ==========================================================
+
+  private recomputeBandWeights(): void {
+    const count = this.bandRadii.length;
+    const inner = this.bandInnerRadius;
+    const outer = this.bandOuterRadius;
+    const span = Math.max(1e-6, outer - inner);
+
+    for (let i = 0; i < count; i++) {
+      const t = clamp01((this.bandRadii[i] - inner) / span);
+      const w = this.computeBandWeightsFromT(t);
+      this.bandWLow[i] = w.low;
+      this.bandWMid[i] = w.mid;
+      this.bandWHigh[i] = w.high;
+    }
+  }
+
+  /**
+   * Map normalized radius t (0..1) to low/mid/high weights with soft overlap.
+   * Inner tends LOW, middle tends MID, outer tends HIGH.
+   */
+  private computeBandWeightsFromT(t: number): { low: number; mid: number; high: number } {
+    // overlap shaping
+    // o in [0.15..0.95] to avoid degeneracy
+    const o = lerp(0.18, 0.92, clamp01(this.bandOverlap01));
+
+    // LOW: strong near 0, fades by mid
+    const low = 1 - smoothstep(0.20 * o, 0.70 * o, t);
+
+    // HIGH: grows toward 1, starts around mid-ish
+    const high = smoothstep(1 - 0.70 * o, 1 - 0.20 * o, t);
+
+    // MID: bell around 0.5 with width controlled by overlap
+    const width = lerp(0.22, 0.48, o);
+    const midRaw = 1 - Math.abs(t - 0.5) / Math.max(1e-6, width);
+    const mid = smoothstep(0.0, 1.0, clamp01(midRaw));
+
+    // Apply biases (future “mixing”)
+    const a = Math.max(0, low * this.bandBiasLow);
+    const b = Math.max(0, mid * this.bandBiasMid);
+    const c = Math.max(0, high * this.bandBiasHigh);
+
+    const n = normalize3(a, b, c);
+    return { low: n.a, mid: n.b, high: n.c };
+  }
+
+  private bandGateCurve(v01: number, gate: number, curvePow: number): number {
+    const g = clamp01(gate);
+    const raw = smoothstep(g, 1.0, clamp01(v01));
+    return clamp01(Math.pow(raw, Math.max(0.01, curvePow)));
+  }
+
+  private updateBand(dt: number): void {
+    const playing = this.audioDriven && this.isAudioPlaying;
+
+    // If no audio: target is zero, and we also handle hard snap to black.
+    const lowTarget = playing ? this.bandGateCurve(this.lastAudio.low, this.bandGateLow, this.bandCurveLow) : 0.0;
+    const midTarget = playing ? this.bandGateCurve(this.lastAudio.mid, this.bandGateMid, this.bandCurveMid) : 0.0;
+    const highTarget = playing ? this.bandGateCurve(this.lastAudio.high, this.bandGateHigh, this.bandCurveHigh) : 0.0;
+
+    const prevL = this.bandLevelLow;
+    const prevM = this.bandLevelMid;
+    const prevH = this.bandLevelHigh;
+
+    this.bandLevelLow = smoothAR(this.bandLevelLow, lowTarget, this.bandAttackLow, this.bandReleaseLow, dt);
+    this.bandLevelMid = smoothAR(this.bandLevelMid, midTarget, this.bandAttackMid, this.bandReleaseMid, dt);
+    this.bandLevelHigh = smoothAR(this.bandLevelHigh, highTarget, this.bandAttackHigh, this.bandReleaseHigh, dt);
+
+    // True darkness enforcement (write zeros and stop)
+    const shouldBeDark =
+      !this.isAudioPlaying &&
+      this.bandLevelLow <= this.bandSnapEps &&
+      this.bandLevelMid <= this.bandSnapEps &&
+      this.bandLevelHigh <= this.bandSnapEps;
+
+    if (shouldBeDark) {
+      // Snap all to 0 and write once
+      if (this.bandLevelLow !== 0 || this.bandLevelMid !== 0 || this.bandLevelHigh !== 0) {
+        this.bandLevelLow = 0;
+        this.bandLevelMid = 0;
+        this.bandLevelHigh = 0;
+      }
+
+      // Only write if not already black (key caches)
+      const key = 0;
+      if (this.bandLastWriteKey !== key) {
+        this.writeBandColors(0, 0, 0);
+        (this.bandGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+        this.bandLastWriteKey = key;
+      }
+
+      return;
+    }
+
+    // Decide whether to write this frame:
+    // - any level change
+    // - or shimmer wants updates while highs are present
+    const levelChanged =
+      Math.abs(this.bandLevelLow - prevL) > 0.0 ||
+      Math.abs(this.bandLevelMid - prevM) > 0.0 ||
+      Math.abs(this.bandLevelHigh - prevH) > 0.0;
+
+    const shimmerActive = this.bandLevelHigh > 0.02;
+
+    // A small quantized “key” to reduce redundant writes when nearly stable
+    const q = (x: number): number => Math.floor(clamp01(x) * 1000);
+    const key =
+      (q(this.bandLevelLow) << 20) ^
+      (q(this.bandLevelMid) << 10) ^
+      q(this.bandLevelHigh);
+
+    if (!levelChanged && !shimmerActive && this.bandLastWriteKey === key) {
+      return;
+    }
+
+    this.writeBandColors(this.bandLevelLow, this.bandLevelMid, this.bandLevelHigh);
+    (this.bandGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+    this.bandLastWriteKey = key;
+  }
+
+  private writeBandColors(levelLow: number, levelMid: number, levelHigh: number): void {
+    const count = this.bandRadii.length;
+
+    const l = clamp01(levelLow) * this.bandGainLow;
+    const m = clamp01(levelMid) * this.bandGainMid;
+    const h = clamp01(levelHigh) * this.bandGainHigh;
+
+    const master = this.bandGainMaster;
+
+    const shimmerAmp = this.bandHighShimmerAmt * clamp01(levelHigh);
+    const shimmerW = Math.PI * 2 * this.bandHighShimmerHz; // rad/sec
+
+    const cL = this.bandColorLow;
+    const cM = this.bandColorMid;
+    const cH = this.bandColorHigh;
+
+    for (let i = 0; i < count; i++) {
+      const idx = i * 3;
+
+      const wL = this.bandWLow[i];
+      const wM = this.bandWMid[i];
+      const wH = this.bandWHigh[i];
+
+      // Weighted band energy at this star
+      let e = l * wL + m * wM + h * wH;
+
+      // Variance makes the field feel alive, not like a uniform LED panel
+      e *= this.bandVariance[i];
+
+      // High shimmer (subtle): only meaningful for stars with some high weight
+      if (shimmerAmp > 0.0001 && wH > 0.02) {
+        const s = Math.sin(this.tSec * shimmerW + this.bandPhase[i]);
+        const shimmer = 1 + s * shimmerAmp * wH;
+        e *= shimmer;
+      }
+
+      // Master gain, keep clamped to avoid absurd bloom spikes
+      const v = clamp(e * master, 0, 2.25);
+
+      // Tint by blending the 3 palette colors via weights
+      const rr = v * (cL.r * wL + cM.r * wM + cH.r * wH);
+      const gg = v * (cL.g * wL + cM.g * wM + cH.g * wH);
+      const bb = v * (cL.b * wL + cM.b * wM + cH.b * wH);
+
+      this.bandColors[idx + 0] = rr;
+      this.bandColors[idx + 1] = gg;
+      this.bandColors[idx + 2] = bb;
     }
   }
 }

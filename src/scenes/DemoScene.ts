@@ -198,16 +198,16 @@ export class DemoScene implements SceneController {
 
   private buildStars(): void {
     this.starSystem = new StarSystem(this.scene, {
-      exclusionRadius: 1000,
+      exclusionRadius: 200,
 
-      farCount: 85,
-      farRadius: 10000,
+      farCount: 31,
+      farRadius: 8000,
       farSize: 1.5,
 
-      nearCount: 1031,
-      nearInnerRadius: 1000,
-      nearOuterRadius: 9000,
-      nearSize: 1.5,
+      nearCount: 0,
+      nearInnerRadius: 5000,
+      nearOuterRadius: 8000,
+      nearSize: 1.0,
 
       // IMPORTANT: start at 0 so no NEAR stars show until audio or ritual
       nearReveal01: 0.0,
@@ -251,7 +251,7 @@ export class DemoScene implements SceneController {
     const y = 0.02;
 
     const universeRadius = new Date().getFullYear();
-    const systemRadius = 8000;
+    const systemRadius = 10000;
     const spokeRadius = systemRadius;
 
     const regions = this.regionSystem.getRegions();
@@ -316,10 +316,10 @@ export class DemoScene implements SceneController {
       this.regionDebugDisposables.push(ringGeom, ringMat);
     };
 
-    addRing(50, "DevRing_50", 0.14);
-    addRing(100, "DevRing_100", 0.14);
-    addRing(250, "DevRing_250", 0.14);
-    addRing(500, "DevRing_500", 0.14);
+    addRing(100, "DevRing_50", 0.14);
+    addRing(200, "DevRing_100", 0.14);
+    addRing(0, "DevRing_250", 0.14);
+    addRing(0, "DevRing_500", 0.14);
 
     addRing(systemRadius, `SystemRadius_${systemRadius}`, 0.25);
     addRing(universeRadius, `UniverseRadius_${universeRadius}`, 0.18);
