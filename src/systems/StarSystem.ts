@@ -2,39 +2,40 @@
 // THE STILL — P03 (StarSystem v0)
 // StarSystem.ts
 // ------------------------------------------------------------
-// Goals (v0):
-//  - FAR stars: sparse, mostly static, non-audio (or subtle), customizable later
-//  - NEAR stars: dense pool, reveal tiers (1/3 → 2/3 → 3/3), audio + ritual driven
-//  - Persistent occlusion zone around Core (no stars inside)
+// NOW (simplified + “liquid”):
+//  - FAR stars: static-ish, subtle
+//  - NEAR stars: ALWAYS exist as a pool, but brightness is modulated per-star
+//    by a smooth audio “intensity” (0..1). No more “reveal by count” popping.
+//  - If audio is NOT playing: NEAR goes fully dark (0 intensity)
+//  - Ritual can override brightness even when audio is NOT playing.
+//  - Shockwave pulse can be "sphere" or "planeXZ" and affects ALL near stars.
 //
-// Design:
-//  - Two THREE.Points clouds (FAR + NEAR)
-//  - NEAR uses per-vertex alpha (via vertexColors) so we can "reveal" a fraction
-//    without reallocating geometry.
-//  - v0 exposes simple control methods. Harmony will later orchestrate them.
+// Key idea:
+//  - intensity = max(audioTarget, externalTarget)
+//  - externalTarget auto-decays unless it’s being actively driven (ritual progress)
 // ============================================================
 
 import * as THREE from "three";
 
 type StarSystemOptions = {
   // Overall
-  exclusionRadius?: number; // inner "no-star" radius around the core
+  exclusionRadius?: number;
 
-  // FAR stars (sparse)
+  // FAR stars
   farCount?: number;
-  farRadius?: number; // outer radius of far distribution
+  farRadius?: number;
   farSize?: number;
   farColor?: number;
 
-  // NEAR stars (dense pool, revealed dynamically)
+  // NEAR stars
   nearCount?: number;
   nearInnerRadius?: number;
   nearOuterRadius?: number;
   nearSize?: number;
   nearBaseColor?: number;
 
-  // Reveal behavior
-  nearReveal01?: number; // initial reveal fraction 0..1 (default 0.33)
+  // Starting intensity (0..1). Recommend 0.0 for true darkness until audio.
+  nearReveal01?: number;
 };
 
 type AudioFrame = {
@@ -44,14 +45,29 @@ type AudioFrame = {
   high?: number;
 };
 
+type PulseMode = "sphere" | "planeXZ";
+
+type RadialPulse = {
+  t: number; // elapsed seconds since start (includes delay time)
+  delay: number; // seconds before pulse becomes active
+  speed: number; // units/sec
+  width: number; // base band thickness in world units
+  strength: number; // 0..1
+};
+
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+const clamp = (v: number, a: number, b: number): number => Math.min(b, Math.max(a, v));
+const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 
 const safe01 = (v: unknown, fallback = 0): number => {
   const n = typeof v === "number" && Number.isFinite(v) ? v : fallback;
   return clamp01(n);
 };
 
-const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+const smoothstep = (edge0: number, edge1: number, x: number): number => {
+  const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+};
 
 export class StarSystem {
   // FAR
@@ -68,19 +84,56 @@ export class StarSystem {
   private nearPositions: Float32Array;
   private nearColors: Float32Array;
 
+  // Cached per-star radii for wave math
+  private nearRadiiSphere: Float32Array; // full 3D radius
+  private nearRadiiXZ: Float32Array; // XZ-plane radius
+
+  // Stable per-star brightness variance
+  private nearVariance: Float32Array;
+
   // State
   private readonly exclusionRadius: number;
 
-  private nearReveal01 = 0.33; // baseline reveal fraction
-  private nearTargetReveal01 = 0.33; // driven by ritual/audio mapping
-  private nearRevealEase = 6.0; // smoothing speed
+  // “Breathing field” intensity (0..1)
+  private nearIntensity01 = 0.0;
+  private nearTargetIntensity01 = 0.0;
+  private nearIntensityEase = 10.31; // slightly “liquid” by default
 
-  // Audio cache (optional mapping)
+  // External override lane (ritual), separate from audio
+  private externalTarget01 = 0.0;
+  private externalTouchedThisFrame = false;
+  private externalDecay = 1.79; // per-second decay toward 0 when not touched
+
+  // Audio cache
+  private isAudioPlaying = false;
   private lastAudio: Required<AudioFrame> = { energy: 0, low: 0, mid: 0, high: 0 };
   private audioDriven = true;
 
-  // A seeded ordering for reveal so stars "appear" consistently
-  private nearOrder: Uint32Array;
+  // Wave family
+  private pulses: RadialPulse[] = [];
+  private maxPulses = 6;
+  private nearMaxRadius = 0;
+
+  // Pulse mode
+  private pulseMode: PulseMode = "sphere";
+
+  // Pulse visibility tuning
+  private pulseDimBase = 0.55;
+  private pulseColorTint = { r: 0.10, g: 0.95, b: 1.0 };
+  private pulseMaxBoost = 2.2;
+
+  // Cosmic shaping knobs
+  private pulseFrontWidthMul = 0.55;
+  private pulseBackWidthMul = 1.25;
+  private pulseFrontRidgeMul = 0.38;
+  private pulseFrontRidgeWidthMul = 0.18;
+
+  // After-ripple
+  private afterRippleEnabled = true;
+  private afterRippleDelaySec = 1.0;
+  private afterRippleStrengthMul = 0.35;
+  private afterRippleWidthMul = 1.25;
+  private afterRippleSpeedMul = 0.92;
 
   constructor(scene: THREE.Scene, options: StarSystemOptions = {}) {
     this.exclusionRadius = Math.max(0, options.exclusionRadius ?? 0);
@@ -88,10 +141,10 @@ export class StarSystem {
     // ----------------------------
     // FAR (sparse)
     // ----------------------------
-    const farCount = Math.max(0, options.farCount ?? 250);
-    const farRadius = Math.max(1, options.farRadius ?? 6500);
+    const farCount = Math.max(0, options.farCount ?? 79);
+    const farRadius = Math.max(1, options.farRadius ?? 10000);
     const farSize = Math.max(0.1, options.farSize ?? 1.25);
-    const farColor = options.farColor ?? 0x9fb8ff;
+    const farColor = options.farColor ?? 0xffdd70;
 
     this.farGeom = new THREE.BufferGeometry();
     const farPos = this.makeShellPositions({
@@ -107,7 +160,7 @@ export class StarSystem {
       size: farSize,
       sizeAttenuation: false,
       transparent: true,
-      opacity: 0.75,
+      opacity: 0.79,
       depthWrite: false,
     });
 
@@ -118,11 +171,13 @@ export class StarSystem {
     // ----------------------------
     // NEAR (dense pool)
     // ----------------------------
-    const nearCount = Math.max(0, options.nearCount ?? 2400);
+    const nearCount = Math.max(0, options.nearCount ?? 1031);
     const nearInnerRadius = Math.max(this.exclusionRadius, options.nearInnerRadius ?? 900);
-    const nearOuterRadius = Math.max(nearInnerRadius + 1, options.nearOuterRadius ?? 5000);
+    const nearOuterRadius = Math.max(nearInnerRadius + 1, options.nearOuterRadius ?? 7777);
     const nearSize = Math.max(0.1, options.nearSize ?? 1.65);
-    const nearBaseColor = options.nearBaseColor ?? 0xffdd70;
+    const nearBaseColor = options.nearBaseColor ?? 0xffffed;
+
+    this.nearMaxRadius = nearOuterRadius;
 
     this.nearGeom = new THREE.BufferGeometry();
 
@@ -132,20 +187,14 @@ export class StarSystem {
       outerRadius: nearOuterRadius,
     });
 
-    this.nearGeom.setAttribute(
-      "position",
-      new THREE.BufferAttribute(this.nearPositions, 3),
-    );
+    this.nearGeom.setAttribute("position", new THREE.BufferAttribute(this.nearPositions, 3));
 
-    // Vertex colors for reveal control (RGB + alpha encoded in material.opacity via per-vertex brightness)
-    // We do: color = baseColor * brightness, where brightness is 0..1.
-    // PointsMaterial supports vertexColors = true for RGB.
-    // We'll encode reveal into RGB brightness (simple + compatible).
+    // Vertex colors (we control brightness per-star here)
     this.nearColors = new Float32Array(nearCount * 3);
     this.nearGeom.setAttribute("color", new THREE.BufferAttribute(this.nearColors, 3));
 
     this.nearMat = new THREE.PointsMaterial({
-      color: nearBaseColor, // acts as a multiplier when vertexColors is true
+      color: nearBaseColor, // multiplier
       vertexColors: true,
       size: nearSize,
       sizeAttenuation: false,
@@ -158,28 +207,41 @@ export class StarSystem {
     this.nearPoints.name = "Stars_NEAR";
     scene.add(this.nearPoints);
 
-    // Reveal ordering (stable)
-    this.nearOrder = this.makeStableRandomOrder(nearCount);
+    // Precompute radii + variance
+    this.nearRadiiSphere = new Float32Array(nearCount);
+    this.nearRadiiXZ = new Float32Array(nearCount);
+    this.nearVariance = new Float32Array(nearCount);
 
-    // Initial reveal
-    this.nearReveal01 = clamp01(options.nearReveal01 ?? 0.33);
-    this.nearTargetReveal01 = this.nearReveal01;
-    this.applyNearRevealToColors(this.nearReveal01, 0.9);
+    for (let i = 0; i < nearCount; i++) {
+      const x = this.nearPositions[i * 3 + 0];
+      const y = this.nearPositions[i * 3 + 1];
+      const z = this.nearPositions[i * 3 + 2];
 
-    // Ensure GPU sees initial colors
+      this.nearRadiiSphere[i] = Math.sqrt(x * x + y * y + z * z);
+      this.nearRadiiXZ[i] = Math.sqrt(x * x + z * z);
+
+      this.nearVariance[i] = 0.82 + Math.random() * 0.18;
+    }
+
+    // Starting intensity (recommend 0)
+    const start = clamp01(options.nearReveal01 ?? 0.0);
+    this.nearIntensity01 = start;
+    this.nearTargetIntensity01 = start;
+    this.externalTarget01 = 0.0;
+
+    this.applyNearColorsWithPulse(this.nearIntensity01);
+
     (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
   }
 
   // ----------------------------------------------------------
-  // Public controls (Harmony will orchestrate later)
+  // Public controls
   // ----------------------------------------------------------
 
-  /** Set whether NEAR reveal should be driven by audio energy in update(). */
   public setAudioDriven(enabled: boolean): void {
     this.audioDriven = Boolean(enabled);
   }
 
-  /** Feed latest audio frame (optional). */
   public setAudioFrame(frame: AudioFrame): void {
     this.lastAudio = {
       energy: safe01(frame.energy, this.lastAudio.energy),
@@ -189,84 +251,145 @@ export class StarSystem {
     };
   }
 
+  public setAudioPlaying(isPlaying: boolean): void {
+    this.isAudioPlaying = Boolean(isPlaying);
+  }
+
+  public setPulseMode(mode: PulseMode): void {
+    this.pulseMode = mode;
+  }
+
   /**
-   * Directly set NEAR reveal target (0..1).
-   * Use this for Ritual progress, Gong bursts, etc.
+   * External brightness override (ritual progress, etc).
+   * IMPORTANT: This is the “ritual lane”. It will auto-decay unless continually driven.
    */
   public setNearRevealTarget01(v: number): void {
-    this.nearTargetReveal01 = clamp01(v);
+    this.externalTarget01 = clamp01(v);
+    this.externalTouchedThisFrame = true;
   }
 
-  /** Set a baseline reveal value (e.g. 0.33). */
+  /** Baseline “rest” intensity. Recommend keeping this at 0. */
   public setNearBaselineReveal01(v: number): void {
-    this.nearReveal01 = clamp01(v);
-    this.nearTargetReveal01 = this.nearReveal01;
+    const vv = clamp01(v);
+    this.nearIntensity01 = vv;
+    this.nearTargetIntensity01 = vv;
   }
 
-  /**
-   * Set base colors for FAR and NEAR (future Harmony hook).
-   * Note: NEAR uses vertex colors multiplied by this base color.
-   */
   public setColors(opts: { farColor?: number; nearColor?: number }): void {
-    if (typeof opts.farColor === "number") {
-      this.farMat.color.setHex(opts.farColor);
-    }
-    if (typeof opts.nearColor === "number") {
-      this.nearMat.color.setHex(opts.nearColor);
-    }
+    if (typeof opts.farColor === "number") this.farMat.color.setHex(opts.farColor);
+    if (typeof opts.nearColor === "number") this.nearMat.color.setHex(opts.nearColor);
   }
 
-  /**
-   * Simple "pulse" hook for gong-like events:
-   * temporarily push NEAR reveal to a higher target.
-   */
-  public pulseNearReveal(amount01: number): void {
-    const boosted = clamp01(this.nearTargetReveal01 + clamp01(amount01));
-    this.nearTargetReveal01 = boosted;
+  public triggerRadialPulse(
+    opts?: Partial<{
+      speed: number;
+      width: number;
+      strength: number;
+      delaySec: number;
+
+      afterRipple?: boolean;
+      afterDelaySec?: number;
+      afterStrengthMul?: number;
+      afterWidthMul?: number;
+      afterSpeedMul?: number;
+    }>,
+  ): void {
+    const speed = Math.max(1, opts?.speed ?? 2200);
+    const width = Math.max(1, opts?.width ?? 260);
+    const strength = clamp01(opts?.strength ?? 0.8);
+    const delay = Math.max(0, opts?.delaySec ?? 0);
+
+    this.pulses.push({ t: 0, delay, speed, width, strength });
+    if (this.pulses.length > this.maxPulses) this.pulses.shift();
+
+    const afterOn = opts?.afterRipple ?? this.afterRippleEnabled;
+    if (afterOn) {
+      const afterDelay = Math.max(0, opts?.afterDelaySec ?? this.afterRippleDelaySec);
+      const sMul = clamp01(opts?.afterStrengthMul ?? this.afterRippleStrengthMul);
+      const wMul = Math.max(0.1, opts?.afterWidthMul ?? this.afterRippleWidthMul);
+      const vMul = Math.max(0.1, opts?.afterSpeedMul ?? this.afterRippleSpeedMul);
+
+      this.pulses.push({
+        t: 0,
+        delay: delay + afterDelay,
+        speed: speed * vMul,
+        width: width * wMul,
+        strength: clamp01(strength * sMul),
+      });
+      if (this.pulses.length > this.maxPulses) this.pulses.shift();
+    }
   }
 
   // ----------------------------------------------------------
   // Update
   // ----------------------------------------------------------
-
   public update(dt: number): void {
-    // NEAR reveal target from audio (v0 mapping)
-    if (this.audioDriven) {
-      // Tier mapping: energy controls reveal fraction (concept: 1/3, 2/3, 3/3)
-      // We map energy to reveal in a soft way:
-      //  - energy 0.00 -> 0.33
-      //  - energy 0.50 -> 0.66
-      //  - energy 1.00 -> 1.00
-      const e = this.lastAudio.energy;
-      const target = e < 0.5 ? lerp(0.33, 0.66, e / 0.5) : lerp(0.66, 1.0, (e - 0.5) / 0.5);
+    const d = Math.max(0, dt);
 
-      // Audio target should not override a stronger external target.
-      // So we take the max: ritual can push higher than audio.
-      this.nearTargetReveal01 = Math.max(this.nearTargetReveal01, clamp01(target));
+    // pulses
+    if (this.pulses.length > 0) {
+      for (const p of this.pulses) p.t += d;
+
+      this.pulses = this.pulses.filter((p) => {
+        const age = p.t - p.delay;
+        if (age <= 0) return true;
+        return age * p.speed < this.nearMaxRadius + p.width;
+      });
     }
 
-    // Ease toward target
-    const t = 1 - Math.exp(-this.nearRevealEase * Math.max(0, dt));
-    const prev = this.nearReveal01;
-    this.nearReveal01 = lerp(this.nearReveal01, this.nearTargetReveal01, t);
+    // auto-decay external lane unless driven this frame
+    if (!this.externalTouchedThisFrame) {
+      const k = 1 - Math.exp(-this.externalDecay * d);
+      this.externalTarget01 = lerp(this.externalTarget01, 0.0, k);
+    }
+    this.externalTouchedThisFrame = false;
 
-    // After approaching target, gently relax target back toward baseline if it was boosted
-    // (prevents permanent "stuck at full" after pulses unless something keeps driving it).
-    // This will later be replaced by Harmony + Ritual rules.
-    if (this.nearTargetReveal01 > this.nearReveal01) {
-      // keep target for now
+    // audio target (continuous breathing)
+    let audioTarget = 0.0;
+    if (this.audioDriven && this.isAudioPlaying) {
+      const e = clamp01(this.lastAudio.energy);
+      const gate = 0.31;
+      const raw = smoothstep(gate, 0.79, e);
+      const curved = Math.pow(raw, 1.0);
+      audioTarget = clamp01(curved);
     } else {
-      // relax target slowly toward baseline tier derived from audio (or 0.33 if audio not driving)
-      const baseline = this.audioDriven ? this.nearTargetReveal01 : 0.33;
-      this.nearTargetReveal01 = lerp(this.nearTargetReveal01, baseline, 0.02);
+      // no audio playing => true darkness unless ritual lane is driving it
+      audioTarget = 0.0;
     }
 
-    // If change is tiny, avoid updating GPU every frame
-    if (Math.abs(this.nearReveal01 - prev) > 0.002) {
-      // Brightness ties to reveal (subtle). At higher reveal, stars also burn hotter.
-      const brightness = lerp(0.65, 1.0, this.nearReveal01);
-      this.applyNearRevealToColors(this.nearReveal01, brightness);
+    const target = Math.max(audioTarget, this.externalTarget01);
 
+    // ease intensity
+    const t = 1 - Math.exp(-this.nearIntensityEase * d);
+    const prev = this.nearIntensity01;
+    this.nearIntensity01 = lerp(this.nearIntensity01, target, t);
+
+    // ----------------------------------------------------------
+    // IMPORTANT: ensure we "write to black"
+    // ----------------------------------------------------------
+    const shouldBeDark = !this.isAudioPlaying && target <= 0.00001 && this.pulses.length === 0;
+
+    // If we should be dark, keep updating while fading down,
+    // and once we're basically black, hard-snap and write zeros.
+    const SNAP_EPS = 0.003; // tune: 0.001..0.01
+    if (shouldBeDark && this.nearIntensity01 < SNAP_EPS) {
+      this.nearIntensity01 = 0.0;
+
+      // Force a final write that clears the GPU colors.
+      this.applyNearColorsWithPulse(0.0);
+      (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+      return;
+    }
+
+    // GPU update if intensity changed OR pulses animate OR we are fading toward darkness
+    const fadingToDark = shouldBeDark && this.nearIntensity01 > 0.0;
+
+    if (
+      Math.abs(this.nearIntensity01 - prev) > 0.00 ||
+      this.pulses.length > 0 ||
+      fadingToDark
+    ) {
+      this.applyNearColorsWithPulse(this.nearIntensity01);
       (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
     }
   }
@@ -296,14 +419,11 @@ export class StarSystem {
     if (outerRadius <= 0) throw new Error(`[StarSystem] outerRadius must be > 0. Got ${outerRadius}.`);
     if (innerRadius < 0) throw new Error(`[StarSystem] innerRadius must be >= 0. Got ${innerRadius}.`);
     if (innerRadius >= outerRadius) {
-      throw new Error(
-        `[StarSystem] innerRadius (${innerRadius}) must be < outerRadius (${outerRadius}).`,
-      );
+      throw new Error(`[StarSystem] innerRadius (${innerRadius}) must be < outerRadius (${outerRadius}).`);
     }
 
     const positions = new Float32Array(count * 3);
 
-    // Uniform distribution in a spherical shell (volume-uniform)
     const r0c = innerRadius * innerRadius * innerRadius;
     const Rc = outerRadius * outerRadius * outerRadius;
 
@@ -312,8 +432,8 @@ export class StarSystem {
       const u = Math.random() * 2 - 1;
       const phi = Math.acos(u);
 
-      const t = Math.random();
-      const r = Math.cbrt(r0c + t * (Rc - r0c));
+      const tt = Math.random();
+      const r = Math.cbrt(r0c + tt * (Rc - r0c));
 
       positions[i * 3 + 0] = r * Math.sin(phi) * Math.cos(theta);
       positions[i * 3 + 1] = r * Math.cos(phi);
@@ -323,46 +443,85 @@ export class StarSystem {
     return positions;
   }
 
-  private makeStableRandomOrder(count: number): Uint32Array {
-    // Stable-ish shuffle: deterministic order is not required yet, just not "index order".
-    // We'll build a simple Fisher-Yates over indices.
-    const arr = new Uint32Array(count);
-    for (let i = 0; i < count; i++) arr[i] = i;
-
-    for (let i = count - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const tmp = arr[i];
-      arr[i] = arr[j];
-      arr[j] = tmp;
-    }
-
-    return arr;
+  private getRadiusForPulse(i: number): number {
+    return this.pulseMode === "planeXZ" ? this.nearRadiiXZ[i] : this.nearRadiiSphere[i];
   }
 
-  private applyNearRevealToColors(reveal01: number, brightness: number): void {
-    const count = this.nearOrder.length;
-    const visibleCount = Math.floor(count * clamp01(reveal01));
+  private computePulseBoostForRadius(r: number): number {
+    if (this.pulses.length === 0) return 0;
 
-    // Set all to "off" first (cheap: single pass)
-    // Then enable first N by order.
-    // Brightness is encoded into RGB, material base color multiplies it.
-    for (let i = 0; i < count; i++) {
-      const idx = i * 3;
-      this.nearColors[idx + 0] = 0;
-      this.nearColors[idx + 1] = 0;
-      this.nearColors[idx + 2] = 0;
+    let boost = 0;
+
+    for (const p of this.pulses) {
+      const age = p.t - p.delay;
+      if (age <= 0) continue;
+
+      const front = age * p.speed;
+
+      // Signed distance: <0 = behind the front (wake), >0 = ahead
+      const signed = r - front;
+
+      const widthFront = Math.max(1, p.width * this.pulseFrontWidthMul);
+      const widthBack = Math.max(1, p.width * this.pulseBackWidthMul);
+      const w = signed >= 0 ? widthFront : widthBack;
+
+      const d = Math.abs(signed);
+      if (d > w) continue;
+
+      const x = 1 - d / w;
+      const band = smoothstep(0, 1, x);
+
+      let ridge = 0;
+      if (signed >= 0) {
+        const ridgeW = Math.max(1, p.width * this.pulseFrontRidgeWidthMul);
+        const rx = 1 - Math.min(1, d / ridgeW);
+        ridge = smoothstep(0, 1, rx) * this.pulseFrontRidgeMul;
+      }
+
+      const b = p.strength * clamp01(band + ridge);
+      boost = Math.max(boost, b);
     }
 
-    for (let k = 0; k < visibleCount; k++) {
-      const i = this.nearOrder[k];
+    return boost;
+  }
+
+  /**
+   * Writes NEAR star colors for ALL stars (no “reveal by count”).
+   * intensity01:
+   *  - comes from audio breathing (when playing) and/or ritual external lane.
+   */
+  private applyNearColorsWithPulse(intensity01: number): void {
+    const count = this.nearRadiiSphere.length;
+
+    const hasPulse = this.pulses.length > 0;
+    const dim = hasPulse ? this.pulseDimBase : 1.0;
+
+    // Base brightness curve so low intensity still reads as faint “dust”
+    // but true silence is truly 0 because intensity01 goes to 0.
+    const baseBrightness = lerp(0.0, 1.0, clamp01(intensity01));
+    const baseScaled = baseBrightness * dim;
+
+    for (let i = 0; i < count; i++) {
       const idx = i * 3;
 
-      // Slight random variance per star for twinkle-like variation (static for now)
-      const v = brightness * (0.82 + Math.random() * 0.18);
+      const baseRaw = baseScaled * this.nearVariance[i];
 
-      this.nearColors[idx + 0] = v;
-      this.nearColors[idx + 1] = v;
-      this.nearColors[idx + 2] = v;
+      const r = this.getRadiusForPulse(i);
+      const pulse = this.computePulseBoostForRadius(r);
+
+      // Let pulse push above 1.0 for bloom/readability
+      const added = pulse * (this.pulseMaxBoost - baseRaw);
+      const v = clamp(baseRaw + added, 0, this.pulseMaxBoost);
+
+      const tintAmt = clamp01((pulse - 0.02) / 0.40);
+
+      const rr = lerp(v, v * this.pulseColorTint.r, tintAmt);
+      const gg = lerp(v, v * this.pulseColorTint.g, tintAmt);
+      const bb = lerp(v, v * this.pulseColorTint.b, tintAmt);
+
+      this.nearColors[idx + 0] = rr;
+      this.nearColors[idx + 1] = gg;
+      this.nearColors[idx + 2] = bb;
     }
   }
 }
