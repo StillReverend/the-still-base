@@ -146,15 +146,15 @@ export class StarSystem {
   // State
   private readonly exclusionRadius: number;
 
-  // “Breathing field” intensity (0..1)
+  // Breathing field intensity (0..1)
   private nearIntensity01 = 0.0;
   private nearTargetIntensity01 = 0.0;
-  private nearIntensityEase = 10.31; // slightly “liquid” by default
+  private nearIntensityEase = 7.9; // slightly liquid by default
 
   // External override lane (ritual), separate from audio
   private externalTarget01 = 0.0;
   private externalTouchedThisFrame = false;
-  private externalDecay = 1.79; // per-second decay toward 0 when not touched
+  private externalDecay = 1.05; // per-second decay toward 0 when not touched
 
   // Audio cache
   private isAudioPlaying = false;
@@ -188,18 +188,18 @@ export class StarSystem {
   private afterRippleSpeedMul = 0.92;
 
   // ==========================================================
-  // BAND — KNOBS (keep these together for Harmony + tuning)
+  // BAND KNOBS (keep these together for Harmony + tuning)
   // ==========================================================
 
   // Palette (Harmony will override later)
-  private bandColorLow: RGB01 = hexToRgb01(0xffffed);  // cool low
-  private bandColorMid: RGB01 = hexToRgb01(0xffdd70);  // warm mid
-  private bandColorHigh: RGB01 = hexToRgb01(0xffdd70); // airy high
+  private bandColorLow: RGB01 = hexToRgb01(0xffffed);  // low
+  private bandColorMid: RGB01 = hexToRgb01(0xffdd70);  // mid
+  private bandColorHigh: RGB01 = hexToRgb01(0xffdd70); // high
 
   // Gating + curves (drives the smoothed levels BEFORE visibility thresholds)
-  private bandGateLow = 0.20;
-  private bandGateMid = 0.40;
-  private bandGateHigh = 0.60
+  private bandGateLow = 0.06;
+  private bandGateMid = 0.08;
+  private bandGateHigh = 0.07;
 
   // ----------------------------------------------------------
   // Spatial mapping
@@ -207,7 +207,7 @@ export class StarSystem {
 
   // Band mixing / overlap shaping (soft thirds)
   // overlap01: 0 = sharper zones, 1 = very blended
-  private bandOverlap01 = 0.79;
+  private bandOverlap01 = 0.31;
 
   // Optional per-band biases (future Harmony “mixing”)
   private bandBiasLow = 1.0;
@@ -230,40 +230,40 @@ export class StarSystem {
 
   // Per-band “turn on” levels (0..1).
   // Stars in that band do NOT appear at all until crossed.
-  private bandOnLow = 0.14;
-  private bandOnMid = 0.18;
-  private bandOnHigh = 0.24;
+  private bandOnLow = 0.10;
+  private bandOnMid = 0.40;
+  private bandOnHigh = 0.05;
 
   // Softness of the on-ramp (0.02 = crisp, 0.06 = smoother)
-  private bandOnFeather = 0.035;
+  private bandOnFeather = 0.05;
 
   // Global gate: BAND is completely off until overall energy passes this.
-  // This is the main “verse stays empty, chorus fills the STILL” control.
+  // This is the main verse stays empty, chorus fills the STILL control.
   private bandEnergyOn = 0.05;
-  private bandEnergyFeather = 0.06;
+  private bandEnergyFeather = 0.08;
 
   // Final brightness floor.
   // Even if math produces a tiny value, we write 0 below this.
-  private bandMinVisibleV = 0.06;
+  private bandMinVisibleV = 0.03;
 
   // ----------------------------------------------------------
   // Response shaping (after bands are ON)
   // ----------------------------------------------------------
 
   // Curves (emotional response)
-  private bandCurveLow = 1.10;
-  private bandCurveMid = 1.00;
-  private bandCurveHigh = 0.85;
+  private bandCurveLow = 1.20; // 1.0 - 1.3
+  private bandCurveMid = 0.90; // 0.9 - 1.1
+  private bandCurveHigh = 0.85; // 0.7 – 1.0
 
   // Attack/Release per band (per-second)
-  private bandAttackLow = 2.2;
-  private bandReleaseLow = 1.1;
+  private bandAttackLow = 1.8;
+  private bandReleaseLow = 0.9;
 
-  private bandAttackMid = 4.2;
-  private bandReleaseMid = 2.0;
+  private bandAttackMid = 6.0;
+  private bandReleaseMid = 3.5;
 
-  private bandAttackHigh = 8.0;
-  private bandReleaseHigh = 4.1;
+  private bandAttackHigh = 6.0;
+  private bandReleaseHigh = 3.0;
 
   // ----------------------------------------------------------
   // High shimmer (only applies once highs are truly active)
@@ -393,8 +393,8 @@ export class StarSystem {
     // BAND (new): true 3D shell driven by low/mid/high
     // ----------------------------
     const bandCount = Math.max(0, options.bandCount ?? 1337);
-    const bandInnerRadius = Math.max(this.exclusionRadius, options.bandInnerRadius ?? 500);
-    const bandOuterRadius = Math.max(bandInnerRadius + 1, options.bandOuterRadius ?? 2500);
+    const bandInnerRadius = Math.max(this.exclusionRadius, options.bandInnerRadius ?? 1300);
+    const bandOuterRadius = Math.max(bandInnerRadius + 1, options.bandOuterRadius ?? 2600);
     const bandSize = Math.max(0.1, options.bandSize ?? 1.45);
 
     this.bandInnerRadius = bandInnerRadius;
@@ -607,11 +607,12 @@ export class StarSystem {
     }
     this.externalTouchedThisFrame = false;
 
+    // NEAR stars reacitvity
     // audio target (continuous breathing)
     let audioTarget = 0.0;
     if (this.audioDriven && this.isAudioPlaying) {
       const e = clamp01(this.lastAudio.energy);
-      const gate = 0.46;
+      const gate = 0.50;
       const raw = smoothstep(gate, 0.79, e);
       const curved = Math.pow(raw, 1.0);
       audioTarget = clamp01(curved);

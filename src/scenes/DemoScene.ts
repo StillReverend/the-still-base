@@ -204,10 +204,10 @@ export class DemoScene implements SceneController {
       farRadius: 8000,
       farSize: 1.5,
 
-      nearCount: 0,
+      nearCount: 500,
       nearInnerRadius: 5000,
       nearOuterRadius: 8000,
-      nearSize: 1.0,
+      nearSize: 1.2,
 
       // IMPORTANT: start at 0 so no NEAR stars show until audio or ritual
       nearReveal01: 0.0,
@@ -318,7 +318,7 @@ export class DemoScene implements SceneController {
 
     addRing(100, "DevRing_50", 0.14);
     addRing(200, "DevRing_100", 0.14);
-    addRing(0, "DevRing_250", 0.14);
+    addRing(5000, "DevRing_250", 0.14);
     addRing(0, "DevRing_500", 0.14);
 
     addRing(systemRadius, `SystemRadius_${systemRadius}`, 0.25);

@@ -324,7 +324,7 @@ export class CoreSystem {
       this.coreStates.update(dt, this.lastAudioFrame);
     }
 
-    this.clock.update(dt);
+    //this.clock.update(dt);
     this.time.update(dt);
   }
 

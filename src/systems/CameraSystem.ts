@@ -84,7 +84,7 @@ export interface CameraRigOptions {
 // Default: TRUE free-orbit (no gate, allows roll)
 const DEFAULT_OPTIONS: CameraRigOptions = {
   minDistance: 150,
-  maxDistance: 2026,
+  maxDistance: 10000,
 
   minPolarAngle: 0.1,
   maxPolarAngle: Math.PI - 0.1,
@@ -104,10 +104,10 @@ const DEFAULT_OPTIONS: CameraRigOptions = {
 
   // Auto-dolly defaults (idle fly in/out)
   autoDollyEnabled: true,
-  autoDollyDelaySeconds: 15,
-  autoDollyNearDistance: 103.1,
-  autoDollyFarDistance: 1031,
-  autoDollySecondsPerLeg: 100,
+  autoDollyDelaySeconds: 30,
+  autoDollyNearDistance: 231,
+  autoDollyFarDistance: 2026,
+  autoDollySecondsPerLeg: 31,
 };
 
 export interface CameraTelemetry {
