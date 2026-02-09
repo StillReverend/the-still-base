@@ -83,7 +83,7 @@ export interface CameraRigOptions {
 
 // Default: TRUE free-orbit (no gate, allows roll)
 const DEFAULT_OPTIONS: CameraRigOptions = {
-  minDistance: 150,
+  minDistance: 500,
   maxDistance: 10000,
 
   minPolarAngle: 0.1,

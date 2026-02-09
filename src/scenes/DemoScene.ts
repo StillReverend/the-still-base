@@ -5,6 +5,8 @@ import * as THREE from "three";
 
 import type { SceneController, SceneContext, SceneName } from "../apps/SceneTypes";
 
+import { gsap } from "../core/Motion";
+
 import type { CorePhase } from "../systems/CoreSystem";
 import { CoreSystem } from "../systems/CoreSystem";
 import { StarSystem } from "../systems/StarSystem";
@@ -19,6 +21,8 @@ type RitualProgressPayload = {
 export class DemoScene implements SceneController {
   public readonly name: SceneName = "DemoScene";
   public readonly scene = new THREE.Scene();
+
+  private gsapProofMesh: THREE.Mesh | null = null;
 
   private ctx: SceneContext | null = null;
 
@@ -142,6 +146,7 @@ export class DemoScene implements SceneController {
     this.buildCoreAndClock(ctx);
     this.buildStars();
     this.buildConstellations(ctx);
+    this.buildGsapProofPulse();
 
     // Scene-local click handling (focusable objects)
     ctx.renderer.domElement.addEventListener("pointerdown", this.onPointerDown);
@@ -278,6 +283,34 @@ export class DemoScene implements SceneController {
         });
       },
     });
+  }
+
+  private buildGsapProofPulse(): void {
+    const geom = new THREE.SphereGeometry(14, 24, 24);
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(0xffffff),
+      transparent: true,
+      opacity: 0.35,
+      depthTest: true,
+      depthWrite: false,
+    });
+
+    const m = new THREE.Mesh(geom, mat);
+    m.name = "GSAP_ProofPulse";
+    m.position.set(0, 120, 0);
+
+    // Start small so the pulse is obvious.
+    m.scale.setScalar(0.2);
+
+    this.scene.add(m);
+    this.gsapProofMesh = m;
+
+    // One-shot pulse: pop in, breathe, settle.
+    gsap
+      .timeline()
+      .to(m.scale, { x: 1.15, y: 1.15, z: 1.15, duration: 0.28, ease: "power2.out" })
+      .to(m.scale, { x: 0.85, y: 0.85, z: 0.85, duration: 0.22, ease: "power2.inOut" })
+      .to(m.scale, { x: 1.0, y: 1.0, z: 1.0, duration: 0.30, ease: "power2.out" });
   }
 
   private configureCamera(ctx: SceneContext): void {
@@ -491,6 +524,13 @@ export class DemoScene implements SceneController {
       this.ctx.bus.off("dev:regions:toggle", this.onToggleRegions);
       this.ctx.bus.off("dev:core:cycle", this.onDevCoreCycle);
       this.ctx.bus.off("dev:core:clear", this.onDevCoreClear);
+    }
+
+    if (this.gsapProofMesh) {
+      this.scene.remove(this.gsapProofMesh);
+      this.gsapProofMesh.geometry.dispose();
+      (this.gsapProofMesh.material as THREE.Material).dispose();
+      this.gsapProofMesh = null;
     }
 
     this.ctx = null;
