@@ -103,6 +103,7 @@ export class DevTools {
     this.onKeyDown = (e: KeyboardEvent) => {
       if (!this.enabled) return;
       if (this.isTypingTarget(e)) return;
+      if (e.repeat) return;
 
       const key = (e.key || "").toLowerCase();
       if (!key) return;
@@ -170,6 +171,26 @@ export class DevTools {
       },
     });
 
+    // Tab toggles overlay visibility. Prevent default Tab focus behavior.
+    this.register("tab", {
+      label: "Toggle Debug Overlay (Tab)",
+      when: () => !!this.overlay,
+      action: (e) => {
+        e.preventDefault();
+
+        if (!this.overlay) return;
+
+        if (this.overlay.toggleVisible) {
+          this.overlay.toggleVisible();
+          return;
+        }
+
+        const isVis = this.overlay.isVisible?.() ?? true;
+        this.overlay.setVisible?.(!isVis);
+      },
+    });
+
+    // Keep the existing "O" toggle as an alternate.
     this.register("o", {
       label: "Toggle Debug Overlay",
       when: () => !!this.overlay,

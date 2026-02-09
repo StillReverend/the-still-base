@@ -10,6 +10,7 @@ import { CoreSystem } from "../systems/CoreSystem";
 import { StarSystem } from "../systems/StarSystem";
 import { RitualSystem } from "../systems/RitualSystem";
 import { RegionSystem } from "../systems/RegionSystem";
+import { ConstellationSystem } from "../systems/ConstellationSystem";
 
 type RitualProgressPayload = {
   progress01?: number;
@@ -26,6 +27,8 @@ export class DemoScene implements SceneController {
   private core: CoreSystem | null = null;
   private starSystem: StarSystem | null = null;
   private ritual: RitualSystem | null = null;
+
+  private constellationSystem: ConstellationSystem | null = null;
 
   private ambientLight: THREE.AmbientLight | null = null;
   private keyLight: THREE.DirectionalLight | null = null;
@@ -109,6 +112,21 @@ export class DemoScene implements SceneController {
     this.starSystem.setAudioPlaying(Boolean(p?.isPlaying));
   };
 
+  // ----------------------------------------------------------
+  // Pointer -> Constellations
+  // ----------------------------------------------------------
+
+  private onPointerDown = (e: PointerEvent): void => {
+    if (!this.ctx || !this.constellationSystem) return;
+
+    // NDC coords (-1..+1)
+    const rect = this.ctx.renderer.domElement.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+
+    this.constellationSystem.handlePointerDown(x, y);
+  };
+
   public init(ctx: SceneContext): void {
     this.ctx = ctx;
 
@@ -123,6 +141,10 @@ export class DemoScene implements SceneController {
     this.buildLights();
     this.buildCoreAndClock(ctx);
     this.buildStars();
+    this.buildConstellations(ctx);
+
+    // Scene-local click handling (focusable objects)
+    ctx.renderer.domElement.addEventListener("pointerdown", this.onPointerDown);
 
     ctx.bus.on("audio:frame", this.onAudioFrame);
 
@@ -215,6 +237,47 @@ export class DemoScene implements SceneController {
 
     // Default to cosmic sphere shockwave (you preferred “all directions”)
     this.starSystem.setPulseMode("sphere");
+  }
+
+  private buildConstellations(ctx: SceneContext): void {
+    if (!this.core) return;
+
+    const coreRoot = this.core.getRoot();
+
+    // Scaffold: warm core identity color. Later this can be pulled from CoreSystem phase/state.
+    const coreColor = new THREE.Color(0xffb14a);
+
+    // Orbit distance when focused on a constellation.
+    // Goal: allow seeing Core in the distance sometimes.
+    const constellationOrbitDistance = 220;
+
+    this.constellationSystem = new ConstellationSystem({
+      scene: this.scene,
+      camera: ctx.camera,
+      coreObject: coreRoot,
+      coreColor,
+
+      // Placement ring (clock positions)
+      ringRadius: 5000,
+      orbRadius: 100,
+      y: 0,
+
+      // Align index 0 to "12 o'clock" (tune depending on your world forward)
+      angleOffsetRad: Math.PI * 0.5,
+
+      // Click-to-focus: clicked orb becomes new orbit target (fly-to comes later).
+      onFocusRequest: (req) => {
+        const pos = req.position;
+
+        ctx.bus.emit("camera:set-orbit", {
+          target: { x: pos.x, y: pos.y, z: pos.z },
+          distance: constellationOrbitDistance,
+          theta: 0.0,
+          phi: 0.0001,
+          up: { x: 0, y: 0, z: 1 },
+        });
+      },
+    });
   }
 
   private configureCamera(ctx: SceneContext): void {
@@ -351,6 +414,7 @@ export class DemoScene implements SceneController {
 
     this.core?.update(delta);
     this.starSystem?.update(delta);
+    this.constellationSystem?.update(delta);
     this.ritual?.update();
   }
 
@@ -358,6 +422,10 @@ export class DemoScene implements SceneController {
     if (import.meta.env.DEV) {
       // eslint-disable-next-line no-console
       console.log("[DemoScene] dispose");
+    }
+
+    if (this.ctx) {
+      this.ctx.renderer.domElement.removeEventListener("pointerdown", this.onPointerDown);
     }
 
     if (this.regionDebugRoot) {
@@ -374,6 +442,11 @@ export class DemoScene implements SceneController {
       this.ctx.bus.off("ritual:core:progress", this.onRitualProgress);
       this.ctx.bus.off("ritual:core:cancelled", this.onRitualCancelled);
       this.ctx.bus.off("ritual:core:completed", this.onRitualCompleted);
+    }
+
+    if (this.constellationSystem) {
+      this.constellationSystem.dispose();
+      this.constellationSystem = null;
     }
 
     if (this.starSystem) {

@@ -100,6 +100,9 @@ export class DebugOverlay {
   private readonly container: HTMLDivElement;
   private readonly textEl: HTMLPreElement;
 
+  // Visibility (controlled via DevTools, default OFF)
+  private visible = false;
+
   private fpsAccum = 0;
   private fpsFrames = 0;
   private fps = 0;
@@ -124,6 +127,23 @@ export class DebugOverlay {
   private busSkipped = 0;
 
   private readonly onAnyHandler: AnyBusHandler | null = null;
+
+  // ----------------------------------------------------------
+  // Visibility API (for DevTools ToggleableOverlay compatibility)
+  // ----------------------------------------------------------
+
+  public isVisible(): boolean {
+    return this.visible;
+  }
+
+  public setVisible(visible: boolean): void {
+    this.visible = visible;
+    this.container.style.display = visible ? "block" : "none";
+  }
+
+  public toggleVisible(): void {
+    this.setVisible(!this.visible);
+  }
 
   private onKeyUp = (ev: KeyboardEvent): void => {
     if (!import.meta.env.DEV) return;
@@ -169,6 +189,9 @@ export class DebugOverlay {
     this.container.appendChild(this.textEl);
 
     document.body.appendChild(this.container);
+
+    // Default: hidden. Use Tab (DevTools) to toggle on/off.
+    this.setVisible(false);
 
     this.hasMemoryAPI = typeof performance !== "undefined" && "memory" in performance;
 
@@ -233,6 +256,9 @@ export class DebugOverlay {
   }
 
   update(dt: number): void {
+    // If hidden, do nothing. Keeps it cheap.
+    if (!this.visible) return;
+
     this.fpsAccum += dt;
     this.fpsFrames += 1;
 
@@ -274,6 +300,7 @@ export class DebugOverlay {
       "  +Z = 12 o'clock, -Z = 6 o'clock",
       "",
       "hotkeys:",
+      "  Tab: toggle overlay",
       "  R: toggle regions",
       "  E: toggle bus log panel",
       "  Shift+E: include camera:telemetry in bus log",
