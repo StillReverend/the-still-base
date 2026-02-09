@@ -18,6 +18,7 @@ import { PostFXSystem } from "../systems/PostFXSystem";
 import { PersistenceSystem } from "../systems/PersistenceSystem";
 import { GateSystem } from "../systems/GateSystem";
 import { AudioSystem } from "../systems/AudioSystem";
+import { HowlerAudioSystem } from "../systems/HowlerAudioSystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -48,6 +49,7 @@ export class Engine {
   private readonly persistence: PersistenceSystem;
   private readonly gateSystem: GateSystem;
   private readonly audioSystem: AudioSystem;
+  private readonly howlerAudioSystem: HowlerAudioSystem;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -87,6 +89,19 @@ export class Engine {
       bus: this.bus,
       persistence: this.persistence,
       defaultFadeMs: 800,
+    });
+
+    // Howler (Playback-first: SFX + Ambient now; music later)
+    this.howlerAudioSystem = new HowlerAudioSystem({
+      bus: this.bus,
+      basePath: "/assets/audio",
+      startMuted: false,
+      volumes: {
+        master: 1.0,
+        sfx: 0.85,
+        ambient: 0.7,
+        music: 1.0,
+      },
     });
 
     // Renderer
@@ -213,6 +228,8 @@ export class Engine {
       this.setupAutoStartMusicOnFirstGesture("Legacy");
     }
 
+    this.installHowlerProofEmitters();
+
     window.addEventListener("resize", this.handleResize);
     this.handleResize();
   }
@@ -259,6 +276,7 @@ export class Engine {
 
     // Audio
     this.audioSystem.update(dt);
+    this.howlerAudioSystem.update(dt);
 
     // Scene update
     this.sceneManager.update(dt);
@@ -395,6 +413,38 @@ export class Engine {
     window.addEventListener("keydown", fire, { once: true });
   }
 
+    // ---------------------------------------------------------------------------
+  // Howler proof emitters (temporary)
+  // ---------------------------------------------------------------------------
+
+  private howlerProofArmed = false;
+  private lastHoverSfxAt = 0;
+  private howlerProofOff: (() => void) | null = null;
+
+  private installHowlerProofEmitters(): void {
+    if (this.howlerProofArmed) return;
+    this.howlerProofArmed = true;
+
+    const onMove = (): void => {
+      const now = performance.now();
+      if (now - this.lastHoverSfxAt < 140) return;
+      this.lastHoverSfxAt = now;
+      this.bus.emit("ui:hover", { kind: "hover" });
+    };
+
+    const onDown = (): void => {
+      this.bus.emit("ui:click", { kind: "click" });
+    };
+
+    this.canvas.addEventListener("pointermove", onMove);
+    this.canvas.addEventListener("pointerdown", onDown);
+
+    this.howlerProofOff = () => {
+      this.canvas.removeEventListener("pointermove", onMove);
+      this.canvas.removeEventListener("pointerdown", onDown);
+    };
+  }
+
   dispose(): void {
     this.stop();
     window.removeEventListener("resize", this.handleResize);
@@ -408,6 +458,13 @@ export class Engine {
       this.debugOverlay.dispose();
       this.debugOverlay = null;
     }
+
+    if (this.howlerProofOff) {
+      this.howlerProofOff();
+      this.howlerProofOff = null;
+    }
+
+    this.howlerAudioSystem.dispose();
 
     // Audio: detach bus handlers
     this.audioSystem.dispose();
