@@ -70,6 +70,9 @@ export class DemoScene implements SceneController {
     this.core.clearBlackHoleOverride();
   };
 
+  private lastUiHoverAt = 0;
+  private readonly uiHoverCooldownMs = 140;
+
   // ----------------------------------------------------------
   // Ritual -> Stars
   // ----------------------------------------------------------
@@ -128,7 +131,28 @@ export class DemoScene implements SceneController {
     const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
 
-    this.constellationSystem.handlePointerDown(x, y);
+    const hit = this.constellationSystem.handlePointerDown(x, y);
+    if (hit) {
+      this.ctx.bus.emit("ui:click", { kind: "click" });
+    }
+
+  };
+
+  private onPointerMove = (e: PointerEvent): void => {
+    if (!this.ctx || !this.constellationSystem) return;
+
+    const rect = this.ctx.renderer.domElement.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+
+    const entered = this.constellationSystem.handlePointerMove(x, y);
+    if (!entered) return;
+
+    const now = performance.now();
+    if (now - this.lastUiHoverAt < this.uiHoverCooldownMs) return;
+    this.lastUiHoverAt = now;
+
+    this.ctx.bus.emit("ui:hover", { kind: "hover" });
   };
 
   public init(ctx: SceneContext): void {
@@ -150,6 +174,7 @@ export class DemoScene implements SceneController {
 
     // Scene-local click handling (focusable objects)
     ctx.renderer.domElement.addEventListener("pointerdown", this.onPointerDown);
+    ctx.renderer.domElement.addEventListener("pointermove", this.onPointerMove);
 
     ctx.bus.on("audio:frame", this.onAudioFrame);
 
@@ -459,6 +484,7 @@ export class DemoScene implements SceneController {
 
     if (this.ctx) {
       this.ctx.renderer.domElement.removeEventListener("pointerdown", this.onPointerDown);
+      this.ctx.renderer.domElement.removeEventListener("pointermove", this.onPointerMove);
     }
 
     if (this.regionDebugRoot) {

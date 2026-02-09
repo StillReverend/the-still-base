@@ -307,9 +307,15 @@ export class ConstellationSystem {
 
   private onFocusRequest?: (req: ConstellationFocusRequest) => void;
 
+  private hoveredId: number | null = null;
+
   // scratch
   private _vA = new THREE.Vector3();
   private _vB = new THREE.Vector3();
+  
+  private _dir = new THREE.Vector3();
+  private _start = new THREE.Vector3();
+  private _end = new THREE.Vector3();
 
   constructor(params: ConstellationSystemParams) {
     this.scene = params.scene;
@@ -382,8 +388,8 @@ export class ConstellationSystem {
     }
   }
 
-  /** Call this from your pointer handler (normalized device coords). */
-  handlePointerDown(ndcX: number, ndcY: number) {
+  /** Call this from your pointer handler (normalized device coords). Returns true if hit. */
+  handlePointerDown(ndcX: number, ndcY: number): boolean {
     this.ndc.set(ndcX, ndcY);
     this.raycaster.setFromCamera(this.ndc, this.camera);
 
@@ -392,19 +398,48 @@ export class ConstellationSystem {
       false
     );
 
-    if (!hits.length) return;
+    if (!hits.length) return false;
 
     const hit = hits[0].object as THREE.Object3D;
     const id = hit.userData.constellationId as number;
 
     const orb = this.orbs.find((o) => o.id === id);
-    if (!orb) return;
+    if (!orb) return false;
 
     this.onFocusRequest?.({
       id,
       object: orb.mesh,
       position: orb.mesh.getWorldPosition(new THREE.Vector3()),
     });
+
+    return true;
+  }
+
+  /**
+   * Pointer hover support. Returns true only when hover ENTERS a valid orb
+   * (i.e., hover changes from null/other -> some orb).
+   */
+  handlePointerMove(ndcX: number, ndcY: number): boolean {
+    this.ndc.set(ndcX, ndcY);
+    this.raycaster.setFromCamera(this.ndc, this.camera);
+
+    const hits = this.raycaster.intersectObjects(
+      this.orbs.map((o) => o.mesh),
+      false
+    );
+
+    if (!hits.length) {
+      this.hoveredId = null;
+      return false;
+    }
+
+    const hit = hits[0].object as THREE.Object3D;
+    const id = hit.userData.constellationId as number;
+
+    if (this.hoveredId === id) return false;
+
+    this.hoveredId = id;
+    return true;
   }
 
   update(dt: number) {
@@ -415,10 +450,10 @@ export class ConstellationSystem {
       const orbPos = orb.mesh.getWorldPosition(this._vB);
 
       // Endpoint padding so the filament “connects” to the surfaces, not centers.
-      const dir = new THREE.Vector3().subVectors(orbPos, corePos).normalize();
+      const dir = this._dir.subVectors(orbPos, corePos).normalize();
 
-      const start = new THREE.Vector3().copy(corePos).addScaledVector(dir, 1.0); // tweak later
-      const end = new THREE.Vector3().copy(orbPos).addScaledVector(dir, -this.orbRadius * 0.9);
+      const start = this._start.copy(corePos).addScaledVector(dir, 1.0); // tweak later
+      const end = this._end.copy(orbPos).addScaledVector(dir, -this.orbRadius * 0.9);
 
       orb.filament.setColors(this.coreColor, orb.color);
       orb.filament.setEndpoints(start, end);

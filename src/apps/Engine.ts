@@ -228,8 +228,6 @@ export class Engine {
       this.setupAutoStartMusicOnFirstGesture("Legacy");
     }
 
-    this.installHowlerProofEmitters();
-
     window.addEventListener("resize", this.handleResize);
     this.handleResize();
   }
@@ -413,38 +411,6 @@ export class Engine {
     window.addEventListener("keydown", fire, { once: true });
   }
 
-    // ---------------------------------------------------------------------------
-  // Howler proof emitters (temporary)
-  // ---------------------------------------------------------------------------
-
-  private howlerProofArmed = false;
-  private lastHoverSfxAt = 0;
-  private howlerProofOff: (() => void) | null = null;
-
-  private installHowlerProofEmitters(): void {
-    if (this.howlerProofArmed) return;
-    this.howlerProofArmed = true;
-
-    const onMove = (): void => {
-      const now = performance.now();
-      if (now - this.lastHoverSfxAt < 140) return;
-      this.lastHoverSfxAt = now;
-      this.bus.emit("ui:hover", { kind: "hover" });
-    };
-
-    const onDown = (): void => {
-      this.bus.emit("ui:click", { kind: "click" });
-    };
-
-    this.canvas.addEventListener("pointermove", onMove);
-    this.canvas.addEventListener("pointerdown", onDown);
-
-    this.howlerProofOff = () => {
-      this.canvas.removeEventListener("pointermove", onMove);
-      this.canvas.removeEventListener("pointerdown", onDown);
-    };
-  }
-
   dispose(): void {
     this.stop();
     window.removeEventListener("resize", this.handleResize);
@@ -457,11 +423,6 @@ export class Engine {
     if (this.debugOverlay) {
       this.debugOverlay.dispose();
       this.debugOverlay = null;
-    }
-
-    if (this.howlerProofOff) {
-      this.howlerProofOff();
-      this.howlerProofOff = null;
     }
 
     this.howlerAudioSystem.dispose();
