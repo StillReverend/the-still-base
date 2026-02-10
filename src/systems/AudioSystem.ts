@@ -16,6 +16,9 @@
 // Notes:
 //  - Track catalog is intentionally "best-effort" URL resolution right now.
 //    We'll formalize this into a proper TrackRegistry later.
+//  - IMPORTANT ARCH RULE:
+//      "audio:fade-to-silence" and "audio:resume" are *REQUEST* events.
+//      AudioSystem must NEVER emit them, or it can recurse through its own handlers.
 // ============================================================
 
 import type { EventBus } from "../core/EventBus";
@@ -187,7 +190,10 @@ export class AudioSystem {
   // ---------------------------------------------------------------------------
 
   getState(): AudioSystemState {
-    return structuredClone(this.state);
+    // IMPORTANT:
+    // - This state is flat primitives, so a shallow clone is enough.
+    // - Avoid structuredClone here; it can throw if state ever gains non-cloneable fields.
+    return { ...this.state };
   }
 
   /**
@@ -371,6 +377,13 @@ export class AudioSystem {
     this.emitState(reason);
   }
 
+  /**
+   * System-level mute/fade.
+   *
+   * IMPORTANT:
+   * - "audio:fade-to-silence" is a REQUEST event (consumed by this system).
+   * - Therefore this method must NOT emit "audio:fade-to-silence" again.
+   */
   fadeToSilence(reason: AudioFadeReason = "system", durationSec?: number): void {
     const dur = Math.max(0, durationSec ?? this.defaultFadeSec);
 
@@ -381,10 +394,18 @@ export class AudioSystem {
 
     this.startFade(this.state.effectiveVolume, 0, dur, reason);
 
-    this.emit("audio:fade-to-silence", { reason, durationSec: dur });
+    // Emit ONLY state/diagnostics, not the request event.
+    this.emit("audio:fade", { kind: "to-silence", reason, durationSec: dur });
     this.emitState("audio:fade-to-silence");
   }
 
+  /**
+   * Release system-level mute/fade.
+   *
+   * IMPORTANT:
+   * - "audio:resume" is a REQUEST event (consumed by this system).
+   * - Therefore this method must NOT emit "audio:resume" again.
+   */
   resumeSystemAudio(reason: AudioFadeReason = "system", durationSec?: number): void {
     const dur = Math.max(0, durationSec ?? this.defaultFadeSec);
 
@@ -398,7 +419,8 @@ export class AudioSystem {
       void this.play("audio:resume-system-audio");
     }
 
-    this.emit("audio:resume", { reason, durationSec: dur });
+    // Emit ONLY state/diagnostics, not the request event.
+    this.emit("audio:fade", { kind: "resume", reason, durationSec: dur });
     this.emitState("audio:resume");
   }
 
@@ -773,7 +795,9 @@ export class AudioSystem {
       this.seek(this.state.timeSec + d, "audio:seek-nudge");
     });
 
-    this.bind("audio:set-volume", (p: { volume: number }) => this.setVolume(p?.volume ?? this.state.volume, "audio:set-volume"));
+    this.bind("audio:set-volume", (p: { volume: number }) =>
+      this.setVolume(p?.volume ?? this.state.volume, "audio:set-volume"),
+    );
     this.bind("audio:volume-nudge", (p: { delta: number }) => {
       const d = Number.isFinite(p?.delta) ? p.delta : 0;
       this.setVolume(this.state.volume + d, "audio:volume-nudge");
@@ -782,14 +806,17 @@ export class AudioSystem {
     this.bind("audio:set-shuffle", (p: { shuffle: boolean }) => this.setShuffle(!!p?.shuffle, "audio:set-shuffle"));
     this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) => this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"));
 
+    // REQUEST events (do NOT re-emit from within the handler chain)
     this.bind("audio:fade-to-silence", (p: { reason?: AudioFadeReason; durationSec?: number }) =>
-      this.fadeToSilence(p?.reason ?? "system", p?.durationSec)
+      this.fadeToSilence(p?.reason ?? "system", p?.durationSec),
     );
 
+    // REQUEST event (do NOT re-emit from within the handler chain)
     this.bind("audio:resume", (p: { reason?: AudioFadeReason; durationSec?: number }) =>
-      this.resumeSystemAudio(p?.reason ?? "system", p?.durationSec)
+      this.resumeSystemAudio(p?.reason ?? "system", p?.durationSec),
     );
 
+    // Gate drives requests
     this.bind("gate:closing", () => this.fadeToSilence("gate"));
     this.bind("gate:opening", () => this.resumeSystemAudio("gate"));
   }
@@ -831,7 +858,7 @@ export class AudioSystem {
         repeat: this.state.repeat,
         volume: this.state.volume,
       },
-      reason
+      reason,
     );
   }
 

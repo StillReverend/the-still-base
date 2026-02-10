@@ -287,7 +287,7 @@ export class DemoScene implements SceneController {
     const coreColor = new THREE.Color(0xffb14a);
 
     // Orbit distance when focused on a constellation.
-    const constellationOrbitDistance = 220;
+    const constellationOrbitDistance = 777;
 
     this.constellationSystem = new ConstellationSystem({
       scene: this.scene,
