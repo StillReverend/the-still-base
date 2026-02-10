@@ -42,7 +42,15 @@ export class BootScene implements SceneController {
     this.scene.add(directional);
 
     const { camera } = ctx;
-    camera.position.set(0, 0, 4);
+    
+    ctx.bus.emit("camera:set-orbit", {
+      target: { x: 0, y: 0, z: 0 },
+      distance: 4,
+      theta: 0,
+      phi: Math.PI * 0.5,
+      up: { x: 0, y: 1, z: 0 },
+    });
+
     camera.lookAt(0, 0, 0);
 
     if (import.meta.env.DEV) {

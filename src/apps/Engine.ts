@@ -13,12 +13,14 @@ import { DebugOverlay } from "./DebugOverlay";
 import { DevTools } from "./DevTools";
 
 import { CameraSystem } from "../systems/CameraSystem";
+import { CameraDirectorSystem } from "../systems/CameraDirectorSystem";
 import { ControlSystem } from "../systems/ControlSystem";
 import { PostFXSystem } from "../systems/PostFXSystem";
 import { PersistenceSystem } from "../systems/PersistenceSystem";
 import { GateSystem } from "../systems/GateSystem";
 import { AudioSystem } from "../systems/AudioSystem";
 import { HowlerAudioSystem } from "../systems/HowlerAudioSystem";
+import { InteractionSystem } from "../systems/InteractionSystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -44,12 +46,14 @@ export class Engine {
 
   private readonly camera: THREE.PerspectiveCamera;
   private readonly cameraSystem: CameraSystem;
+  private readonly cameraDirector: CameraDirectorSystem;
   private readonly controlSystem: ControlSystem;
 
   private readonly persistence: PersistenceSystem;
   private readonly gateSystem: GateSystem;
   private readonly audioSystem: AudioSystem;
   private readonly howlerAudioSystem: HowlerAudioSystem;
+  private readonly interactionSystem: InteractionSystem;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -121,12 +125,7 @@ export class Engine {
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
 
     // Camera
-    this.camera = new THREE.PerspectiveCamera(
-      50,
-      window.innerWidth / window.innerHeight,
-      1.0,
-      1000,
-    );
+    this.camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1.0, 1000);
 
     this.cameraSystem = new CameraSystem({
       camera: this.camera,
@@ -134,10 +133,23 @@ export class Engine {
       config: this.config,
     });
 
+    // Camera Director (cinematic shots)
+    this.cameraDirector = new CameraDirectorSystem({
+      bus: this.bus,
+      cameraSystem: this.cameraSystem,
+    });
+
     this.controlSystem = new ControlSystem({
       domElement: this.canvas,
       bus: this.bus,
       config: this.config,
+    });
+
+    // Interaction (central pointer + raycast)
+    this.interactionSystem = new InteractionSystem({
+      bus: this.bus,
+      domElement: this.renderer.domElement,
+      camera: this.camera,
     });
 
     // Scene manager
@@ -208,7 +220,7 @@ export class Engine {
 
       // Browser gesture unlock + (optional) dev autostart
       this.setupAudioUnlockGestures();
-      this.setupAutoStartMusicOnFirstGesture("Legacy");
+      this.setupAutoStartMusicOnFirstGesture("Lift");
 
       this.devTools = new DevTools({
         bus: this.bus,
@@ -225,7 +237,7 @@ export class Engine {
 
       // If you want Lift.mp3 to start for real users too, keep this enabled.
       // If you prefer “silent until UI exists”, comment it out.
-      this.setupAutoStartMusicOnFirstGesture("Legacy");
+      this.setupAutoStartMusicOnFirstGesture("Lift");
     }
 
     window.addEventListener("resize", this.handleResize);
@@ -264,9 +276,14 @@ export class Engine {
 
     const dt = Math.min(dtRaw, this.config.maxDeltaTime);
 
-    // Controls -> camera
+    // Controls -> camera (CameraSystem will ignore if a cinematic is active)
     const snapshot = this.controlSystem.consumeSnapshot();
     this.cameraSystem.applyControlDeltas(snapshot.rotateDelta, snapshot.dollyDelta);
+
+    // Camera Director (cinematics) updates BEFORE the rig update
+    this.cameraDirector.update(dt);
+
+    // Camera rig update (auto-orbit, damping, telemetry, etc.)
     this.cameraSystem.update(dt);
 
     // Gate system (local wall-clock)
@@ -275,6 +292,9 @@ export class Engine {
     // Audio
     this.audioSystem.update(dt);
     this.howlerAudioSystem.update(dt);
+
+    // Interaction
+    this.interactionSystem.update(dt);
 
     // Scene update
     this.sceneManager.update(dt);
@@ -425,6 +445,9 @@ export class Engine {
       this.debugOverlay = null;
     }
 
+    this.cameraDirector.dispose();
+
+    this.interactionSystem.dispose();
     this.howlerAudioSystem.dispose();
 
     // Audio: detach bus handlers

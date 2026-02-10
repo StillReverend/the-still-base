@@ -1,89 +1,53 @@
+// src/systems/CameraSystem.ts
+// ============================================================
+// THE STILL — CameraSystem (Rig)
+// ------------------------------------------------------------
+// Responsibilities:
+//  - Own the live camera "rig" state (orbit target + offset).
+//  - Apply user input deltas (rotate/zoom).
+//  - Apply idle behaviors (auto-orbit, auto-dolly).
+//  - Provide a clean cinematic handoff surface for CameraDirectorSystem.
+//  - Emit telemetry.
+//
+// Explicit non-goals (Director-owned):
+//  - No cinematic tweens/timelines live here.
+//  - No "transition-to-orbit" event.
+//  - No direct scene camera driving.
+// ============================================================
+
 import * as THREE from "three";
 import type { EventBus } from "../core/EventBus";
 import type { Config } from "../core/Config";
 
 export type PolarConstraintMode = "clamp" | "wrap";
 
-/**
- * Camera rig options for orbit behavior.
- *
- * IMPORTANT:
- * - "wrap" here means TRUE free-orbit trackball math (no spherical poles).
- * - "clamp" is an optional framing mode that uses min/max polar angles
- *   relative to WORLD UP (classic orbit gate) for specific scenes.
- */
 export interface CameraRigOptions {
-  /** Minimum orbit distance from target */
   minDistance: number;
-  /** Maximum orbit distance from target */
   maxDistance: number;
 
-  /** Minimum polar angle (vertical) in radians (used when polarConstraintMode = "clamp") */
   minPolarAngle: number;
-  /** Maximum polar angle (vertical) in radians (used when polarConstraintMode = "clamp") */
   maxPolarAngle: number;
 
-  /**
-   * How to constrain polar rotation:
-   * - "wrap": FULL free-orbit trackball math (no spherical poles, allows roll)
-   * - "clamp": enforce min/max polar angles relative to WORLD UP
-   */
   polarConstraintMode: PolarConstraintMode;
 
-  /** Enable smooth damping */
   enableDamping: boolean;
-  /** Damping factor (0–1, higher = more damping) */
   dampingFactor: number;
-  /** Rotation speed in radians per pixel */
   rotateSpeed: number;
-  /** Zoom speed scalar applied to wheel delta */
   zoomSpeed: number;
 
-  // ---------------------------------------------------------------------------
-  // Auto-orbit (drift)
-  // ---------------------------------------------------------------------------
-
-  /** Whether auto-orbit drift is enabled */
   autoOrbitEnabled: boolean;
-
-  /**
-   * Seconds of no user input before auto-orbit begins.
-   *
-   * NOTE:
-   * Kept for backward compatibility. In the “time cannot be stopped” mode,
-   * orbit drift is constant and this value is ignored.
-   */
-  autoOrbitDelaySeconds: number;
-
-  /** Auto-orbit yaw speed in radians per second (applied around local-up) */
+  autoOrbitDelaySeconds: number; // (reserved; not used yet, but kept for future)
   autoOrbitSpeedRadPerSec: number;
 
-  // ---------------------------------------------------------------------------
-  // Auto-dolly (idle fly in/out between two distances)
-  // ---------------------------------------------------------------------------
-
-  /** Whether idle dolly is enabled */
   autoDollyEnabled: boolean;
-
-  /** Seconds of no user input before dolly begins (orbit drift can already be running). */
   autoDollyDelaySeconds: number;
-
-  /** Near distance target for the idle dolly (world units). */
   autoDollyNearDistance: number;
-
-  /** Far distance target for the idle dolly (world units). */
   autoDollyFarDistance: number;
-
-  /**
-   * Seconds to travel from near -> far (and far -> near).
-   * Higher = slower, more serene conductor-wand motion.
-   */
   autoDollySecondsPerLeg: number;
 }
 
-// Default: TRUE free-orbit (no gate, allows roll)
 const DEFAULT_OPTIONS: CameraRigOptions = {
-  minDistance: 500,
+  minDistance: 200,
   maxDistance: 10000,
 
   minPolarAngle: 0.1,
@@ -92,17 +56,15 @@ const DEFAULT_OPTIONS: CameraRigOptions = {
   polarConstraintMode: "wrap",
 
   enableDamping: true,
-  dampingFactor: 0.50,
+  dampingFactor: 0.5,
 
   rotateSpeed: (Math.PI / 180) * 0.0031,
   zoomSpeed: 0.0001,
 
-  // Auto-orbit defaults (tweak via bus.emit("camera:set-rig-options", {...}))
   autoOrbitEnabled: true,
-  autoOrbitDelaySeconds: 0.0, // ignored (orbit drift is constant)
+  autoOrbitDelaySeconds: 0.0,
   autoOrbitSpeedRadPerSec: 0.031,
 
-  // Auto-dolly defaults (idle fly in/out)
   autoDollyEnabled: true,
   autoDollyDelaySeconds: 30,
   autoDollyNearDistance: 231,
@@ -114,8 +76,8 @@ export interface CameraTelemetry {
   position: THREE.Vector3;
   target: THREE.Vector3;
   distance: number;
-  azimuthAngle: number; // theta
-  polarAngle: number; // phi
+  azimuthAngle: number;
+  polarAngle: number;
 }
 
 export interface CameraSystemDeps {
@@ -123,6 +85,14 @@ export interface CameraSystemDeps {
   bus: EventBus;
   config: Config;
 }
+
+export type CameraSetOrbitPayload = {
+  target: { x: number; y: number; z: number };
+  distance: number;
+  theta: number;
+  phi: number;
+  up?: { x: number; y: number; z: number };
+};
 
 export class CameraSystem {
   public readonly camera: THREE.PerspectiveCamera;
@@ -133,31 +103,27 @@ export class CameraSystem {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   private readonly config: Config;
 
-  // Orbit state is stored as an offset vector (trackball), not spherical angles.
+  // Orbit state stored as offset vector (world space)
   private readonly offset = new THREE.Vector3();
 
-  // Accumulated deltas (from ControlSystem)
+  // Buffered per-frame input
   private rotateDelta = new THREE.Vector2();
   private scale = 1;
 
-  // Idle tracking for auto behaviors
+  // Idle tracking
   private idleSeconds = 0;
-
-  // Tracks REAL user input (not damping residual).
-  // This fixes the case where rotate/zoom damping keeps the system from ever becoming "idle".
   private hadUserInputThisFrame = false;
-  private secondsSinceUserInput = 9999;
 
   // Auto-dolly state
   private autoDollyWasActive = false;
   private autoDollyTime = 0;
-
-  // NEW: capture start distance so dolly begins exactly where we are (no snap),
-  // and ALWAYS starts by moving outward toward far.
   private autoDollyStartDistance = 0;
   private autoDollyFirstLegSeconds = 0;
 
-  // Scratch (no allocations per frame)
+  // Director lock
+  private cinematicActive = false;
+
+  // Scratch / constants
   private readonly worldUp = new THREE.Vector3(0, 1, 0);
 
   private readonly scratchForward = new THREE.Vector3();
@@ -170,6 +136,9 @@ export class CameraSystem {
   private readonly scratchPos = new THREE.Vector3();
   private readonly scratchTarget = new THREE.Vector3();
 
+  private readonly scratchUpVec = new THREE.Vector3();
+  private readonly scratchSpherical = new THREE.Spherical();
+
   constructor(deps: CameraSystemDeps) {
     this.camera = deps.camera;
     this.bus = deps.bus;
@@ -178,15 +147,15 @@ export class CameraSystem {
     this.target = new THREE.Vector3(0, 0, 0);
     this.options = { ...DEFAULT_OPTIONS };
 
-    // Initial camera placement matching your prior feel.
+    // Seed camera
     this.camera.position.set(0, 6, 12);
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(this.target);
 
-    // Initialize offset from current camera transform.
+    // Seed orbit offset
     this.offset.copy(this.camera.position).sub(this.target);
 
-    // Clipping planes
+    // Camera clip planes (Engine may override far/near too)
     this.camera.near = 0.5;
     this.camera.far = 15000;
     this.camera.updateProjectionMatrix();
@@ -195,34 +164,104 @@ export class CameraSystem {
   }
 
   // ---------------------------------------------------------------------------
-  // Public API
+  // Public API (Director + Engine)
   // ---------------------------------------------------------------------------
 
-  public setTarget(target: THREE.Vector3): void {
-    // Preserve camera world position by re-basing offset.
-    const worldPos = this.camera.position.clone();
-    this.target.copy(target);
-    this.offset.copy(worldPos).sub(this.target);
+  /** Director lock. When active, the rig will not apply input/idle behaviors. */
+  public setCinematicActive(active: boolean): void {
+    this.cinematicActive = active;
 
-    // Switching targets counts as “activity”
+    // Always clear buffered motion so we don't "snap" on the first free rig frame.
+    this.rotateDelta.set(0, 0);
+    this.scale = 1;
+
     this.idleSeconds = 0;
-
-    // Force a clean re-entry into idle dolly on next idle frame
     this.autoDollyWasActive = false;
     this.autoDollyTime = 0;
+    this.autoDollyFirstLegSeconds = 0;
+    this.hadUserInputThisFrame = false;
+
+    if (!active) {
+      // Re-anchor orbit state to current camera pose so resuming is seamless.
+      this.offset.copy(this.camera.position).sub(this.target);
+      if (this.offset.lengthSq() < 1e-10) {
+        this.offset.set(0, 0, Math.max(this.options.minDistance, 12));
+      }
+
+      const dist = this.offset.length();
+      const clamped = Math.min(this.options.maxDistance, Math.max(this.options.minDistance, dist));
+      this.offset.setLength(clamped);
+
+      this.camera.position.copy(this.target).add(this.offset);
+      this.camera.lookAt(this.target);
+    }
   }
 
+  /**
+   * Director writes the exact pose and asks the rig to "accept" it as truth.
+   * This keeps telemetry stable and makes the handoff deterministic.
+   */
+  public applyCinematicPose(position: THREE.Vector3, quaternion: THREE.Quaternion, up: THREE.Vector3): void {
+    this.camera.position.copy(position);
+    this.camera.quaternion.copy(quaternion);
+    this.camera.up.copy(up);
+
+    this.offset.copy(this.camera.position).sub(this.target);
+  }
+
+  /**
+   * Director finished a shot and wants orbit control around a target using the
+   * CURRENT camera position as the initial orbit offset.
+   */
+  public handoffToOrbitTarget(target: THREE.Vector3, up?: THREE.Vector3): void {
+    this.target.copy(target);
+
+    this.offset.copy(this.camera.position).sub(this.target);
+    if (this.offset.lengthSq() < 1e-10) {
+      this.offset.set(0, 0, Math.max(this.options.minDistance, 12));
+    }
+
+    const dist = this.offset.length();
+    const clamped = Math.min(this.options.maxDistance, Math.max(this.options.minDistance, dist));
+    this.offset.setLength(clamped);
+
+    if (up) {
+      this.camera.up.copy(up);
+      if (this.camera.up.lengthSq() < 1e-10) this.camera.up.set(0, 1, 0);
+      else this.camera.up.normalize();
+    }
+
+    this.camera.position.copy(this.target).add(this.offset);
+    this.camera.lookAt(this.target);
+
+    this.rotateDelta.set(0, 0);
+    this.scale = 1;
+
+    this.idleSeconds = 0;
+    this.autoDollyWasActive = false;
+    this.autoDollyTime = 0;
+    this.autoDollyFirstLegSeconds = 0;
+    this.hadUserInputThisFrame = false;
+  }
+
+  /**
+   * Public wrapper used by the Director to set orbit state instantly.
+   * (We keep the public name explicit to discourage scenes from calling private APIs.)
+   */
+  public setOrbitInstantPublic(p: CameraSetOrbitPayload): void {
+    this.setOrbitInstant(p);
+  }
+
+  /** Engine/scenes may set rig options (not pose). */
   public setOptions(partial: Partial<CameraRigOptions>): void {
     Object.assign(this.options, partial);
 
-    // Keep values sane
     if (this.options.autoOrbitDelaySeconds < 0) this.options.autoOrbitDelaySeconds = 0;
     if (this.options.autoOrbitSpeedRadPerSec < 0) this.options.autoOrbitSpeedRadPerSec = 0;
 
     if (this.options.autoDollyDelaySeconds < 0) this.options.autoDollyDelaySeconds = 0;
     if (this.options.autoDollySecondsPerLeg < 0.1) this.options.autoDollySecondsPerLeg = 0.1;
 
-    // Prevent inverted ranges
     if (this.options.autoDollyFarDistance < this.options.autoDollyNearDistance) {
       const tmp = this.options.autoDollyFarDistance;
       this.options.autoDollyFarDistance = this.options.autoDollyNearDistance;
@@ -230,69 +269,66 @@ export class CameraSystem {
     }
   }
 
+  /**
+   * ControlSystem feeds deltas here; rig applies them during update().
+   * NOTE: This is ignored during cinematic.
+   */
   public applyControlDeltas(rotateDelta: THREE.Vector2, dollyDelta: number): void {
+    if (this.cinematicActive) return;
+
     let hadUserInput = false;
 
     if (rotateDelta.lengthSq() > 0) {
       this.rotateDelta.add(rotateDelta);
       hadUserInput = true;
+      this.hadUserInputThisFrame = true;
     }
 
     if (dollyDelta !== 0) {
       const zoomScale = Math.pow(0.95, dollyDelta * this.options.zoomSpeed);
       this.scale *= zoomScale;
       hadUserInput = true;
+      this.hadUserInputThisFrame = true;
     }
 
     if (hadUserInput) {
-      // Any intentional camera interaction cancels idle timers (but time drift continues)
       this.idleSeconds = 0;
-
-      // IMPORTANT: allow auto-dolly to re-arm after user interaction
       this.autoDollyWasActive = false;
     }
   }
 
   public update(deltaSeconds: number): void {
-    // Clamp deltaSeconds just to avoid weird spikes if tab was backgrounded
     const dt = Math.min(Math.max(deltaSeconds, 0), 0.1);
 
-    // Ensure offset is valid
+    if (this.cinematicActive) {
+      this.emitTelemetry();
+      this.hadUserInputThisFrame = false;
+      return;
+    }
+
     if (this.offset.lengthSq() < 1e-10) {
       this.offset.set(0, 0, Math.max(this.options.minDistance, 12));
     }
 
-    // Track idleness based on REAL user input (not damping residual).
-    // This prevents rotate/zoom damping from keeping us "non-idle" forever.
-    if (!this.hadUserInputThisFrame) {
-      this.secondsSinceUserInput += dt;
-      this.idleSeconds += dt;
-    } else {
-      // A fresh input event happened this frame (mouse/touch/wheel).
-      this.secondsSinceUserInput = 0;
-      this.idleSeconds = 0;
-    }
+    // Idle tracking
+    if (!this.hadUserInputThisFrame) this.idleSeconds += dt;
+    else this.idleSeconds = 0;
 
-    // Consider the user "actively controlling" only if input occurred THIS frame.
-    // Damping/inertia should not block idle behaviors from resuming.
     const hasActiveUserMotion = this.hadUserInputThisFrame;
 
-    // Orbit drift is CONSTANT when enabled.
     const autoOrbitActive = this.options.autoOrbitEnabled;
 
-    // Dolly should be delayed by inactivity (independent of orbit drift).
     const autoDollyActive =
       this.options.autoDollyEnabled &&
       !hasActiveUserMotion &&
       this.idleSeconds >= this.options.autoDollyDelaySeconds;
 
     // -----------------------------------------------------------------------
-    // Auto-orbit injection (constant drift)
+    // Auto-orbit drift
     // -----------------------------------------------------------------------
     if (autoOrbitActive) {
       const yaw = this.options.autoOrbitSpeedRadPerSec * dt;
 
-      // Build an orthonormal camera basis from current orbit state.
       this.scratchForward.copy(this.offset).normalize().multiplyScalar(-1);
       this.scratchUp.copy(this.camera.up).normalize();
       this.scratchRight.copy(this.scratchForward).cross(this.scratchUp);
@@ -305,7 +341,6 @@ export class CameraSystem {
 
       this.scratchUp.copy(this.scratchRight).cross(this.scratchForward).normalize();
 
-      // Yaw about LOCAL up
       this.qYaw.setFromAxisAngle(this.scratchUp, yaw);
 
       this.offset.applyQuaternion(this.qYaw);
@@ -318,13 +353,12 @@ export class CameraSystem {
     }
 
     // -----------------------------------------------------------------------
-    // Rotation (trackball) from user deltas
+    // Rotation from user deltas
     // -----------------------------------------------------------------------
     if (this.rotateDelta.lengthSq() > 0) {
       const yaw = -this.rotateDelta.x * this.options.rotateSpeed;
       const pitch = -this.rotateDelta.y * this.options.rotateSpeed;
 
-      // Build an orthonormal camera basis from current orbit state.
       this.scratchForward.copy(this.offset).normalize().multiplyScalar(-1);
       this.scratchUp.copy(this.camera.up).normalize();
       this.scratchRight.copy(this.scratchForward).cross(this.scratchUp);
@@ -337,9 +371,7 @@ export class CameraSystem {
 
       this.scratchUp.copy(this.scratchRight).cross(this.scratchForward).normalize();
 
-      // Yaw around LOCAL up
       this.qYaw.setFromAxisAngle(this.scratchUp, yaw);
-      // Pitch around LOCAL right
       this.qPitch.setFromAxisAngle(this.scratchRight, pitch);
 
       this.offset.applyQuaternion(this.qYaw);
@@ -355,11 +387,9 @@ export class CameraSystem {
     }
 
     // -----------------------------------------------------------------------
-    // Auto-dolly (idle fly out first, then in, repeating)
+    // Auto-dolly (distance breathing)
     // -----------------------------------------------------------------------
     if (autoDollyActive) {
-      // On activation: start EXACTLY at current distance (no jump)
-      // and ALWAYS move outward first (toward far).
       if (!this.autoDollyWasActive) {
         this.autoDollyTime = 0;
 
@@ -369,7 +399,6 @@ export class CameraSystem {
           Math.max(this.options.minDistance, currentDist),
         );
 
-        // Precompute first-leg duration so velocity feels consistent even if we start mid-span.
         const nearDistRaw = this.options.autoDollyNearDistance;
         const farDistRaw = this.options.autoDollyFarDistance;
 
@@ -385,11 +414,9 @@ export class CameraSystem {
         const baseSpan = Math.max(1e-6, Math.abs(farDist - nearDist));
         const firstSpan = Math.abs(farDist - this.autoDollyStartDistance);
 
-        // Scale first leg time proportionally so speed doesn't change.
         const secondsPerLeg = Math.max(0.1, this.options.autoDollySecondsPerLeg);
         this.autoDollyFirstLegSeconds = secondsPerLeg * (firstSpan / baseSpan);
 
-        // If we're essentially already at far, skip the first leg.
         if (this.autoDollyFirstLegSeconds < 1e-3) {
           this.autoDollyFirstLegSeconds = 0;
         }
@@ -411,56 +438,44 @@ export class CameraSystem {
         Math.max(this.options.minDistance, farDistRaw),
       );
 
-      // Easing curve for serene turning at the endpoints.
-      // Smoothstep: 3t^2 - 2t^3 (C1 continuous, no jolty corner)
       const ease = (t: number): number => t * t * (3 - 2 * t);
 
       let targetDist = this.offset.length();
 
-      // Leg 0: start -> far (outward first)
       if (this.autoDollyFirstLegSeconds > 0 && this.autoDollyTime < this.autoDollyFirstLegSeconds) {
-        const t = this.autoDollyTime / this.autoDollyFirstLegSeconds; // 0..1
+        const t = this.autoDollyTime / this.autoDollyFirstLegSeconds;
         targetDist = THREE.MathUtils.lerp(
           this.autoDollyStartDistance,
           farDist,
           ease(THREE.MathUtils.clamp(t, 0, 1)),
         );
       } else {
-        // After leg 0, continue with repeating legs of fixed duration:
-        // leg 1: far -> near
-        // leg 2: near -> far
-        // ...
         const tAfter = this.autoDollyTime - this.autoDollyFirstLegSeconds;
         const leg = Math.floor(tAfter / secondsPerLeg);
-        const tLeg = (tAfter % secondsPerLeg) / secondsPerLeg; // 0..1
+        const tLeg = (tAfter % secondsPerLeg) / secondsPerLeg;
         const t = ease(THREE.MathUtils.clamp(tLeg, 0, 1));
 
         targetDist =
           leg % 2 === 0
-            ? THREE.MathUtils.lerp(farDist, nearDist, t) // leg 0 here == far->near
-            : THREE.MathUtils.lerp(nearDist, farDist, t); // leg 1 here == near->far
+            ? THREE.MathUtils.lerp(farDist, nearDist, t)
+            : THREE.MathUtils.lerp(nearDist, farDist, t);
       }
 
       this.offset.setLength(targetDist);
     }
 
     // -----------------------------------------------------------------------
-    // Zoom (distance)
+    // Zoom (distance) from input scale
     // -----------------------------------------------------------------------
     let dist = this.offset.length();
 
-    // Apply dolly scale only if it actually moved this frame.
     if (Math.abs(this.scale - 1) > 1e-6) {
       dist *= this.scale;
-      dist = Math.min(this.options.maxDistance, Math.max(this.options.minDistance, dist));
-      this.offset.setLength(dist);
-    } else {
-      // Still ensure distance clamps (in case options changed)
-      dist = Math.min(this.options.maxDistance, Math.max(this.options.minDistance, dist));
-      this.offset.setLength(dist);
     }
 
-    // Track whether dolly was active last frame (for clean enter/exit)
+    dist = Math.min(this.options.maxDistance, Math.max(this.options.minDistance, dist));
+    this.offset.setLength(dist);
+
     this.autoDollyWasActive = autoDollyActive;
     if (!autoDollyActive) {
       this.autoDollyTime = 0;
@@ -471,7 +486,6 @@ export class CameraSystem {
     this.camera.position.copy(this.target).add(this.offset);
     this.camera.lookAt(this.target);
 
-    // Telemetry
     this.emitTelemetry();
 
     // Damping/reset
@@ -484,49 +498,79 @@ export class CameraSystem {
       this.scale = 1;
     }
 
-    // Clear per-frame input flag.
     this.hadUserInputThisFrame = false;
   }
 
   public getTelemetry(): CameraTelemetry {
+    const s = new THREE.Spherical().setFromVector3(this.offset);
     return {
       position: this.camera.position.clone(),
       target: this.target.clone(),
       distance: this.offset.length(),
-      azimuthAngle: new THREE.Spherical().setFromVector3(this.offset).theta,
-      polarAngle: new THREE.Spherical().setFromVector3(this.offset).phi,
+      azimuthAngle: s.theta,
+      polarAngle: s.phi,
     };
   }
 
   // ---------------------------------------------------------------------------
-  // Internal wiring
+  // Bus wiring
   // ---------------------------------------------------------------------------
 
   private registerBusHandlers(): void {
-    this.bus.on("camera:set-target", (payload: { x: number; y: number; z: number }) => {
-      this.setTarget(new THREE.Vector3(payload.x, payload.y, payload.z));
-    });
-
     this.bus.on("camera:set-rig-options", (payload: Partial<CameraRigOptions>) => {
       this.setOptions(payload);
     });
+
+    this.bus.on<CameraSetOrbitPayload>("camera:set-orbit", (payload) => {
+      this.setOrbitInstant(payload);
+    });
   }
 
-  /**
-   * Only used when polarConstraintMode === "clamp".
-   * This intentionally reintroduces a “gate” relative to WORLD UP for framed scenes.
-   */
+  // ---------------------------------------------------------------------------
+  // Orbit set (instant)
+  // ---------------------------------------------------------------------------
+
+  private setOrbitInstant(p: CameraSetOrbitPayload): void {
+    const up = p.up ?? { x: this.camera.up.x, y: this.camera.up.y, z: this.camera.up.z };
+
+    this.target.set(p.target.x, p.target.y, p.target.z);
+
+    this.scratchUpVec.set(up.x, up.y, up.z);
+    if (this.scratchUpVec.lengthSq() < 1e-10) this.scratchUpVec.set(0, 1, 0);
+    else this.scratchUpVec.normalize();
+    this.camera.up.copy(this.scratchUpVec);
+
+    const dist = Math.min(this.options.maxDistance, Math.max(this.options.minDistance, p.distance));
+
+    this.scratchSpherical.radius = dist;
+    this.scratchSpherical.theta = p.theta;
+    this.scratchSpherical.phi = p.phi;
+    this.scratchSpherical.makeSafe();
+
+    this.offset.setFromSpherical(this.scratchSpherical);
+
+    if (this.options.polarConstraintMode === "clamp") {
+      this.applyWorldPolarClamp();
+    }
+
+    this.camera.position.copy(this.target).add(this.offset);
+    this.camera.lookAt(this.target);
+
+    this.rotateDelta.set(0, 0);
+    this.scale = 1;
+
+    this.idleSeconds = 0;
+    this.autoDollyWasActive = false;
+    this.hadUserInputThisFrame = false;
+  }
+
   private applyWorldPolarClamp(): void {
     const s = new THREE.Spherical().setFromVector3(this.offset);
 
     s.makeSafe();
     s.phi = Math.min(this.options.maxPolarAngle, Math.max(this.options.minPolarAngle, s.phi));
 
-    // Rebuild offset with clamped phi while preserving theta/radius
     this.offset.setFromSpherical(s);
-
-    // In clamp mode, also stabilize camera.up so the gate behaves predictably
-    // (still doesn’t affect wrap mode).
     this.camera.up.copy(this.worldUp);
   }
 

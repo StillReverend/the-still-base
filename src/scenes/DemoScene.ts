@@ -1,5 +1,9 @@
 // src/scenes/DemoScene.ts
-// (Only changes are in the ritual handlers + initial star setup logic.)
+// (Updated:
+//  - CORE return now uses CameraDirector "flyTo" (no more fade+snap feel).
+//  - Adds simple "current orbit target" guard so you cannot re-click the SAME target you're already orbiting.
+//  - Adds targetId hints into camera:play params (Director can optionally use these now / later).
+//  - Fixes a stray `{0` typo in buildConstellations signature.)
 
 import * as THREE from "three";
 
@@ -16,6 +20,10 @@ import { ConstellationSystem } from "../systems/ConstellationSystem";
 
 type RitualProgressPayload = {
   progress01?: number;
+};
+
+type InteractionClickPayload = {
+  object: THREE.Object3D;
 };
 
 export class DemoScene implements SceneController {
@@ -44,6 +52,23 @@ export class DemoScene implements SceneController {
   private regionDebugRoot: THREE.Object3D | null = null;
   private regionDebugDisposables: Array<THREE.BufferGeometry | THREE.Material> = [];
 
+  // Cached list of what we told InteractionSystem to raycast
+  private pickables: THREE.Object3D[] = [];
+
+  // ---------------------------------------------------------------------------
+  // Orbit target guard (prevents re-clicking the thing you're already orbiting)
+  // ---------------------------------------------------------------------------
+
+  private currentOrbitTargetId: string | null = null;
+
+  private setCurrentOrbitTarget(id: string | null): void {
+    this.currentOrbitTargetId = id;
+  }
+
+  private isCurrentOrbitTarget(id: string): boolean {
+    return this.currentOrbitTargetId === id;
+  }
+
   private onToggleRegions = (): void => {
     if (!this.regionDebugRoot) return;
     this.regionDebugRoot.visible = !this.regionDebugRoot.visible;
@@ -70,9 +95,6 @@ export class DemoScene implements SceneController {
     this.core.clearBlackHoleOverride();
   };
 
-  private lastUiHoverAt = 0;
-  private readonly uiHoverCooldownMs = 140;
-
   // ----------------------------------------------------------
   // Ritual -> Stars
   // ----------------------------------------------------------
@@ -80,27 +102,23 @@ export class DemoScene implements SceneController {
   private onRitualProgress = (p: RitualProgressPayload): void => {
     if (!this.starSystem) return;
     const v = typeof p?.progress01 === "number" ? p.progress01 : 0;
-    // Drive the “external lane” continuously during the hold.
     this.starSystem.setNearRevealTarget01(v);
   };
 
   private onRitualCancelled = (): void => {
     if (!this.starSystem) return;
-    // Cancel means: let near go dark again (unless audio is playing).
     this.starSystem.setNearRevealTarget01(0.0);
   };
 
   private onRitualCompleted = (): void => {
     if (!this.starSystem) return;
 
-    // Momentary full bright (external lane), then it will decay automatically
-    // unless audio is playing and driving the breathing.
     this.starSystem.setNearRevealTarget01(1.0);
 
     this.starSystem.triggerRadialPulse({
       speed: 1400,
       width: 1031,
-      strength: 1.50,
+      strength: 1.5,
     });
   };
 
@@ -115,44 +133,33 @@ export class DemoScene implements SceneController {
       high: f.high,
     });
 
-    // This is the key switch: no audio playing => near stars fully dark (unless ritual drives them)
     this.starSystem.setAudioPlaying(Boolean(p?.isPlaying));
   };
 
   // ----------------------------------------------------------
-  // Pointer -> Constellations
+  // InteractionSystem -> Core + Constellations
   // ----------------------------------------------------------
 
-  private onPointerDown = (e: PointerEvent): void => {
-    if (!this.ctx || !this.constellationSystem) return;
+  private onInteractionClick = (p: InteractionClickPayload): void => {
+    const obj = p?.object;
+    if (!obj) return;
 
-    // NDC coords (-1..+1)
-    const rect = this.ctx.renderer.domElement.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+    // 1) Core click => return to orbiting the CORE
+    if (this.core) {
+      const coreRoot = this.core.getRoot();
+      if (this.isDescendantOf(obj, coreRoot)) {
+        // Guard: already orbiting CORE => ignore (reserved for future puzzle clicks on CORE)
+        if (this.isCurrentOrbitTarget("CORE")) return;
 
-    const hit = this.constellationSystem.handlePointerDown(x, y);
-    if (hit) {
-      this.ctx.bus.emit("ui:click", { kind: "click" });
+        this.focusCore();
+        return;
+      }
     }
 
-  };
-
-  private onPointerMove = (e: PointerEvent): void => {
-    if (!this.ctx || !this.constellationSystem) return;
-
-    const rect = this.ctx.renderer.domElement.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
-
-    const entered = this.constellationSystem.handlePointerMove(x, y);
-    if (!entered) return;
-
-    const now = performance.now();
-    if (now - this.lastUiHoverAt < this.uiHoverCooldownMs) return;
-    this.lastUiHoverAt = now;
-
-    this.ctx.bus.emit("ui:hover", { kind: "hover" });
+    // 2) Otherwise, hand off to Constellations (if present)
+    if (this.constellationSystem) {
+      this.constellationSystem.handlePickObject(obj);
+    }
   };
 
   public init(ctx: SceneContext): void {
@@ -172,9 +179,9 @@ export class DemoScene implements SceneController {
     this.buildConstellations(ctx);
     this.buildGsapProofPulse();
 
-    // Scene-local click handling (focusable objects)
-    ctx.renderer.domElement.addEventListener("pointerdown", this.onPointerDown);
-    ctx.renderer.domElement.addEventListener("pointermove", this.onPointerMove);
+    // Interaction wiring (no DOM listeners in scenes)
+    this.rebuildPickables();
+    ctx.bus.on("interaction:click", this.onInteractionClick);
 
     ctx.bus.on("audio:frame", this.onAudioFrame);
 
@@ -226,6 +233,12 @@ export class DemoScene implements SceneController {
     this.rimLight = new THREE.DirectionalLight(0x6fa9ff, 0.7);
     this.rimLight.position.set(-5, -3, -7);
     this.rimLight.castShadow = false;
+
+    // Keeping existing behavior unchanged (not added).
+    // If you want them active, uncomment:
+    // this.scene.add(this.ambientLight);
+    // this.scene.add(this.keyLight);
+    // this.scene.add(this.rimLight);
   }
 
   private buildCoreAndClock(ctx: SceneContext): void {
@@ -261,11 +274,9 @@ export class DemoScene implements SceneController {
       nearOuterRadius: 8000,
       nearSize: 1.2,
 
-      // IMPORTANT: start at 0 so no NEAR stars show until audio or ritual
       nearReveal01: 0.0,
     });
 
-    // Default to cosmic sphere shockwave (you preferred “all directions”)
     this.starSystem.setPulseMode("sphere");
   }
 
@@ -273,12 +284,9 @@ export class DemoScene implements SceneController {
     if (!this.core) return;
 
     const coreRoot = this.core.getRoot();
-
-    // Scaffold: warm core identity color. Later this can be pulled from CoreSystem phase/state.
     const coreColor = new THREE.Color(0xffb14a);
 
     // Orbit distance when focused on a constellation.
-    // Goal: allow seeing Core in the distance sometimes.
     const constellationOrbitDistance = 220;
 
     this.constellationSystem = new ConstellationSystem({
@@ -287,24 +295,43 @@ export class DemoScene implements SceneController {
       coreObject: coreRoot,
       coreColor,
 
-      // Placement ring (clock positions)
       ringRadius: 5000,
-      orbRadius: 100,
+      orbRadius: 31,
       y: 0,
 
-      // Align index 0 to "12 o'clock" (tune depending on your world forward)
       angleOffsetRad: Math.PI * 0.5,
 
-      // Click-to-focus: clicked orb becomes new orbit target (fly-to comes later).
       onFocusRequest: (req) => {
-        const pos = req.position;
+        const pos = (req as any)?.position as THREE.Vector3 | undefined;
+        if (!pos) return;
 
-        ctx.bus.emit("camera:set-orbit", {
-          target: { x: pos.x, y: pos.y, z: pos.z },
-          distance: constellationOrbitDistance,
-          theta: 0.0,
-          phi: 0.0001,
-          up: { x: 0, y: 0, z: 1 },
+        // Best-effort stable ID (supports future puzzle clicks)
+        const rawId =
+          (req as any)?.id ??
+          (req as any)?.orbId ??
+          (req as any)?.name ??
+          (req as any)?.key ??
+          "unknown";
+        const targetId = `CONSTELLATION:${String(rawId)}`;
+
+        // Guard: already orbiting this constellation => ignore (reserved for puzzle clicks)
+        if (this.isCurrentOrbitTarget(targetId)) return;
+
+        this.setCurrentOrbitTarget(targetId);
+
+        // Use the Director's "flyTo" for interaction navigation (feels natural).
+        ctx.bus.emit("camera:play", {
+          name: "flyTo",
+          params: {
+            targetId,
+            target: { x: pos.x, y: pos.y, z: pos.z },
+            distance: constellationOrbitDistance,
+            duration: 1.1,
+            ease: "power2.out",
+            up: { x: 0, y: 0, z: 1 },
+            lookLag: 0.22,
+          },
+          policy: "interrupt",
         });
       },
     });
@@ -324,18 +351,16 @@ export class DemoScene implements SceneController {
     m.name = "GSAP_ProofPulse";
     m.position.set(0, 120, 0);
 
-    // Start small so the pulse is obvious.
     m.scale.setScalar(0.2);
 
     this.scene.add(m);
     this.gsapProofMesh = m;
 
-    // One-shot pulse: pop in, breathe, settle.
     gsap
       .timeline()
       .to(m.scale, { x: 1.15, y: 1.15, z: 1.15, duration: 0.28, ease: "power2.out" })
       .to(m.scale, { x: 0.85, y: 0.85, z: 0.85, duration: 0.22, ease: "power2.inOut" })
-      .to(m.scale, { x: 1.0, y: 1.0, z: 1.0, duration: 0.30, ease: "power2.out" });
+      .to(m.scale, { x: 1.0, y: 1.0, z: 1.0, duration: 0.3, ease: "power2.out" });
   }
 
   private configureCamera(ctx: SceneContext): void {
@@ -348,6 +373,9 @@ export class DemoScene implements SceneController {
     const target = new THREE.Vector3(0, 0, 0);
     if (this.clockFace) this.clockFace.getWorldPosition(target);
 
+    // Initial pose is CORE orbit.
+    this.setCurrentOrbitTarget("CORE");
+
     ctx.bus.emit("camera:set-orbit", {
       target: { x: target.x, y: target.y, z: target.z },
       distance,
@@ -355,6 +383,80 @@ export class DemoScene implements SceneController {
       phi,
       up,
     });
+  }
+
+  // ----------------------------------------------------------
+  // CORE focus helper
+  // ----------------------------------------------------------
+
+  private focusCore(): void {
+    if (!this.ctx) return;
+
+    const distance = 490;
+    const up = { x: 0, y: 0, z: 1 };
+
+    const target = new THREE.Vector3(0, 0, 0);
+    if (this.clockFace) this.clockFace.getWorldPosition(target);
+
+    // Mark current orbit target immediately (prevents double-click spam during flight).
+    this.setCurrentOrbitTarget("CORE");
+
+    // IMPORTANT:
+    // Use "flyTo" for CORE return so you ALWAYS see the travel motion.
+    // (ArcTo is fine for ceremonial return later, but right now it is getting "visually bypassed"
+    // in your current flow when coming from constellation focus.)
+    this.ctx.bus.emit("camera:play", {
+      name: "flyTo",
+      params: {
+        targetId: "CORE",
+        target: { x: target.x, y: target.y, z: target.z },
+        distance,
+        duration: 1.05,
+        ease: "power2.out",
+        up,
+        lookLag: 0.22,
+      },
+      policy: "interrupt",
+    });
+  }
+
+  // ----------------------------------------------------------
+  // Pickables assembly
+  // ----------------------------------------------------------
+
+  private rebuildPickables(): void {
+    if (!this.ctx) return;
+
+    const objects: THREE.Object3D[] = [];
+
+    // Constellation orbs
+    if (this.constellationSystem) {
+      const picks = this.constellationSystem.getPickableObjects();
+      if (Array.isArray(picks)) objects.push(...picks);
+    }
+
+    // CORE: add ALL meshes under the core root so we don't depend on recursive raycast.
+    if (this.core) {
+      const coreRoot = this.core.getRoot();
+      coreRoot.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) objects.push(o);
+      });
+    }
+
+    this.pickables = objects;
+
+    this.ctx.bus.emit("interaction:pickables:set", {
+      objects: this.pickables,
+    });
+  }
+
+  private isDescendantOf(obj: THREE.Object3D, root: THREE.Object3D): boolean {
+    let cur: THREE.Object3D | null = obj;
+    while (cur) {
+      if (cur === root) return true;
+      cur = cur.parent;
+    }
+    return false;
   }
 
   // (Region overlay code unchanged)
@@ -451,7 +553,9 @@ export class DemoScene implements SceneController {
     this.regionDebugRoot = root;
 
     // eslint-disable-next-line no-console
-    console.log(`[DemoScene] Region overlay enabled. SystemRadius=${systemRadius}, UniverseRadius=${universeRadius}`);
+    console.log(
+      `[DemoScene] Region overlay enabled. SystemRadius=${systemRadius}, UniverseRadius=${universeRadius}`,
+    );
   }
 
   public update(delta: number): void {
@@ -482,11 +586,6 @@ export class DemoScene implements SceneController {
       console.log("[DemoScene] dispose");
     }
 
-    if (this.ctx) {
-      this.ctx.renderer.domElement.removeEventListener("pointerdown", this.onPointerDown);
-      this.ctx.renderer.domElement.removeEventListener("pointermove", this.onPointerMove);
-    }
-
     if (this.regionDebugRoot) {
       if (this.clockFace) this.clockFace.remove(this.regionDebugRoot);
       else this.scene.remove(this.regionDebugRoot);
@@ -501,7 +600,15 @@ export class DemoScene implements SceneController {
       this.ctx.bus.off("ritual:core:progress", this.onRitualProgress);
       this.ctx.bus.off("ritual:core:cancelled", this.onRitualCancelled);
       this.ctx.bus.off("ritual:core:completed", this.onRitualCompleted);
+
+      this.ctx.bus.off("interaction:click", this.onInteractionClick);
+
+      // Clear pickables so InteractionSystem doesn't raycast stale objects after scene swap.
+      this.ctx.bus.emit("interaction:pickables:set", { objects: [] });
     }
+
+    this.pickables = [];
+    this.currentOrbitTargetId = null;
 
     if (this.constellationSystem) {
       this.constellationSystem.dispose();

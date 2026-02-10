@@ -183,6 +183,7 @@ export class HowlerAudioSystem {
 
   private playSfx(id: string, url: string, volume01: number): void {
     if (this.state.isMuted) return;
+    if (!this.state.isUnlocked) return;
 
     const vol = clamp01(volume01);
     const howl = this.getOrCreateHowl(id, url, { loop: false, volume: vol });

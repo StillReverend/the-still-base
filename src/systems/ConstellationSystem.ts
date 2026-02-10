@@ -1,3 +1,4 @@
+// src/systems/ConstellationSystem.ts
 // ============================================================
 // THE STILL — ConstellationSystem (Scaffold)
 // ------------------------------------------------------------
@@ -5,7 +6,8 @@
 //  - Spawn 12 Constellation Orbs in a clock ring around the Core.
 //  - Render a bi-tapered filament Core <-> Orb with Core->Orb color gradient.
 //  - Provide picking (raycast) for orbs.
-//  - Request camera focus/fly-to on click (integration via callback).
+//  - Request camera focus on click (integration via callback).
+//  - Expose pickables + object-based pick handling for InteractionSystem.
 // ============================================================
 
 import * as THREE from "three";
@@ -34,9 +36,9 @@ export type ConstellationSystemParams = {
   coreColor: THREE.Color;
 
   // Layout
-  ringRadius: number;   // distance from core to orbs
-  orbRadius: number;    // orb sphere radius
-  y: number;            // ring plane height (0 = centered)
+  ringRadius: number; // distance from core to orbs
+  orbRadius: number; // orb sphere radius
+  y: number; // ring plane height (0 = centered)
 
   // Clock alignment (so “12 o’clock” faces where you want)
   angleOffsetRad?: number;
@@ -45,11 +47,11 @@ export type ConstellationSystemParams = {
   onFocusRequest?: (req: ConstellationFocusRequest) => void;
 };
 
-function clamp01(x: number) {
+function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
 }
 
-function smoothstep(edge0: number, edge1: number, x: number) {
+function smoothstep(edge0: number, edge1: number, x: number): number {
   const t = clamp01((x - edge0) / (edge1 - edge0));
   return t * t * (3 - 2 * t);
 }
@@ -68,13 +70,19 @@ class FilamentRibbon {
   private readonly segments: number;
   private readonly positions: Float32Array;
   private readonly sides: Float32Array; // -1..+1 for edge feather
-  private readonly ts: Float32Array;    // 0..1 along length
+  private readonly ts: Float32Array; // 0..1 along length
 
   private readonly geo: THREE.BufferGeometry;
   private readonly mat: THREE.ShaderMaterial;
 
   private _start = new THREE.Vector3();
   private _end = new THREE.Vector3();
+
+  // scratch (avoid per-frame allocations)
+  private readonly dir = new THREE.Vector3();
+  private readonly camForward = new THREE.Vector3();
+  private readonly right = new THREE.Vector3();
+  private readonly P = new THREE.Vector3();
 
   constructor(params: {
     segments?: number;
@@ -86,8 +94,6 @@ class FilamentRibbon {
   }) {
     this.segments = params.segments ?? 32;
 
-    // Vertex layout: for each segment step i (0..segments),
-    // we create two vertices: left/right side of ribbon.
     const rows = this.segments + 1;
     const vertCount = rows * 2;
 
@@ -95,24 +101,20 @@ class FilamentRibbon {
     this.sides = new Float32Array(vertCount);
     this.ts = new Float32Array(vertCount);
 
-    // Indices for triangle strip
     const indexCount = this.segments * 6;
     const indices = new Uint32Array(indexCount);
 
     let v = 0;
     for (let i = 0; i < rows; i++) {
-      // left vertex
       this.sides[v] = -1;
       this.ts[v] = i / this.segments;
       v++;
 
-      // right vertex
       this.sides[v] = +1;
       this.ts[v] = i / this.segments;
       v++;
     }
 
-    // triangles
     let idx = 0;
     for (let i = 0; i < this.segments; i++) {
       const a = i * 2 + 0;
@@ -143,36 +145,19 @@ class FilamentRibbon {
       uniforms: {
         uCoreColor: { value: params.coreColor.clone() },
         uOrbColor: { value: params.orbColor.clone() },
-        uThickEnd: { value: params.thickEnd },
-        uThinMid: { value: params.thinMid },
-        uShapeK: { value: 2.2 }, // higher = “fatter ends”
         uIntensity: { value: params.intensity ?? 1.0 },
         uTime: { value: 0.0 },
       },
       vertexShader: /* glsl */ `
-        uniform float uThickEnd;
-        uniform float uThinMid;
-        uniform float uShapeK;
-        uniform float uTime;
-
         attribute float aSide; // -1..+1
         attribute float aT;    // 0..1
 
         varying float vSide;
         varying float vT;
 
-        // Hourglass width: thick at both ends, thin in middle
-        float widthProfile(float t) {
-          float endWeight = abs(2.0 * t - 1.0); // 1 at ends, 0 mid
-          float shaped = pow(endWeight, uShapeK);
-          return mix(uThinMid, uThickEnd, shaped);
-        }
-
         void main() {
           vSide = aSide;
           vT = aT;
-
-          // Positions are written CPU-side each frame (already billboarded).
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
         }
       `,
@@ -186,19 +171,14 @@ class FilamentRibbon {
         varying float vT;
 
         void main() {
-          // Color gradient along length
           vec3 col = mix(uCoreColor, uOrbColor, vT);
 
-          // Soft edge feather across width
           float edge = 1.0 - smoothstep(0.65, 1.0, abs(vSide));
-
-          // Slight along-length shaping (keeps center a little “charged”)
-          float center = 1.0 - abs(2.0 * vT - 1.0); // 0 ends, 1 mid
+          float center = 1.0 - abs(2.0 * vT - 1.0);
           float glow = 0.65 + 0.35 * pow(center, 0.8);
 
           float alpha = edge * glow * uIntensity;
 
-          // Tiny shimmer (very subtle)
           float shimmer = 0.92 + 0.08 * sin(uTime * 1.7 + vT * 12.0);
           vec3 outCol = col * shimmer;
 
@@ -211,79 +191,63 @@ class FilamentRibbon {
     this.mesh.frustumCulled = false;
   }
 
-  setColors(coreColor: THREE.Color, orbColor: THREE.Color) {
+  setColors(coreColor: THREE.Color, orbColor: THREE.Color): void {
     this.mat.uniforms.uCoreColor.value.copy(coreColor);
     this.mat.uniforms.uOrbColor.value.copy(orbColor);
   }
 
-  setEndpoints(start: THREE.Vector3, end: THREE.Vector3) {
+  setEndpoints(start: THREE.Vector3, end: THREE.Vector3): void {
     this._start.copy(start);
     this._end.copy(end);
   }
 
-  update(dt: number, camera: THREE.Camera) {
+  update(dt: number, camera: THREE.Camera, thickEnd: number, thinMid: number): void {
     this.mat.uniforms.uTime.value += dt;
 
-    // Build billboarded ribbon CPU-side so we can control width profile precisely.
-    // We compute a “right” vector perpendicular to (A->B) and camera forward.
     const A = this._start;
     const B = this._end;
 
-    const dir = new THREE.Vector3().subVectors(B, A);
-    const len = dir.length();
+    this.dir.subVectors(B, A);
+    const len = this.dir.length();
     if (len < 0.0001) return;
-    dir.multiplyScalar(1 / len);
+    this.dir.multiplyScalar(1 / len);
 
-    // camera forward (world)
-    const camForward = new THREE.Vector3();
-    camera.getWorldDirection(camForward);
+    camera.getWorldDirection(this.camForward);
 
-    // right = normalize(dir x camForward)
-    const right = new THREE.Vector3().crossVectors(dir, camForward);
-    const rLen = right.length();
-    if (rLen < 0.0001) {
-      // fallback: pick any stable axis
-      right.set(1, 0, 0);
-    } else {
-      right.multiplyScalar(1 / rLen);
-    }
+    this.right.crossVectors(this.dir, this.camForward);
+    const rLen = this.right.length();
+    if (rLen < 0.0001) this.right.set(1, 0, 0);
+    else this.right.multiplyScalar(1 / rLen);
 
-    const thickEnd = this.mat.uniforms.uThickEnd.value as number;
-    const thinMid = this.mat.uniforms.uThinMid.value as number;
     const shapeK = 2.2;
-
     const rows = this.segments + 1;
-    let p = 0;
 
+    let p = 0;
     for (let i = 0; i < rows; i++) {
       const t = i / this.segments;
 
-      // Hourglass width in world units
       const endWeight = Math.abs(2 * t - 1);
       const shaped = Math.pow(endWeight, shapeK);
       const w = thinMid + (thickEnd - thinMid) * shaped;
 
-      // point along the segment
-      const P = new THREE.Vector3().lerpVectors(A, B, t);
+      this.P.lerpVectors(A, B, t);
 
-      // left/right verts
-      const L = new THREE.Vector3().copy(P).addScaledVector(right, -w);
-      const R = new THREE.Vector3().copy(P).addScaledVector(right, +w);
+      // left
+      this.positions[p++] = this.P.x - this.right.x * w;
+      this.positions[p++] = this.P.y - this.right.y * w;
+      this.positions[p++] = this.P.z - this.right.z * w;
 
-      this.positions[p++] = L.x;
-      this.positions[p++] = L.y;
-      this.positions[p++] = L.z;
-
-      this.positions[p++] = R.x;
-      this.positions[p++] = R.y;
-      this.positions[p++] = R.z;
+      // right
+      this.positions[p++] = this.P.x + this.right.x * w;
+      this.positions[p++] = this.P.y + this.right.y * w;
+      this.positions[p++] = this.P.z + this.right.z * w;
     }
 
     (this.geo.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
     this.geo.computeBoundingSphere();
   }
 
-  dispose() {
+  dispose(): void {
     this.geo.dispose();
     this.mat.dispose();
   }
@@ -310,12 +274,12 @@ export class ConstellationSystem {
   private hoveredId: number | null = null;
 
   // scratch
-  private _vA = new THREE.Vector3();
-  private _vB = new THREE.Vector3();
-  
-  private _dir = new THREE.Vector3();
-  private _start = new THREE.Vector3();
-  private _end = new THREE.Vector3();
+  private readonly vA = new THREE.Vector3();
+  private readonly vB = new THREE.Vector3();
+  private readonly dir = new THREE.Vector3();
+  private readonly start = new THREE.Vector3();
+  private readonly end = new THREE.Vector3();
+  private readonly pickWorldPos = new THREE.Vector3();
 
   constructor(params: ConstellationSystemParams) {
     this.scene = params.scene;
@@ -333,21 +297,38 @@ export class ConstellationSystem {
     this.buildOrbs();
   }
 
-  private buildOrbs() {
-    // 12 unique colors (placeholder palette; you’ll likely tune later)
+  getPickableObjects(): THREE.Object3D[] {
+    return this.orbs.map((o) => o.mesh);
+  }
+
+  handlePickObject(object: THREE.Object3D): boolean {
+    const id = object?.userData?.constellationId;
+    if (typeof id !== "number") return false;
+
+    const orb = this.orbs.find((o) => o.id === id);
+    if (!orb) return false;
+
+    const pos = orb.mesh.getWorldPosition(this.pickWorldPos);
+
+    this.onFocusRequest?.({
+      id,
+      object: orb.mesh,
+      position: pos.clone(),
+    });
+
+    return true;
+  }
+
+  private buildOrbs(): void {
     const palette = [
-      0x40c9ff, 0x7a5cff, 0xff4fd8, 0xff5a3c,
-      0xffb74a, 0x9bff57, 0x2dffcc, 0x2aa9ff,
-      0x7ef0ff, 0xa779ff, 0xff79b0, 0xffd36e,
+      0x40c9ff, 0x7a5cff, 0xff4fd8, 0xff5a3c, 0xffb74a, 0x9bff57, 0x2dffcc, 0x2aa9ff, 0x7ef0ff,
+      0xa779ff, 0xff79b0, 0xffd36e,
     ].map((hex) => new THREE.Color(hex));
 
     for (let i = 0; i < 12; i++) {
       const color = palette[i % palette.length].clone();
 
-      // Orb mesh
       const geo = new THREE.SphereGeometry(this.orbRadius, 32, 24);
-
-      // Dormant “halo” look: transparent + additive rim feel (simple scaffold material)
       const mat = new THREE.MeshBasicMaterial({
         color,
         transparent: true,
@@ -360,19 +341,13 @@ export class ConstellationSystem {
       mesh.name = `ConstellationOrb_${i}`;
       mesh.userData.constellationId = i;
 
-      // Clock ring position in XZ plane at height y
       const t = i / 12;
       const a = t * Math.PI * 2 + this.angleOffsetRad;
 
-      mesh.position.set(
-        Math.cos(a) * this.ringRadius,
-        this.y,
-        Math.sin(a) * this.ringRadius
-      );
+      mesh.position.set(Math.cos(a) * this.ringRadius, this.y, Math.sin(a) * this.ringRadius);
 
       this.scene.add(mesh);
 
-      // Filament
       const filament = new FilamentRibbon({
         segments: 36,
         thickEnd: this.orbRadius * 0.55,
@@ -388,35 +363,24 @@ export class ConstellationSystem {
     }
   }
 
-  /** Call this from your pointer handler (normalized device coords). Returns true if hit. */
+  /** Legacy: Call this from your pointer handler (normalized device coords). Returns true if hit. */
   handlePointerDown(ndcX: number, ndcY: number): boolean {
     this.ndc.set(ndcX, ndcY);
     this.raycaster.setFromCamera(this.ndc, this.camera);
 
     const hits = this.raycaster.intersectObjects(
       this.orbs.map((o) => o.mesh),
-      false
+      false,
     );
 
     if (!hits.length) return false;
 
     const hit = hits[0].object as THREE.Object3D;
-    const id = hit.userData.constellationId as number;
-
-    const orb = this.orbs.find((o) => o.id === id);
-    if (!orb) return false;
-
-    this.onFocusRequest?.({
-      id,
-      object: orb.mesh,
-      position: orb.mesh.getWorldPosition(new THREE.Vector3()),
-    });
-
-    return true;
+    return this.handlePickObject(hit);
   }
 
   /**
-   * Pointer hover support. Returns true only when hover ENTERS a valid orb
+   * Legacy: Pointer hover support. Returns true only when hover ENTERS a valid orb
    * (i.e., hover changes from null/other -> some orb).
    */
   handlePointerMove(ndcX: number, ndcY: number): boolean {
@@ -425,7 +389,7 @@ export class ConstellationSystem {
 
     const hits = this.raycaster.intersectObjects(
       this.orbs.map((o) => o.mesh),
-      false
+      false,
     );
 
     if (!hits.length) {
@@ -442,26 +406,26 @@ export class ConstellationSystem {
     return true;
   }
 
-  update(dt: number) {
-    // Update filaments each frame so they face camera and stay connected.
-    const corePos = this.coreObject.getWorldPosition(this._vA);
+  update(dt: number): void {
+    const corePos = this.coreObject.getWorldPosition(this.vA);
 
     for (const orb of this.orbs) {
-      const orbPos = orb.mesh.getWorldPosition(this._vB);
+      const orbPos = orb.mesh.getWorldPosition(this.vB);
 
-      // Endpoint padding so the filament “connects” to the surfaces, not centers.
-      const dir = this._dir.subVectors(orbPos, corePos).normalize();
+      this.dir.subVectors(orbPos, corePos).normalize();
 
-      const start = this._start.copy(corePos).addScaledVector(dir, 1.0); // tweak later
-      const end = this._end.copy(orbPos).addScaledVector(dir, -this.orbRadius * 0.9);
+      const start = this.start.copy(corePos).addScaledVector(this.dir, 1.0);
+      const end = this.end.copy(orbPos).addScaledVector(this.dir, -this.orbRadius * 0.9);
 
       orb.filament.setColors(this.coreColor, orb.color);
       orb.filament.setEndpoints(start, end);
-      //orb.filament.update(dt, this.camera);
+
+      // If you want the filament visible, enable this line (left off to preserve current behavior)
+      // orb.filament.update(dt, this.camera, this.orbRadius * 0.55, this.orbRadius * 0.12);
     }
   }
 
-  dispose() {
+  dispose(): void {
     for (const orb of this.orbs) {
       (orb.mesh.geometry as THREE.BufferGeometry).dispose();
       (orb.mesh.material as THREE.Material).dispose();
