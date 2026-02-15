@@ -24,36 +24,11 @@
 import type { EventBus } from "../core/EventBus";
 import type { PersistenceSystem, RepeatMode } from "./PersistenceSystem";
 
+// ✅ Single canonical contract for audio:state payload.state
+// (Harmony consumes this via EventBus only; no runtime coupling required.)
+import type { AudioSystemState } from "./harmony/types";
+
 export type AudioFadeReason = "gate" | "user" | "system";
-
-export type AudioSystemState = {
-  activeTrackId: string | null;
-  isPlaying: boolean;
-
-  /** Playhead in seconds (authoritative once WebAudio is running). */
-  timeSec: number;
-
-  /** Duration (seconds) if known; null until media is decoded. */
-  durationSec: number | null;
-
-  shuffle: boolean;
-  repeat: RepeatMode;
-
-  /** User volume preference (0..1). */
-  volume: number;
-
-  /** Effective volume after fades (0..1). */
-  effectiveVolume: number;
-
-  /** True when Gate has forced silence (or other system-level mute). */
-  systemMuted: boolean;
-
-  /** Browser audio is unlocked (AudioContext is running). */
-  isUnlocked: boolean;
-
-  /** Last unlock/playback related error (dev only). */
-  lastError: string | null;
-};
 
 type FadeState = {
   active: boolean;
@@ -106,14 +81,14 @@ export class AudioSystem {
 
   private decoded: Map<string, AudioBuffer> = new Map();
 
-  // NEW: prevent duplicate preloads
+  // prevent duplicate preloads
   private durationPreloadInFlight: Promise<void> | null = null;
 
   private musicSource: AudioBufferSourceNode | null = null;
   private musicStartAtCtxTime = 0; // ctx.currentTime at start()
   private musicStartOffsetSec = 0; // offset passed into start()
 
-  // NEW: keep reference to the current decoded buffer so we can live-seek while playing
+  // keep reference to the current decoded buffer so we can live-seek while playing
   private currentMusicBuffer: AudioBuffer | null = null;
 
   // ----------------------------------------------------------
@@ -123,38 +98,34 @@ export class AudioSystem {
   private fftBins: Uint8Array | null = null;
 
   // Throttle bus emissions to avoid log spam.
-  private readonly frameHz = 30;
+  private readonly frameHz = 20;
   private lastFrameEmitCtxTime = -1;
 
-  // NEW: Throttle "audio:state" emissions while playing (UI sync)
-  private readonly stateHz = 10;
+  // Throttle "audio:state" emissions while playing (UI sync)
+  private readonly stateHz = 6;
   private lastStateEmitCtxTime = -1;
 
-  // Smoothed bands (0..1). Keeps the Core from jittering like a caffeinated firefly.
+  // Smoothed bands (0..1).
   private smoothedEnergy = 0;
   private smoothedLow = 0;
   private smoothedMid = 0;
   private smoothedHigh = 0;
 
-  // NEW: "note pop" onset (0..1)
+  // "note pop" onset (0..1)
   private smoothedOnset = 0;
   private prevRawEnergy = 0;
 
-  // NEW: onset tuning (safe defaults, easy to tweak)
-  // - onsetGain: increases sensitivity to small plucks/notes (quiet tracks)
-  // - onsetAttackHz: how fast onset rises (higher = snappier)
-  // - onsetReleaseHz: how fast onset falls (higher = shorter pop)
+  // onset tuning
   private readonly onsetGain = 14; // try 10..22
   private readonly onsetAttackHz = 80; // try 60..140
   private readonly onsetReleaseHz = 16; // try 10..28
 
   // Existing smoothing speed for bands/energy
-  private readonly bandSmoothHz = 10; // ~fast but not twitchy
+  private readonly bandSmoothHz = 10;
 
-  // NEW: peak hold (0..1) for "big moment" visuals.
-  // Use this when you want the ring to "fill" at musical peaks, even if the peak is brief.
+  // peak hold (0..1) for "big moment" visuals.
   private peakHold = 0;
-  private readonly peakDecayPerSec = 0.42; // try 0.25..0.80 (lower = longer hang)
+  private readonly peakDecayPerSec = 0.42;
 
   // ----------------------------------------------------------
   // Bus wiring
@@ -200,9 +171,6 @@ export class AudioSystem {
   // ---------------------------------------------------------------------------
 
   getState(): AudioSystemState {
-    // IMPORTANT:
-    // - This state is flat primitives, so a shallow clone is enough.
-    // - Avoid structuredClone here; it can throw if state ever gains non-cloneable fields.
     return { ...this.state };
   }
 
@@ -220,7 +188,7 @@ export class AudioSystem {
   async unlock(reason = "audio:unlock"): Promise<void> {
     if (this.state.isUnlocked) {
       this.emitState(reason);
-      // NEW: If we have an active track, preload its duration so UI can show it before Play.
+      // If we have an active track, preload its duration so UI can show it before Play.
       if (this.state.activeTrackId) {
         this.preloadDurationFor(this.state.activeTrackId, "audio:duration-preload-after-unlock");
       }
@@ -273,7 +241,7 @@ export class AudioSystem {
     this.emit("audio:set-track", { trackId });
     this.emitState(reason);
 
-    // NEW: Preload duration for the newly selected track if we're unlocked.
+    // Preload duration for the newly selected track if we're unlocked.
     if (trackId) {
       this.preloadDurationFor(trackId, "audio:duration-preload-after-setTrack");
     }
@@ -352,8 +320,6 @@ export class AudioSystem {
     this.state.timeSec = t;
 
     // If we're playing and we already have the decoded buffer, do a true live seek:
-    // stop the current AudioBufferSourceNode and start a new one at the requested offset.
-    // IMPORTANT: Do NOT call updatePlayheadFromCtxTime() here, because it would overwrite `t`.
     if (this.state.isPlaying && this.audioCtx && this.musicGain && this.currentMusicBuffer) {
       const buffer = this.currentMusicBuffer;
       const safeT = clampFinite(t, 0, Math.max(0, buffer.duration - 0.0001));
@@ -470,7 +436,7 @@ export class AudioSystem {
     if (this.state.isPlaying) {
       this.updatePlayheadFromCtxTime();
 
-      // NEW: Emit audio:state periodically so Harmony UI time advances.
+      // Emit audio:state periodically so Harmony UI time advances.
       // Uses AudioContext time for stable throttling.
       if (this.audioCtx) {
         const now = this.audioCtx.currentTime;
@@ -641,7 +607,7 @@ export class AudioSystem {
           this.emitState(reason);
         }
       } catch {
-        // If preload fails (e.g., browser restrictions), we’ll still get duration on Play.
+        // If preload fails, we’ll still get duration on Play.
       } finally {
         this.durationPreloadInFlight = null;
       }
@@ -662,6 +628,47 @@ export class AudioSystem {
         reject(e);
       }
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Track end + repeat behavior
+  // ---------------------------------------------------------------------------
+
+  private handleMusicEnded(endedBuffer: AudioBuffer): void {
+    // Mark ended
+    this.state.timeSec = endedBuffer.duration;
+    this.state.isPlaying = false;
+    this.musicSource = null;
+
+    this.emit("audio:ended", { trackId: this.state.activeTrackId });
+    this.emitState("audio:ended");
+    this.persistPlayer("audio:ended");
+
+    // Repeat behavior
+    if (this.state.systemMuted) return;
+    if (!this.state.isUnlocked) return;
+    if (!this.state.activeTrackId) return;
+
+    // NOTE:
+    // - "all" will eventually mean "advance to next track in catalog/playlist".
+    // - Until we have that catalog wiring, treat "all" as looping the current track.
+    const shouldLoop = this.state.repeat === "one" || this.state.repeat === "all";
+    if (!shouldLoop) return;
+
+    try {
+      this.state.timeSec = 0;
+      this.startMusicSource(endedBuffer, 0, "audio:repeat");
+      this.state.isPlaying = true;
+
+      this.emit("audio:repeat", { mode: this.state.repeat, trackId: this.state.activeTrackId });
+      this.emitState("audio:repeat");
+      this.persistPlayer("audio:repeat");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.state.lastError = msg;
+      this.emit("audio:repeat-failed", { message: msg });
+      this.emitState("audio:repeat-failed");
+    }
   }
 
   private startMusicSource(
@@ -687,14 +694,7 @@ export class AudioSystem {
 
     src.onended = () => {
       if (this.musicSource !== src) return;
-
-      this.state.timeSec = buffer.duration;
-      this.state.isPlaying = false;
-      this.musicSource = null;
-
-      this.emit("audio:ended", { trackId: this.state.activeTrackId });
-      this.emitState("audio:ended");
-      this.persistPlayer("audio:ended");
+      this.handleMusicEnded(buffer);
     };
 
     src.start(0, offset);
@@ -706,6 +706,7 @@ export class AudioSystem {
 
     const src = this.musicSource;
     this.musicSource = null;
+    this.currentMusicBuffer = null;
 
     try {
       src.onended = null;
@@ -758,7 +759,7 @@ export class AudioSystem {
     if (!this.fftBins) return;
     if (!this.state.isUnlocked) return;
 
-    // Throttle: ~30fps using AudioContext time (stable, monotonic)
+    // Throttle using AudioContext time (stable, monotonic)
     const now = this.audioCtx.currentTime;
     const interval = 1 / Math.max(1, this.frameHz);
 
@@ -799,24 +800,14 @@ export class AudioSystem {
     this.smoothedHigh = lerp(this.smoothedHigh, high, alpha);
     this.smoothedEnergy = lerp(this.smoothedEnergy, rawEnergy, alpha);
 
-    // --------------------------------------------------------
     // Onset (note pops)
-    // --------------------------------------------------------
-    // Positive delta emphasizes attacks; scaled to become meaningful on quiet tracks.
     const delta = Math.max(0, rawEnergy - this.prevRawEnergy);
     this.prevRawEnergy = rawEnergy;
 
-    // Gain + a tiny curve so small deltas still register
     const onsetTarget = clamp01(Math.pow(delta * this.onsetGain, 0.85));
-
-    // Attack/Release envelope (fast attack, quick-ish release)
     this.smoothedOnset = smoothAR(this.smoothedOnset, onsetTarget, this.onsetAttackHz, this.onsetReleaseHz, dt);
 
-    // --------------------------------------------------------
-    // Peak hold (for "fill the ring" moments)
-    // --------------------------------------------------------
-    // - instantly catches big peaks
-    // - decays slowly so visuals can "arrive" and linger
+    // Peak hold
     if (rawEnergy >= this.peakHold) {
       this.peakHold = rawEnergy;
     } else {
@@ -879,12 +870,7 @@ export class AudioSystem {
     this.bind("audio:toggle-request", () => this.togglePlay("audio:toggle-request"));
     this.bind("audio:seek-request", (p: { timeSec: number }) => this.seek(p?.timeSec ?? 0, "audio:seek-request"));
 
-    // --------------------------------------------------------
     // Harmony UI commands (audio:cmd:*)
-    // --------------------------------------------------------
-    // These are emitted by HarmonySystem. We translate them into
-    // AudioSystem actions without changing core AudioSystem events.
-
     this.bind("audio:cmd:togglePlay", () => this.togglePlay("audio:cmd:togglePlay"));
 
     this.bind("audio:cmd:play", () => {
@@ -907,28 +893,20 @@ export class AudioSystem {
     });
 
     // Scaffold: favorites not implemented in AudioSystem yet.
-    // We'll accept the event so nothing errors, but do nothing for now.
     this.bind("audio:cmd:toggleFavorite", (_p: { trackId: string }) => {
       // TODO (Harmony Phase 1.5): wire to PersistenceSystem favorites store
     });
 
-    this.bind("audio:seek-nudge", (p: { deltaSec: number }) => {
-      const d = Number.isFinite(p?.deltaSec) ? p.deltaSec : 0;
-      this.seek(this.state.timeSec + d, "audio:seek-nudge");
-    });
+    this.bind("audio:set-volume", (p: { volume: number }) => this.setVolume(p?.volume ?? this.state.volume, "audio:set-volume"));
 
-    this.bind("audio:set-volume", (p: { volume: number }) =>
-      this.setVolume(p?.volume ?? this.state.volume, "audio:set-volume"),
-    );
     this.bind("audio:volume-nudge", (p: { delta: number }) => {
       const d = Number.isFinite(p?.delta) ? p.delta : 0;
       this.setVolume(this.state.volume + d, "audio:volume-nudge");
     });
 
     this.bind("audio:set-shuffle", (p: { shuffle: boolean }) => this.setShuffle(!!p?.shuffle, "audio:set-shuffle"));
-    this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) =>
-      this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"),
-    );
+
+    this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) => this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"));
 
     // REQUEST events (do NOT re-emit from within the handler chain)
     this.bind("audio:fade-to-silence", (p: { reason?: AudioFadeReason; durationSec?: number }) =>
@@ -967,6 +945,7 @@ export class AudioSystem {
     this.bus.emit(event, payload);
   }
 
+  // ✅ Contract locked: ONLY { state, reason }
   private emitState(reason: string): void {
     this.bus.emit("audio:state", { state: this.getState(), reason });
   }

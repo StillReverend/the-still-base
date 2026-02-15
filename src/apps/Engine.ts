@@ -225,7 +225,7 @@ export class Engine {
 
       // Browser gesture unlock + (optional) dev autostart
       this.setupAudioUnlockGestures();
-      this.setupAutoStartMusicOnFirstGesture("Lift");
+      this.setupAutoStartMusicOnFirstUnlock("Lift");
 
       this.devTools = new DevTools({
         bus: this.bus,
@@ -242,7 +242,7 @@ export class Engine {
 
       // If you want Lift.mp3 to start for real users too, keep this enabled.
       // If you prefer “silent until UI exists”, comment it out.
-      this.setupAutoStartMusicOnFirstGesture("Lift");
+      this.setupAutoStartMusicOnFirstUnlock("Lift");
     }
 
     window.addEventListener("resize", this.handleResize);
@@ -387,53 +387,45 @@ export class Engine {
   }
 
   // ---------------------------------------------------------------------------
-  // Phase 1: Auto-start a background track on first gesture
+  // Phase 1: Auto-start a background track after unlock
   // ---------------------------------------------------------------------------
 
   private autoStartMusicArmed = false;
 
   /**
-   * Starts a named track (e.g. "Lift") after the first user gesture.
-   * We wait for "audio:unlocked" before requesting play to avoid races.
+   * Starts a named track (e.g. "Lift") once audio becomes unlocked.
+   *
+   * IMPORTANT:
+   * - Does NOT attach its own gesture listeners.
+   * - Piggybacks on setupAudioUnlockGestures() which already handles the first gesture.
    */
-  private setupAutoStartMusicOnFirstGesture(trackId: string): void {
+  private setupAutoStartMusicOnFirstUnlock(trackId: string): void {
     if (this.autoStartMusicArmed) return;
     this.autoStartMusicArmed = true;
 
     let fired = false;
 
-    const fire = (): void => {
+    const onUnlocked = (): void => {
       if (fired) return;
       fired = true;
 
-      window.removeEventListener("pointerdown", fire);
-      window.removeEventListener("keydown", fire);
+      this.bus.off("audio:unlocked", onUnlocked as unknown as (payload: unknown) => void);
 
-      // Set track immediately (id is used to resolve Lift.mp3).
+      // Set track then play
       this.bus.emit("audio:set-track", { trackId });
-
-      // Once unlocked, request play.
-      const onUnlocked = (): void => {
-        this.bus.off("audio:unlocked", onUnlocked as unknown as (payload: unknown) => void);
-        this.bus.emit("audio:play-request", {});
-      };
-
-      // If we’re already unlocked for some reason, just play.
-      const state = this.audioSystem.getState();
-      if (state.isUnlocked) {
-        this.bus.emit("audio:play-request", {});
-        return;
-      }
-
-      // Wait for unlock completion.
-      this.bus.on("audio:unlocked", onUnlocked as unknown as (payload: unknown) => void);
-
-      // Trigger unlock.
-      this.bus.emit("audio:unlock-request", {});
+      this.bus.emit("audio:play-request", {});
     };
 
-    window.addEventListener("pointerdown", fire, { once: true });
-    window.addEventListener("keydown", fire, { once: true });
+    // If already unlocked for some reason, start immediately.
+    const state = this.audioSystem.getState();
+    if (state.isUnlocked) {
+      this.bus.emit("audio:set-track", { trackId });
+      this.bus.emit("audio:play-request", {});
+      return;
+    }
+
+    // Otherwise wait for unlock completion.
+    this.bus.on("audio:unlocked", onUnlocked as unknown as (payload: unknown) => void);
   }
 
   dispose(): void {

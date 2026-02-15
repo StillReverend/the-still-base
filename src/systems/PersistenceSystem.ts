@@ -67,6 +67,16 @@ export interface TrackState {
 
 export interface AudioPlayerState {
   activeTrackId: string | null;
+
+  /** Last known playback state (for resume UX). */
+  isPlaying: boolean;
+
+  /** Last known playhead seconds (for resume). */
+  timeSec: number;
+
+  /** Last known duration seconds (if known). */
+  durationSec: number | null;
+
   shuffle: boolean;
   repeat: RepeatMode;
   volume: number; // 0..1
@@ -159,6 +169,9 @@ const createDefaultState = (): UserState => {
     },
     audio: {
       activeTrackId: null,
+      isPlaying: false,
+      timeSec: 0,
+      durationSec: null,
       shuffle: false,
       repeat: "off",
       volume: 0.85,
@@ -171,6 +184,8 @@ const createDefaultState = (): UserState => {
 
 const sanitizeState = (state: UserState): UserState => {
   // Defensive clamping / normalization for future-proofing.
+  const rawDuration = (state.audio as Partial<AudioPlayerState>)?.durationSec;
+
   const s: UserState = {
     ...state,
     version: 1,
@@ -201,6 +216,20 @@ const sanitizeState = (state: UserState): UserState => {
     },
     audio: {
       activeTrackId: typeof state.audio?.activeTrackId === "string" ? state.audio.activeTrackId : null,
+
+      isPlaying: Boolean((state.audio as Partial<AudioPlayerState>)?.isPlaying),
+
+      timeSec: Number.isFinite((state.audio as Partial<AudioPlayerState>)?.timeSec ?? NaN)
+        ? Math.max(0, Number((state.audio as Partial<AudioPlayerState>).timeSec))
+        : 0,
+
+      durationSec:
+        rawDuration == null
+          ? null
+          : Number.isFinite(rawDuration)
+            ? Math.max(0, Number(rawDuration))
+            : null,
+
       shuffle: Boolean(state.audio?.shuffle),
       repeat: state.audio?.repeat === "one" || state.audio?.repeat === "all" ? state.audio.repeat : "off",
       volume: clamp01(state.audio?.volume ?? 0),
@@ -242,7 +271,12 @@ const sanitizeState = (state: UserState): UserState => {
 const isUserStateV1 = (raw: unknown): raw is UserState => {
   if (!raw || typeof raw !== "object") return false;
   const r = raw as Partial<UserState>;
-  return r.version === 1 && typeof r.gate === "object" && typeof r.harmony === "object";
+  return (
+    r.version === 1 &&
+    typeof r.gate === "object" &&
+    typeof r.harmony === "object" &&
+    typeof r.audio === "object"
+  );
 };
 
 export class PersistenceSystem {
@@ -286,7 +320,6 @@ export class PersistenceSystem {
     });
   }
 
-
   /** Update via top-level partial merge; schedules autosave by default. */
   update(partial: Partial<Omit<UserState, "version" | "createdAtMs" | "updatedAtMs">>, reason = "update"): void {
     const next: UserState = sanitizeState({
@@ -324,7 +357,10 @@ export class PersistenceSystem {
       status,
       lastOpenedAtMs: status === "open" ? t : this.state.gate.lastOpenedAtMs,
       lastClosedAtMs: status === "closed" ? t : this.state.gate.lastClosedAtMs,
-      reopenCount: status === "open" && this.state.gate.status === "closed" ? this.state.gate.reopenCount + 1 : this.state.gate.reopenCount,
+      reopenCount:
+        status === "open" && this.state.gate.status === "closed"
+          ? this.state.gate.reopenCount + 1
+          : this.state.gate.reopenCount,
     };
     this.update({ gate }, reason);
   }
@@ -373,12 +409,39 @@ export class PersistenceSystem {
   }
 
   setAudioPlayer(partial: Partial<AudioPlayerState>, reason = "audio:update"): void {
+    const nextIsPlaying =
+      typeof partial.isPlaying === "boolean" ? partial.isPlaying : this.state.audio.isPlaying;
+
+    const nextTimeSec =
+      Number.isFinite(partial.timeSec ?? NaN) ? Math.max(0, Number(partial.timeSec)) : this.state.audio.timeSec;
+
+    const nextDurationSec =
+      partial.durationSec == null
+        ? this.state.audio.durationSec
+        : Number.isFinite(partial.durationSec)
+          ? Math.max(0, Number(partial.durationSec))
+          : this.state.audio.durationSec;
+
     const audio: AudioPlayerState = {
       ...this.state.audio,
       ...partial,
+
+      activeTrackId:
+        typeof partial.activeTrackId === "string" || partial.activeTrackId === null
+          ? (partial.activeTrackId ?? null)
+          : this.state.audio.activeTrackId,
+
+      isPlaying: nextIsPlaying,
+      timeSec: nextTimeSec,
+      durationSec: nextDurationSec,
+
       volume: clamp01(partial.volume ?? this.state.audio.volume),
-      repeat: partial.repeat === "one" || partial.repeat === "all" || partial.repeat === "off" ? (partial.repeat ?? this.state.audio.repeat) : this.state.audio.repeat,
+      repeat:
+        partial.repeat === "one" || partial.repeat === "all" || partial.repeat === "off"
+          ? (partial.repeat ?? this.state.audio.repeat)
+          : this.state.audio.repeat,
     };
+
     this.update({ audio }, reason);
   }
 
@@ -437,5 +500,4 @@ export class PersistenceSystem {
   dispose(): void {
     this.clearAutosave();
   }
-
 }

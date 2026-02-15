@@ -2,32 +2,54 @@
 // ============================================================
 // THE STILL — Harmony (Contracts)
 // ============================================================
+//
+// IMPORTANT:
+// Harmony must not import AudioSystem directly.
+// It only speaks through EventBus contracts.
+// So we define the minimal AudioSystemState shape we care about here,
+// and we import RepeatMode from PersistenceSystem (canonical/persisted).
+// ============================================================
 
-export type RepeatMode = "off" | "one" | "all";
+import type { RepeatMode } from "../PersistenceSystem";
+
 export type AudioCmdSource = "harmony" | string;
 
-export type AudioState = {
-  // Harmony-friendly / legacy shapes
-  playing?: boolean;
-  trackId?: string | null;
+/**
+ * AudioSystemState (subset Harmony cares about).
+ * This mirrors what AudioSystem emits inside `audio:state`.
+ */
+export type AudioSystemState = {
+  activeTrackId: string | null;
+  isPlaying: boolean;
+
+  timeSec: number;
+  durationSec: number | null;
+
+  shuffle: boolean;
+  repeat: RepeatMode;
+
+  volume: number; // 0..1
+
+  effectiveVolume: number; // 0..1
+  systemMuted: boolean;
+
+  isUnlocked: boolean;
+  lastError: string | null;
+};
+
+/**
+ * The ONLY supported payload shape for `audio:state`.
+ * AudioSystem emits: { state: AudioSystemState, reason: string }
+ */
+export type AudioStateEvent = {
+  state: AudioSystemState;
+  reason: string;
+
+  /**
+   * Optional UI-friendly title override (future).
+   * If omitted, Harmony will show trackId or "No track".
+   */
   title?: string;
-  positionSec?: number;
-  durationSec?: number;
-
-  // AudioSystemState-ish shapes
-  isPlaying?: boolean;
-  activeTrackId?: string | null;
-  timeSec?: number;
-  durationSecRaw?: number;
-  repeat?: RepeatMode;
-  shuffle?: boolean;
-  volume?: number;
-
-  // optional extras (future)
-  repeatMode?: RepeatMode;
-  isFavorite?: boolean;
-  locked?: boolean;
-  bufferedSec?: number;
 };
 
 export type AudioCatalog = {

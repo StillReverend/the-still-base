@@ -7,7 +7,8 @@
 
 import type { EventBus } from "../../core/EventBus";
 import { HarmonyUI } from "./HarmonyUI";
-import { HARMONY_DEFAULT_STATE, type HarmonyState, type AudioState, type RepeatMode } from "./types";
+import { HARMONY_DEFAULT_STATE, type HarmonyState, type AudioStateEvent } from "./types";
+import type { RepeatMode } from "../PersistenceSystem";
 
 type AnyFn = (...args: any[]) => void;
 
@@ -18,6 +19,22 @@ export class HarmonySystem {
   private ui: HarmonyUI | null = null;
   private state: HarmonyState = { ...HARMONY_DEFAULT_STATE };
   private disposers: Array<() => void> = [];
+
+  // Coalesce UI renders to 1x/RAF (prevents UI “stickiness” under load)
+  private renderRaf = 0;
+  private renderQueued = false;
+
+  // NEW: keep last applied audio snapshot so we can skip pointless renders
+  private lastAudioApplied: {
+    playing: boolean;
+    trackId: string | null;
+    title: string;
+    positionSec: number;
+    durationSec: number;
+    shuffle: boolean;
+    repeat: RepeatMode;
+    volume: number;
+  } | null = null;
 
   constructor(bus: EventBus) {
     this.bus = bus;
@@ -32,10 +49,13 @@ export class HarmonySystem {
         this.emit("audio:unlock-request", {});
         // Request-style event consumed by AudioSystem
         this.emit("audio:toggle-request", { source: "harmony" });
+        // Do not force local play state; AudioSystem is the authority.
       },
 
-      // UI requests seeks via "audio:seek-request"
-      onSeek: (timeSec) => this.emit("audio:seek-request", { timeSec, source: "harmony" }),
+      onSeek: (timeSec) => {
+        this.emit("audio:seek-request", { timeSec, source: "harmony" });
+        // No local position write here; AudioSystem will confirm via audio:state ticks.
+      },
 
       onToggleShuffle: () => this.setShuffle(!this.state.shuffle),
       onCycleRepeat: () => this.cycleRepeat(),
@@ -57,7 +77,7 @@ export class HarmonySystem {
     this.ui.render(this.state);
 
     // Bus subscriptions
-    this.on("audio:state", (p: AudioState) => this.onAudioState(p));
+    this.on("audio:state", (p: AudioStateEvent) => this.onAudioState(p));
 
     this.on("harmony:ui:setVisible", (p: { visible: boolean }) => this.setUIVisible(Boolean(p?.visible)));
     this.on("harmony:ui:toggleVisible", () => this.setUIVisible(!this.state.uiVisible));
@@ -74,6 +94,12 @@ export class HarmonySystem {
     for (const d of this.disposers) d();
     this.disposers = [];
 
+    if (this.renderRaf) cancelAnimationFrame(this.renderRaf);
+    this.renderRaf = 0;
+    this.renderQueued = false;
+
+    this.lastAudioApplied = null;
+
     this.ui?.dispose();
     this.ui = null;
   }
@@ -82,50 +108,82 @@ export class HarmonySystem {
   // State updates
   // ------------------------------------------------------------
 
-  private onAudioState(payload: any): void {
-    // AudioSystem emits: { state: AudioSystemState, reason }
-    // Also accept a flat state payload.
-    const s = payload?.state ?? payload;
+  private onAudioState(payload: AudioStateEvent): void {
+    // Strict contract: AudioSystem emits { state, reason }
+    const s = payload?.state;
+    if (!s) return;
 
-    const playing = Boolean(s?.isPlaying ?? s?.playing ?? false);
-    const trackId = (s?.activeTrackId ?? s?.trackId ?? null) as string | null;
+    const playing = Boolean(s.isPlaying);
+    const trackId = (s.activeTrackId ?? null) as string | null;
 
-    const timeSec = Number(s?.timeSec ?? s?.positionSec ?? 0);
+    const timeSec = Number.isFinite(s.timeSec) ? s.timeSec : 0;
+    const durationSec = Number.isFinite(s.durationSec ?? NaN) ? Number(s.durationSec) : 0;
 
-    // AudioSystem uses durationSec: number | null
-    const durationSecRaw = s?.durationSec ?? s?.durationSecRaw ?? 0;
-    const durationSec = Number(durationSecRaw ?? 0);
+    const shuffle = Boolean(s.shuffle);
+    const repeat = (s.repeat ?? "off") as RepeatMode;
+    const volume = clamp01(Number.isFinite(s.volume) ? s.volume : this.state.volume);
 
-    // New: shuffle/repeat/volume from AudioSystemState
-    const shuffle = Boolean(s?.shuffle ?? false);
-    const repeat = (s?.repeat ?? s?.repeatMode ?? "off") as RepeatMode;
-    const volume = Number(s?.volume ?? this.state.volume);
+    const safeRepeat: RepeatMode = repeat === "off" || repeat === "one" || repeat === "all" ? repeat : "off";
+
+    const title = typeof payload.title === "string" && payload.title ? payload.title : trackId ?? "No track";
+
+    // Skip doing work if nothing meaningful changed (reduces Safari hiccups)
+    const snapshot = {
+      playing,
+      trackId,
+      title,
+      positionSec: timeSec,
+      durationSec,
+      shuffle,
+      repeat: safeRepeat,
+      volume,
+    };
+
+    if (this.lastAudioApplied && this.audioSnapshotEquals(this.lastAudioApplied, snapshot)) {
+      return;
+    }
+
+    this.lastAudioApplied = snapshot;
 
     this.state.playing = playing;
     this.state.trackId = trackId;
-
-    // Title: prefer explicit payload.title if provided; otherwise use trackId
-    this.state.title =
-      typeof payload?.title === "string" && payload.title ? payload.title : trackId ?? "No track";
-
-    this.state.positionSec = Number.isFinite(timeSec) ? timeSec : 0;
-    this.state.durationSec = Number.isFinite(durationSec) ? durationSec : 0;
+    this.state.title = title;
+    this.state.positionSec = timeSec;
+    this.state.durationSec = durationSec;
 
     this.state.shuffle = shuffle;
-    this.state.repeat = repeat === "off" || repeat === "one" || repeat === "all" ? repeat : "off";
-    this.state.volume = Number.isFinite(volume) ? clamp01(volume) : this.state.volume;
+    this.state.repeat = safeRepeat;
+    this.state.volume = volume;
 
-    this.render();
+    this.requestRender();
+  }
+
+  private audioSnapshotEquals(
+    a: NonNullable<HarmonySystem["lastAudioApplied"]>,
+    b: NonNullable<HarmonySystem["lastAudioApplied"]>,
+  ): boolean {
+    // NOTE: positionSec changes frequently; we still compare it.
+    // If you ever want even less churn, you can quantize positionSec to, say, 0.05s here.
+    return (
+      a.playing === b.playing &&
+      a.trackId === b.trackId &&
+      a.title === b.title &&
+      a.positionSec === b.positionSec &&
+      a.durationSec === b.durationSec &&
+      a.shuffle === b.shuffle &&
+      a.repeat === b.repeat &&
+      a.volume === b.volume
+    );
   }
 
   private setUIVisible(visible: boolean): void {
     this.state.uiVisible = visible;
-    this.render();
+    this.requestRender();
   }
 
   private setVibePanelOpen(open: boolean): void {
     this.state.vibePanelOpen = open;
-    this.render();
+    this.requestRender();
   }
 
   private toggleVibePanel(): void {
@@ -134,64 +192,83 @@ export class HarmonySystem {
 
   private setShuffle(enabled: boolean): void {
     const v = Boolean(enabled);
+
+    // Optimistic UI
     this.state.shuffle = v;
     this.emit("audio:set-shuffle", { shuffle: v, source: "harmony" });
-    this.render();
+
+    this.requestRender();
   }
 
   private cycleRepeat(): void {
     const next: RepeatMode = this.state.repeat === "off" ? "all" : this.state.repeat === "all" ? "one" : "off";
+
+    // Optimistic UI
     this.state.repeat = next;
     this.emit("audio:set-repeat", { repeat: next, source: "harmony" });
-    this.render();
+
+    this.requestRender();
   }
 
   private setVolume(volume01: number): void {
     const v = clamp01(Number.isFinite(volume01) ? volume01 : this.state.volume);
+
+    // Optimistic UI
     this.state.volume = v;
     this.emit("audio:set-volume", { volume: v, source: "harmony" });
-    this.render();
+
+    this.requestRender();
   }
 
   private selectColor(colorId: string): void {
     this.state.colorId = colorId;
     this.emit("vibe:selectColor", { colorId });
-    this.render();
+    this.requestRender();
   }
 
   private selectFilter(filterId: string): void {
     this.state.filterId = filterId;
     this.emit("vibe:selectFilter", { filterId });
-    this.render();
+    this.requestRender();
   }
 
   private toggleParticle(particleId: string, enabled: boolean): void {
     this.state.particles[particleId] = enabled;
     this.emit("vibe:toggleParticle", { particleId, enabled });
-    this.render();
+    this.requestRender();
   }
 
   private toggleAmbient(ambientId: string, enabled: boolean): void {
     this.state.ambients[ambientId] = enabled;
     this.emit("vibe:toggleAmbient", { ambientId, enabled });
-    this.render();
+    this.requestRender();
   }
 
   private setRitualDuration(durationSec: number): void {
     const clamped = Math.max(10, Math.min(600, Math.floor(durationSec)));
     this.state.ritualDurationSec = clamped;
     this.emit("ritual:setDuration", { durationSec: clamped });
-    this.render();
+    this.requestRender();
   }
 
-  private render(): void {
-    this.ui?.render(this.state);
+  // one render per RAF
+  private requestRender(): void {
+    if (!this.ui) return;
+    if (this.renderQueued) return;
+
+    this.renderQueued = true;
+    this.renderRaf = requestAnimationFrame(() => {
+      this.renderRaf = 0;
+      this.renderQueued = false;
+      this.ui?.render(this.state);
+    });
   }
 
   // ------------------------------------------------------------
   // EventBus adapter (centralized)
   // ------------------------------------------------------------
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private emit(event: string, payload?: any): void {
     this.bus.emit(event, payload);
   }
