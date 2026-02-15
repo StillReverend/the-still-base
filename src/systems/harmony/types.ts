@@ -7,11 +7,23 @@ export type RepeatMode = "off" | "one" | "all";
 export type AudioCmdSource = "harmony" | string;
 
 export type AudioState = {
-  playing: boolean;
-  trackId: string | null;
+  // Harmony-friendly / legacy shapes
+  playing?: boolean;
+  trackId?: string | null;
   title?: string;
-  positionSec: number;
-  durationSec: number;
+  positionSec?: number;
+  durationSec?: number;
+
+  // AudioSystemState-ish shapes
+  isPlaying?: boolean;
+  activeTrackId?: string | null;
+  timeSec?: number;
+  durationSecRaw?: number;
+  repeat?: RepeatMode;
+  shuffle?: boolean;
+  volume?: number;
+
+  // optional extras (future)
   repeatMode?: RepeatMode;
   isFavorite?: boolean;
   locked?: boolean;
@@ -41,6 +53,11 @@ export type HarmonyState = {
   positionSec: number;
   durationSec: number;
 
+  // player controls (Phase 1)
+  shuffle: boolean;
+  repeat: RepeatMode;
+  volume: number; // 0..1
+
   // vibe (Phase 1 placeholders)
   colorId: string | null;
   filterId: string | null;
@@ -60,6 +77,10 @@ export const HARMONY_DEFAULT_STATE: HarmonyState = {
   title: "No track",
   positionSec: 0,
   durationSec: 0,
+
+  shuffle: false,
+  repeat: "off",
+  volume: 0.85,
 
   colorId: null,
   filterId: null,
