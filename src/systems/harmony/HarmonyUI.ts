@@ -5,11 +5,16 @@
 //  - Calls handlers only (no EventBus imports)
 // ============================================================
 
-import type { HarmonyState } from "./types";
+import type { HarmonyState, RepeatMode } from "./types";
 
 type UIHandlers = {
   onTogglePlay(): void;
   onSeek(timeSec: number): void;
+
+  onToggleShuffle(): void;
+  onCycleRepeat(): void;
+  onSetVolume(volume01: number): void;
+
   onToggleVibePanel(): void;
   onSetUIVisible(visible: boolean): void;
 
@@ -25,11 +30,21 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
+function clamp01(v: number): number {
+  return Math.min(1, Math.max(0, v));
+}
+
 function formatTime(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
   const m = Math.floor(s / 60);
   const r = s % 60;
   return `${m}:${String(r).padStart(2, "0")}`;
+}
+
+function repeatLabel(mode: RepeatMode): string {
+  if (mode === "one") return "R1";
+  if (mode === "all") return "RA";
+  return "R0";
 }
 
 export class HarmonyUI {
@@ -41,6 +56,10 @@ export class HarmonyUI {
   private scrub: HTMLInputElement;
   private titleText: HTMLDivElement;
   private timeText: HTMLDivElement;
+
+  private btnShuffle: HTMLButtonElement;
+  private btnRepeat: HTMLButtonElement;
+  private vol: HTMLInputElement;
 
   private btnVibe: HTMLButtonElement;
   private btnHide: HTMLButtonElement;
@@ -56,6 +75,10 @@ export class HarmonyUI {
 
   // Keep last known duration so we can update the timer text while scrubbing.
   private lastDurationSec = 0;
+
+  // Avoid flooding volume events while dragging; keep it smooth.
+  private volRaf = 0;
+  private volPending: number | null = null;
 
   constructor(handlers: UIHandlers) {
     this.handlers = handlers;
@@ -100,12 +123,16 @@ export class HarmonyUI {
         -webkit-tap-highlight-color: transparent;
       }
       .harmony-btn:active { transform: translateY(1px); }
+      .harmony-btn.on {
+        border-color: rgba(255,255,255,0.30);
+        background: rgba(255,255,255,0.14);
+      }
 
       .harmony-title {
         display: flex;
         flex-direction: column;
         min-width: 160px;
-        max-width: 38vw;
+        max-width: 34vw;
         overflow: hidden;
       }
       .harmony-title .t {
@@ -124,6 +151,11 @@ export class HarmonyUI {
       .harmony-scrub {
         flex: 1;
         min-width: 120px;
+        height: 30px;
+      }
+
+      .harmony-vol {
+        width: 110px;
         height: 30px;
       }
 
@@ -220,7 +252,6 @@ export class HarmonyUI {
     };
 
     const scrubEnd = () => {
-      // Finalize the seek on release/change.
       const timeSec = Number(this.scrub.value);
       if (Number.isFinite(timeSec)) this.handlers.onSeek(timeSec);
 
@@ -233,18 +264,14 @@ export class HarmonyUI {
     };
 
     const scrubLive = () => {
-      // Some browsers (trackpad, keyboard, accessibility) primarily fire "input"
-      // without pointerdown/up in the way you expect.
       this.isScrubbing = true;
 
       const timeSec = Number(this.scrub.value);
       if (!Number.isFinite(timeSec)) return;
 
-      // Update timer UI immediately for responsiveness.
       const dur = Math.max(0, this.lastDurationSec);
       this.timeText.textContent = `${formatTime(timeSec)} / ${formatTime(dur)}`;
 
-      // Throttle actual seek calls to once per animation frame.
       this.scrubPendingSec = timeSec;
       if (!this.scrubSeekRaf) {
         this.scrubSeekRaf = requestAnimationFrame(() => {
@@ -258,24 +285,68 @@ export class HarmonyUI {
       }
     };
 
-    // Pointer-based scrubbing
     this.scrub.addEventListener("pointerdown", scrubStart);
     this.scrub.addEventListener("pointerup", scrubEnd);
     this.scrub.addEventListener("pointercancel", scrubEnd);
     this.scrub.addEventListener("lostpointercapture", scrubEnd);
 
-    // Touch fallback
     this.scrub.addEventListener("touchstart", scrubStart, { passive: true });
     this.scrub.addEventListener("touchend", scrubEnd);
 
-    // Live scrubbing while playing.
     this.scrub.addEventListener("input", scrubLive);
-
-    // Some UAs fire "change" when the drag ends (esp. keyboard adjustments).
     this.scrub.addEventListener("change", scrubEnd);
-
-    // If focus is lost mid-drag, finalize
     this.scrub.addEventListener("blur", scrubEnd);
+
+    // Shuffle
+    this.btnShuffle = document.createElement("button");
+    this.btnShuffle.className = "harmony-btn";
+    this.btnShuffle.textContent = "Shuf";
+    this.btnShuffle.addEventListener("click", () => this.handlers.onToggleShuffle());
+
+    // Repeat (cycle)
+    this.btnRepeat = document.createElement("button");
+    this.btnRepeat.className = "harmony-btn";
+    this.btnRepeat.textContent = "R0";
+    this.btnRepeat.addEventListener("click", () => this.handlers.onCycleRepeat());
+
+    // Volume
+    this.vol = document.createElement("input");
+    this.vol.className = "harmony-vol";
+    this.vol.type = "range";
+    this.vol.min = "0";
+    this.vol.max = "1";
+    this.vol.step = "0.01";
+    this.vol.value = "0.85";
+
+    const volumeLive = () => {
+      const v = clamp01(Number(this.vol.value));
+      this.volPending = v;
+
+      if (!this.volRaf) {
+        this.volRaf = requestAnimationFrame(() => {
+          this.volRaf = 0;
+          const pending = this.volPending;
+          this.volPending = null;
+          if (pending != null && Number.isFinite(pending)) {
+            this.handlers.onSetVolume(pending);
+          }
+        });
+      }
+    };
+
+    const volumeEnd = () => {
+      const v = clamp01(Number(this.vol.value));
+      this.volPending = null;
+      if (this.volRaf) {
+        cancelAnimationFrame(this.volRaf);
+        this.volRaf = 0;
+      }
+      this.handlers.onSetVolume(v);
+    };
+
+    this.vol.addEventListener("input", volumeLive);
+    this.vol.addEventListener("change", volumeEnd);
+    this.vol.addEventListener("blur", volumeEnd);
 
     this.btnVibe = document.createElement("button");
     this.btnVibe.className = "harmony-btn";
@@ -290,6 +361,9 @@ export class HarmonyUI {
     this.bar.appendChild(this.btnPlay);
     this.bar.appendChild(titleWrap);
     this.bar.appendChild(this.scrub);
+    this.bar.appendChild(this.btnShuffle);
+    this.bar.appendChild(this.btnRepeat);
+    this.bar.appendChild(this.vol);
     this.bar.appendChild(this.btnVibe);
     this.bar.appendChild(this.btnHide);
 
@@ -363,6 +437,11 @@ export class HarmonyUI {
     if (this.scrubSeekRaf) cancelAnimationFrame(this.scrubSeekRaf);
     this.scrubSeekRaf = 0;
     this.scrubPendingSec = null;
+
+    if (this.volRaf) cancelAnimationFrame(this.volRaf);
+    this.volRaf = 0;
+    this.volPending = null;
+
     this.root.remove();
   }
 
@@ -375,13 +454,21 @@ export class HarmonyUI {
     this.btnPlay.textContent = state.playing ? "Pause" : "Play";
     this.titleText.textContent = state.title || "No track";
 
+    // Shuffle / Repeat
+    this.btnShuffle.classList.toggle("on", !!state.shuffle);
+    this.btnRepeat.textContent = repeatLabel(state.repeat);
+
+    // Volume (don’t fight the user while they drag it)
+    const v = clamp01(Number.isFinite(state.volume) ? state.volume : 0.85);
+    if (document.activeElement !== this.vol) {
+      this.vol.value = String(v);
+    }
+
     const dur = Number.isFinite(state.durationSec) ? state.durationSec : 0;
     const pos = Number.isFinite(state.positionSec) ? state.positionSec : 0;
 
     this.lastDurationSec = dur;
 
-    // If the user is actively scrubbing, we do NOT overwrite the scrub thumb.
-    // We also keep the timer responsive via the "input" handler.
     if (!this.isScrubbing) {
       this.timeText.textContent = `${formatTime(pos)} / ${formatTime(dur)}`;
     }

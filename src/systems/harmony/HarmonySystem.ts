@@ -7,9 +7,11 @@
 
 import type { EventBus } from "../../core/EventBus";
 import { HarmonyUI } from "./HarmonyUI";
-import { HARMONY_DEFAULT_STATE, type HarmonyState, type AudioState } from "./types";
+import { HARMONY_DEFAULT_STATE, type HarmonyState, type AudioState, type RepeatMode } from "./types";
 
 type AnyFn = (...args: any[]) => void;
+
+const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
 export class HarmonySystem {
   private bus: EventBus;
@@ -34,6 +36,11 @@ export class HarmonySystem {
 
       // UI requests seeks via "audio:seek-request"
       onSeek: (timeSec) => this.emit("audio:seek-request", { timeSec, source: "harmony" }),
+
+      onToggleShuffle: () => this.setShuffle(!this.state.shuffle),
+      onCycleRepeat: () => this.cycleRepeat(),
+
+      onSetVolume: (volume01) => this.setVolume(volume01),
 
       onToggleVibePanel: () => this.toggleVibePanel(),
       onSetUIVisible: (visible) => this.setUIVisible(visible),
@@ -84,7 +91,15 @@ export class HarmonySystem {
     const trackId = (s?.activeTrackId ?? s?.trackId ?? null) as string | null;
 
     const timeSec = Number(s?.timeSec ?? s?.positionSec ?? 0);
-    const durationSecRaw = Number(s?.durationSec ?? 0);
+
+    // AudioSystem uses durationSec: number | null
+    const durationSecRaw = s?.durationSec ?? s?.durationSecRaw ?? 0;
+    const durationSec = Number(durationSecRaw ?? 0);
+
+    // New: shuffle/repeat/volume from AudioSystemState
+    const shuffle = Boolean(s?.shuffle ?? false);
+    const repeat = (s?.repeat ?? s?.repeatMode ?? "off") as RepeatMode;
+    const volume = Number(s?.volume ?? this.state.volume);
 
     this.state.playing = playing;
     this.state.trackId = trackId;
@@ -94,7 +109,11 @@ export class HarmonySystem {
       typeof payload?.title === "string" && payload.title ? payload.title : trackId ?? "No track";
 
     this.state.positionSec = Number.isFinite(timeSec) ? timeSec : 0;
-    this.state.durationSec = Number.isFinite(durationSecRaw) ? durationSecRaw : 0;
+    this.state.durationSec = Number.isFinite(durationSec) ? durationSec : 0;
+
+    this.state.shuffle = shuffle;
+    this.state.repeat = repeat === "off" || repeat === "one" || repeat === "all" ? repeat : "off";
+    this.state.volume = Number.isFinite(volume) ? clamp01(volume) : this.state.volume;
 
     this.render();
   }
@@ -111,6 +130,27 @@ export class HarmonySystem {
 
   private toggleVibePanel(): void {
     this.setVibePanelOpen(!this.state.vibePanelOpen);
+  }
+
+  private setShuffle(enabled: boolean): void {
+    const v = Boolean(enabled);
+    this.state.shuffle = v;
+    this.emit("audio:set-shuffle", { shuffle: v, source: "harmony" });
+    this.render();
+  }
+
+  private cycleRepeat(): void {
+    const next: RepeatMode = this.state.repeat === "off" ? "all" : this.state.repeat === "all" ? "one" : "off";
+    this.state.repeat = next;
+    this.emit("audio:set-repeat", { repeat: next, source: "harmony" });
+    this.render();
+  }
+
+  private setVolume(volume01: number): void {
+    const v = clamp01(Number.isFinite(volume01) ? volume01 : this.state.volume);
+    this.state.volume = v;
+    this.emit("audio:set-volume", { volume: v, source: "harmony" });
+    this.render();
   }
 
   private selectColor(colorId: string): void {
