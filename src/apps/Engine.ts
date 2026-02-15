@@ -21,6 +21,7 @@ import { GateSystem } from "../systems/GateSystem";
 import { AudioSystem } from "../systems/AudioSystem";
 import { HowlerAudioSystem } from "../systems/HowlerAudioSystem";
 import { InteractionSystem } from "../systems/InteractionSystem";
+import { HarmonySystem } from "../systems/harmony/HarmonySystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -54,6 +55,7 @@ export class Engine {
   private readonly audioSystem: AudioSystem;
   private readonly howlerAudioSystem: HowlerAudioSystem;
   private readonly interactionSystem: InteractionSystem;
+  private harmony: HarmonySystem | null = null;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -151,6 +153,9 @@ export class Engine {
       domElement: this.renderer.domElement,
       camera: this.camera,
     });
+
+    this.harmony = new HarmonySystem(this.bus);
+    this.harmony.init();
 
     // Scene manager
     this.sceneManager = new SceneManager(this.save);
@@ -449,6 +454,8 @@ export class Engine {
 
     this.interactionSystem.dispose();
     this.howlerAudioSystem.dispose();
+    this.harmony?.dispose();
+    this.harmony = null;
 
     // Audio: detach bus handlers
     this.audioSystem.dispose();
