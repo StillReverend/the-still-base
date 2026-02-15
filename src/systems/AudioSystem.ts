@@ -106,9 +106,15 @@ export class AudioSystem {
 
   private decoded: Map<string, AudioBuffer> = new Map();
 
+  // NEW: prevent duplicate preloads
+  private durationPreloadInFlight: Promise<void> | null = null;
+
   private musicSource: AudioBufferSourceNode | null = null;
   private musicStartAtCtxTime = 0; // ctx.currentTime at start()
   private musicStartOffsetSec = 0; // offset passed into start()
+
+  // NEW: keep reference to the current decoded buffer so we can live-seek while playing
+  private currentMusicBuffer: AudioBuffer | null = null;
 
   // ----------------------------------------------------------
   // Audio frame (FFT -> bands) for reactive systems
@@ -119,6 +125,10 @@ export class AudioSystem {
   // Throttle bus emissions to avoid log spam.
   private readonly frameHz = 30;
   private lastFrameEmitCtxTime = -1;
+
+  // NEW: Throttle "audio:state" emissions while playing (UI sync)
+  private readonly stateHz = 10;
+  private lastStateEmitCtxTime = -1;
 
   // Smoothed bands (0..1). Keeps the Core from jittering like a caffeinated firefly.
   private smoothedEnergy = 0;
@@ -210,6 +220,10 @@ export class AudioSystem {
   async unlock(reason = "audio:unlock"): Promise<void> {
     if (this.state.isUnlocked) {
       this.emitState(reason);
+      // NEW: If we have an active track, preload its duration so UI can show it before Play.
+      if (this.state.activeTrackId) {
+        this.preloadDurationFor(this.state.activeTrackId, "audio:duration-preload-after-unlock");
+      }
       return;
     }
 
@@ -258,6 +272,11 @@ export class AudioSystem {
     this.persistence.setAudioPlayer({ activeTrackId: trackId, timeSec: 0, durationSec: null }, reason);
     this.emit("audio:set-track", { trackId });
     this.emitState(reason);
+
+    // NEW: Preload duration for the newly selected track if we're unlocked.
+    if (trackId) {
+      this.preloadDurationFor(trackId, "audio:duration-preload-after-setTrack");
+    }
 
     if (wasPlaying) void this.play("audio:set-track-restart");
   }
@@ -328,18 +347,37 @@ export class AudioSystem {
 
   seek(timeSec: number, reason = "audio:seek"): void {
     const t = Math.max(0, Number.isFinite(timeSec) ? timeSec : 0);
+
+    // Update state immediately to requested value.
     this.state.timeSec = t;
 
-    this.emit("audio:seek", { timeSec: t, trackId: this.state.activeTrackId });
-    this.emitState(reason);
+    // If we're playing and we already have the decoded buffer, do a true live seek:
+    // stop the current AudioBufferSourceNode and start a new one at the requested offset.
+    // IMPORTANT: Do NOT call updatePlayheadFromCtxTime() here, because it would overwrite `t`.
+    if (this.state.isPlaying && this.audioCtx && this.musicGain && this.currentMusicBuffer) {
+      const buffer = this.currentMusicBuffer;
+      const safeT = clampFinite(t, 0, Math.max(0, buffer.duration - 0.0001));
 
-    if (this.state.isPlaying) {
-      this.updatePlayheadFromCtxTime();
-      this.stopMusicSource("seek");
-      this.state.isPlaying = false;
-      void this.play("audio:seek-restart");
+      // Keep duration consistent
+      if (this.state.durationSec == null || !Number.isFinite(this.state.durationSec) || this.state.durationSec <= 0) {
+        this.state.durationSec = buffer.duration;
+      }
+
+      // Restart at the requested offset
+      this.startMusicSource(buffer, safeT, reason, "seek");
+
+      // Still playing
+      this.state.isPlaying = true;
+
+      this.emit("audio:seek", { timeSec: safeT, trackId: this.state.activeTrackId });
+      this.emitState(reason);
+      this.persistPlayer(reason);
+      return;
     }
 
+    // Not playing (or buffer not ready): just update playhead so next Play starts here.
+    this.emit("audio:seek", { timeSec: t, trackId: this.state.activeTrackId });
+    this.emitState(reason);
     this.persistPlayer(reason);
   }
 
@@ -431,6 +469,18 @@ export class AudioSystem {
   update(dt: number): void {
     if (this.state.isPlaying) {
       this.updatePlayheadFromCtxTime();
+
+      // NEW: Emit audio:state periodically so Harmony UI time advances.
+      // Uses AudioContext time for stable throttling.
+      if (this.audioCtx) {
+        const now = this.audioCtx.currentTime;
+        const interval = 1 / Math.max(1, this.stateHz);
+
+        if (this.lastStateEmitCtxTime < 0 || now - this.lastStateEmitCtxTime >= interval) {
+          this.lastStateEmitCtxTime = now;
+          this.emitState("audio:tick");
+        }
+      }
     }
 
     if (this.fade.active) {
@@ -477,6 +527,7 @@ export class AudioSystem {
 
     this.decoded.clear();
     this.fftBins = null;
+    this.currentMusicBuffer = null;
 
     if (this.audioCtx) {
       try {
@@ -565,6 +616,38 @@ export class AudioSystem {
     throw new Error(`Failed to load track "${trackId}". Tried: ${urls.join(", ")}. Last error: ${msg}`);
   }
 
+  // ---------------------------------------------------------------------------
+  // Duration preload (no autoplay)
+  // ---------------------------------------------------------------------------
+
+  private preloadDurationFor(trackId: string, reason: string): void {
+    if (!trackId) return;
+    if (!this.state.isUnlocked) return; // wait until unlocked
+    if (this.durationPreloadInFlight) return;
+
+    this.durationPreloadInFlight = (async () => {
+      try {
+        await this.ensureGraph(); // safe; won’t start playback
+        const buf = await this.getDecodedBuffer(trackId);
+
+        // Only apply if still the active track
+        if (this.state.activeTrackId !== trackId) return;
+
+        // Update duration if we didn’t know it yet (or it changed)
+        const dur = buf.duration;
+        if (Number.isFinite(dur) && dur > 0) {
+          this.state.durationSec = dur;
+          this.persistence.setAudioPlayer({ durationSec: dur }, "audio:duration-preload");
+          this.emitState(reason);
+        }
+      } catch {
+        // If preload fails (e.g., browser restrictions), we’ll still get duration on Play.
+      } finally {
+        this.durationPreloadInFlight = null;
+      }
+    })();
+  }
+
   private decodeArrayBuffer(arr: ArrayBuffer): Promise<AudioBuffer> {
     if (!this.audioCtx) return Promise.reject(new Error("AudioContext not ready."));
     const ctx = this.audioCtx;
@@ -581,10 +664,15 @@ export class AudioSystem {
     });
   }
 
-  private startMusicSource(buffer: AudioBuffer, offsetSec: number, reason: string): void {
+  private startMusicSource(
+    buffer: AudioBuffer,
+    offsetSec: number,
+    reason: string,
+    stopReason: string = "restart",
+  ): void {
     if (!this.audioCtx || !this.musicGain) throw new Error("Audio graph not ready.");
 
-    this.stopMusicSource("restart");
+    this.stopMusicSource(stopReason);
 
     const src = this.audioCtx.createBufferSource();
     src.buffer = buffer;
@@ -593,6 +681,7 @@ export class AudioSystem {
     const offset = clampFinite(offsetSec, 0, Math.max(0, buffer.duration - 0.0001));
 
     this.musicSource = src;
+    this.currentMusicBuffer = buffer;
     this.musicStartAtCtxTime = this.audioCtx.currentTime;
     this.musicStartOffsetSec = offset;
 
@@ -788,7 +877,40 @@ export class AudioSystem {
     });
     this.bind("audio:pause-request", () => this.pause("audio:pause-request"));
     this.bind("audio:toggle-request", () => this.togglePlay("audio:toggle-request"));
-    this.bind("audio:seek", (p: { timeSec: number }) => this.seek(p?.timeSec ?? 0, "audio:seek"));
+    this.bind("audio:seek-request", (p: { timeSec: number }) => this.seek(p?.timeSec ?? 0, "audio:seek-request"));
+
+    // --------------------------------------------------------
+    // Harmony UI commands (audio:cmd:*)
+    // --------------------------------------------------------
+    // These are emitted by HarmonySystem. We translate them into
+    // AudioSystem actions without changing core AudioSystem events.
+
+    this.bind("audio:cmd:togglePlay", () => this.togglePlay("audio:cmd:togglePlay"));
+
+    this.bind("audio:cmd:play", () => {
+      void this.play("audio:cmd:play");
+    });
+
+    this.bind("audio:cmd:pause", () => this.pause("audio:cmd:pause"));
+
+    this.bind("audio:cmd:seek", (p: { timeSec: number }) => {
+      this.seek(p?.timeSec ?? 0, "audio:cmd:seek");
+    });
+
+    this.bind("audio:cmd:selectTrack", (p: { trackId: string }) => {
+      const id = typeof p?.trackId === "string" ? p.trackId : null;
+      this.setTrack(id, "audio:cmd:selectTrack");
+    });
+
+    this.bind("audio:cmd:setRepeatMode", (p: { mode: RepeatMode }) => {
+      this.setRepeat(p?.mode ?? this.state.repeat, "audio:cmd:setRepeatMode");
+    });
+
+    // Scaffold: favorites not implemented in AudioSystem yet.
+    // We'll accept the event so nothing errors, but do nothing for now.
+    this.bind("audio:cmd:toggleFavorite", (_p: { trackId: string }) => {
+      // TODO (Harmony Phase 1.5): wire to PersistenceSystem favorites store
+    });
 
     this.bind("audio:seek-nudge", (p: { deltaSec: number }) => {
       const d = Number.isFinite(p?.deltaSec) ? p.deltaSec : 0;
@@ -804,7 +926,9 @@ export class AudioSystem {
     });
 
     this.bind("audio:set-shuffle", (p: { shuffle: boolean }) => this.setShuffle(!!p?.shuffle, "audio:set-shuffle"));
-    this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) => this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"));
+    this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) =>
+      this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"),
+    );
 
     // REQUEST events (do NOT re-emit from within the handler chain)
     this.bind("audio:fade-to-silence", (p: { reason?: AudioFadeReason; durationSec?: number }) =>
