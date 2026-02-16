@@ -133,6 +133,10 @@ export class AudioSystem {
   private readonly stateHz = 6;
   private lastStateEmitCtxTime = -1;
 
+  // Per-track lastTimeSec persistence throttle (while playing)
+  private readonly trackTimePersistHz = 0.5; // every ~2s
+  private lastTrackTimePersistCtxTime = -1;
+
   // Smoothed bands (0..1).
   private smoothedEnergy = 0;
   private smoothedLow = 0;
@@ -154,6 +158,13 @@ export class AudioSystem {
   // peak hold (0..1) for "big moment" visuals.
   private peakHold = 0;
   private readonly peakDecayPerSec = 0.42;
+
+  // ----------------------------------------------------------
+  // Shuffle history (Phase 2)
+  // ----------------------------------------------------------
+
+  private readonly shuffleHistoryMax = 5;
+  private shuffleHistory: string[] = [];
 
   // ----------------------------------------------------------
   // Bus wiring
@@ -189,6 +200,14 @@ export class AudioSystem {
     };
 
     this.attachBusHandlers();
+
+    // Phase 2: if an active track exists in persistence, prefer per-track resume time
+    if (this.state.activeTrackId) {
+      const track = this.persistence.getTrack(this.state.activeTrackId);
+      if (track && Number.isFinite(track.lastTimeSec) && track.lastTimeSec > 0) {
+        this.state.timeSec = Math.max(0, track.lastTimeSec);
+      }
+    }
 
     // Announce initial state for DebugOverlay / diagnostics
     this.emitState("init");
@@ -258,14 +277,28 @@ export class AudioSystem {
   setTrack(trackId: string | null, reason = "audio:set-track"): void {
     if (this.state.activeTrackId === trackId) return;
 
+    // Persist current track's lastTimeSec before switching (Phase 2)
+    this.persistCurrentTrackTime("audio:set-track:before-switch");
+
     const wasPlaying = this.state.isPlaying;
     if (wasPlaying) this.pause("audio:set-track-stop");
 
     this.state.activeTrackId = trackId;
-    this.state.timeSec = 0;
+
+    // Phase 2: resume from per-track lastTimeSec if available
+    let startTime = 0;
+    if (trackId) {
+      const t = this.persistence.getTrack(trackId);
+      if (t && Number.isFinite(t.lastTimeSec) && t.lastTimeSec > 0) startTime = Math.max(0, t.lastTimeSec);
+    }
+
+    this.state.timeSec = startTime;
     this.state.durationSec = null;
 
-    this.persistence.setAudioPlayer({ activeTrackId: trackId, timeSec: 0, durationSec: null }, reason);
+    this.persistence.setAudioPlayer({ activeTrackId: trackId, timeSec: startTime, durationSec: null }, reason);
+
+    if (trackId) this.pushShuffleHistory(trackId);
+
     this.emit("audio:set-track", { trackId });
     this.emitState(reason);
 
@@ -313,9 +346,14 @@ export class AudioSystem {
       this.state.isPlaying = true;
       this.state.lastError = null;
 
+      this.pushShuffleHistory(this.state.activeTrackId);
+
       this.emit("audio:play", { trackId: this.state.activeTrackId });
       this.emitState(reason);
       this.persistPlayer(reason);
+
+      // Immediate per-track resume stamp
+      this.persistCurrentTrackTime("audio:play");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.state.lastError = msg;
@@ -331,6 +369,10 @@ export class AudioSystem {
     this.stopMusicSource("pause");
 
     this.state.isPlaying = false;
+
+    // Phase 2: persist per-track lastTimeSec on pause
+    this.persistCurrentTrackTime("audio:pause");
+
     this.emit("audio:pause", { trackId: this.state.activeTrackId });
     this.emitState(reason);
     this.persistPlayer(reason);
@@ -347,17 +389,16 @@ export class AudioSystem {
     // Update state immediately to requested value.
     this.state.timeSec = t;
 
+    // Persist per-track lastTimeSec for resume (Phase 2)
+    this.persistCurrentTrackTime("audio:seek");
+
     // If we're playing and we already have the decoded buffer, do a true live seek:
     if (this.state.isPlaying && this.audioCtx && this.musicGain && this.currentMusicBuffer) {
       const buffer = this.currentMusicBuffer;
       const safeT = clampFinite(t, 0, Math.max(0, buffer.duration - 0.0001));
 
       // Keep duration consistent
-      if (
-        this.state.durationSec == null ||
-        !Number.isFinite(this.state.durationSec) ||
-        this.state.durationSec <= 0
-      ) {
+      if (this.state.durationSec == null || !Number.isFinite(this.state.durationSec) || this.state.durationSec <= 0) {
         this.state.durationSec = buffer.duration;
       }
 
@@ -401,6 +442,10 @@ export class AudioSystem {
     if (this.state.shuffle === v) return;
     this.state.shuffle = v;
     this.persistence.setAudioPlayer({ shuffle: v }, reason);
+
+    // Reset shuffle history when toggled to avoid weird “stuck” feeling
+    this.shuffleHistory = [];
+
     this.emit("audio:shuffle", { shuffle: v });
     this.emitState(reason);
   }
@@ -467,6 +512,17 @@ export class AudioSystem {
   update(dt: number): void {
     if (this.state.isPlaying) {
       this.updatePlayheadFromCtxTime();
+
+      // Phase 2: periodically persist per-track lastTimeSec while playing
+      if (this.audioCtx && this.state.activeTrackId) {
+        const now = this.audioCtx.currentTime;
+        const interval = 1 / Math.max(0.0001, this.trackTimePersistHz);
+
+        if (this.lastTrackTimePersistCtxTime < 0 || now - this.lastTrackTimePersistCtxTime >= interval) {
+          this.lastTrackTimePersistCtxTime = now;
+          this.persistCurrentTrackTime("audio:tick:trackTime");
+        }
+      }
 
       // Emit audio:state periodically so Harmony UI time advances.
       // Uses AudioContext time for stable throttling.
@@ -743,6 +799,11 @@ export class AudioSystem {
     this.state.isPlaying = false;
     this.musicSource = null;
 
+    // Phase 2: if a track ends, store lastTimeSec=0 (so next play starts fresh)
+    if (this.state.activeTrackId) {
+      this.persistence.setTrackLastTime(this.state.activeTrackId, 0, "audio:ended:setTrackLastTime");
+    }
+
     this.emit("audio:ended", { trackId: this.state.activeTrackId });
     this.emitState("audio:ended");
     this.persistPlayer("audio:ended");
@@ -1011,9 +1072,16 @@ export class AudioSystem {
       this.setRepeat(p?.mode ?? this.state.repeat, "audio:cmd:setRepeatMode");
     });
 
-    // Scaffold: favorites not implemented in AudioSystem yet.
-    this.bind("audio:cmd:toggleFavorite", (_p: { trackId: string }) => {
-      // TODO (Harmony Phase 1.5): wire to PersistenceSystem favorites store
+    // Phase 2: Favorites (wired to Persistence)
+    this.bind("audio:cmd:toggleFavorite", (p: { trackId: string }) => {
+      const id = typeof p?.trackId === "string" ? p.trackId : "";
+      if (!id) return;
+
+      this.persistence.toggleTrackFavorite(id, "audio:cmd:toggleFavorite");
+
+      // UI tends to be listening to persistence:changed, but we also ping audio:state
+      // so the Harmony UI can refresh instantly without coupling.
+      this.emitState("audio:cmd:toggleFavorite");
     });
 
     this.bind("audio:set-volume", (p: { volume: number }) =>
@@ -1104,8 +1172,17 @@ export class AudioSystem {
     if (playable.length === 1) return playable[0] ?? null;
 
     if (this.state.shuffle) {
-      const options = playable.filter((id) => id !== currentId);
-      const pool = options.length > 0 ? options : playable;
+      // Avoid recent repeats (Phase 2)
+      const recent = new Set(this.shuffleHistory.slice(-this.shuffleHistoryMax));
+      recent.add(currentId);
+
+      let pool = playable.filter((id) => !recent.has(id));
+      if (pool.length === 0) {
+        // If everything is “recent”, at least avoid immediate repeat.
+        pool = playable.filter((id) => id !== currentId);
+      }
+      if (pool.length === 0) pool = playable;
+
       const idx = Math.floor(Math.random() * pool.length);
       return pool[idx] ?? null;
     }
@@ -1118,17 +1195,53 @@ export class AudioSystem {
   }
 
   private setTrackSilently(trackId: string | null, reason: string): void {
+    // Persist current before switching
+    this.persistCurrentTrackTime(`${reason}:before-switch`);
+
     this.state.activeTrackId = trackId;
-    this.state.timeSec = 0;
+
+    // Phase 2: resume from per-track lastTimeSec if available
+    let startTime = 0;
+    if (trackId) {
+      const t = this.persistence.getTrack(trackId);
+      if (t && Number.isFinite(t.lastTimeSec) && t.lastTimeSec > 0) startTime = Math.max(0, t.lastTimeSec);
+    }
+
+    this.state.timeSec = startTime;
     this.state.durationSec = null;
 
-    this.persistence.setAudioPlayer({ activeTrackId: trackId, timeSec: 0, durationSec: null }, reason);
+    this.persistence.setAudioPlayer({ activeTrackId: trackId, timeSec: startTime, durationSec: null }, reason);
+
+    if (trackId) this.pushShuffleHistory(trackId);
 
     // Keep UI/state in sync without emitting the "audio:set-track" event (avoids echo loops).
     this.emitState(reason);
 
     if (trackId) {
       this.preloadDurationFor(trackId, `${reason}:duration-preload`);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 2 helpers: per-track resume + shuffle history
+  // ---------------------------------------------------------------------------
+
+  private persistCurrentTrackTime(reason: string): void {
+    const id = this.state.activeTrackId;
+    if (!id) return;
+
+    const t = Number.isFinite(this.state.timeSec) ? Math.max(0, this.state.timeSec) : 0;
+    this.persistence.setTrackLastTime(id, t, reason);
+  }
+
+  private pushShuffleHistory(trackId: string): void {
+    if (!trackId) return;
+    const last = this.shuffleHistory[this.shuffleHistory.length - 1];
+    if (last === trackId) return;
+
+    this.shuffleHistory.push(trackId);
+    if (this.shuffleHistory.length > this.shuffleHistoryMax * 2) {
+      this.shuffleHistory = this.shuffleHistory.slice(-this.shuffleHistoryMax);
     }
   }
 

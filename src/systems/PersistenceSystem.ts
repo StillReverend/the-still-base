@@ -147,6 +147,11 @@ const clamp01 = (v: number): number => {
   return v;
 };
 
+const clampNonNeg = (v: number): number => {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, v);
+};
+
 const nowMs = (): number => Date.now();
 
 const createDefaultState = (): UserState => {
@@ -339,6 +344,18 @@ export class PersistenceSystem {
   }
 
   // ---------------------------------------------------------------------------
+  // Convenience getters
+  // ---------------------------------------------------------------------------
+
+  /** Returns the track state (clone-safe) or null if it doesn't exist in persistence. */
+  getTrack(trackId: string): TrackState | null {
+    const id = typeof trackId === "string" ? trackId : "";
+    if (!id) return null;
+    const t = this.state.tracks?.[id];
+    return t ? safeClone(t) : null;
+  }
+
+  // ---------------------------------------------------------------------------
   // Convenience setters
   // ---------------------------------------------------------------------------
 
@@ -378,24 +395,68 @@ export class PersistenceSystem {
   }
 
   upsertTrack(trackId: string, partial: Partial<Omit<TrackState, "id">>, reason = "tracks:upsert"): void {
-    const existing = this.state.tracks[trackId] ?? {
-      id: trackId,
+    const id = typeof trackId === "string" ? trackId : "";
+    if (!id) return;
+
+    const existing = this.state.tracks[id] ?? {
+      id,
       unlocked: false,
       favorite: false,
       lastTimeSec: 0,
     };
 
     const tracks = { ...this.state.tracks };
-    tracks[trackId] = {
+    tracks[id] = {
       ...existing,
       ...partial,
-      id: trackId,
+      id,
       lastTimeSec: Number.isFinite(partial.lastTimeSec ?? existing.lastTimeSec)
         ? Math.max(0, partial.lastTimeSec ?? existing.lastTimeSec)
         : existing.lastTimeSec,
+      favorite: typeof partial.favorite === "boolean" ? partial.favorite : existing.favorite,
+      unlocked: typeof partial.unlocked === "boolean" ? partial.unlocked : existing.unlocked,
     };
 
     this.update({ tracks }, reason);
+  }
+
+  /** Phase 2: explicitly set favorite state (creates track entry if needed). */
+  setTrackFavorite(trackId: string, favorite: boolean, reason = "tracks:setFavorite"): void {
+    const id = typeof trackId === "string" ? trackId : "";
+    if (!id) return;
+
+    const existing = this.state.tracks[id] ?? {
+      id,
+      unlocked: false,
+      favorite: false,
+      lastTimeSec: 0,
+    };
+
+    if (existing.favorite === Boolean(favorite)) return;
+
+    this.upsertTrack(id, { favorite: Boolean(favorite) }, reason);
+  }
+
+  /** Phase 2: toggle favorite (creates track entry if needed). */
+  toggleTrackFavorite(trackId: string, reason = "tracks:toggleFavorite"): void {
+    const id = typeof trackId === "string" ? trackId : "";
+    if (!id) return;
+
+    const existing = this.state.tracks[id] ?? {
+      id,
+      unlocked: false,
+      favorite: false,
+      lastTimeSec: 0,
+    };
+
+    this.upsertTrack(id, { favorite: !existing.favorite }, reason);
+  }
+
+  /** Phase 2: persist per-track resume position (creates track entry if needed). */
+  setTrackLastTime(trackId: string, lastTimeSec: number, reason = "tracks:setLastTime"): void {
+    const id = typeof trackId === "string" ? trackId : "";
+    if (!id) return;
+    this.upsertTrack(id, { lastTimeSec: clampNonNeg(lastTimeSec) }, reason);
   }
 
   setAudioPlayer(partial: Partial<AudioPlayerState>, reason = "audio:update"): void {
@@ -424,7 +485,10 @@ export class PersistenceSystem {
       durationSec: nextDurationSec,
 
       volume: clamp01(partial.volume ?? this.state.audio.volume),
-      repeat: partial.repeat === "one" || partial.repeat === "all" || partial.repeat === "off" ? (partial.repeat ?? this.state.audio.repeat) : this.state.audio.repeat,
+      repeat:
+        partial.repeat === "one" || partial.repeat === "all" || partial.repeat === "off"
+          ? (partial.repeat ?? this.state.audio.repeat)
+          : this.state.audio.repeat,
     };
 
     this.update({ audio }, reason);
