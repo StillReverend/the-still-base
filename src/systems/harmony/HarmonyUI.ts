@@ -12,6 +12,10 @@ type UIHandlers = {
   onTogglePlay(): void;
   onSeek(timeSec: number): void;
 
+  // Phase 2: track navigation
+  onPrevTrack(): void;
+  onNextTrack(): void;
+
   onToggleShuffle(): void;
   onCycleRepeat(): void;
   onSetVolume(volume01: number): void;
@@ -105,7 +109,11 @@ export class HarmonyUI {
   private bar: HTMLDivElement;
   private panel: HTMLDivElement;
 
+  // Phase 2: prev/next
+  private btnPrev: HTMLButtonElement;
   private btnPlay: HTMLButtonElement;
+  private btnNext: HTMLButtonElement;
+
   private scrub: HTMLInputElement;
   private titleText: HTMLDivElement;
   private timeText: HTMLDivElement;
@@ -277,11 +285,24 @@ export class HarmonyUI {
     this.bar = document.createElement("div");
     this.bar.className = "harmony-bar";
 
+    // Phase 2: Prev / Play / Next cluster
+    this.btnPrev = document.createElement("button");
+    this.btnPrev.className = "harmony-btn";
+    this.btnPrev.type = "button";
+    this.btnPrev.textContent = "Prev";
+    this.unbinds.push(bindPress(this.btnPrev, () => this.handlers.onPrevTrack()));
+
     this.btnPlay = document.createElement("button");
     this.btnPlay.className = "harmony-btn";
     this.btnPlay.type = "button";
     this.btnPlay.textContent = "Play";
     this.unbinds.push(bindPress(this.btnPlay, () => this.handlers.onTogglePlay()));
+
+    this.btnNext = document.createElement("button");
+    this.btnNext.className = "harmony-btn";
+    this.btnNext.type = "button";
+    this.btnNext.textContent = "Next";
+    this.unbinds.push(bindPress(this.btnNext, () => this.handlers.onNextTrack()));
 
     const titleWrap = document.createElement("div");
     titleWrap.className = "harmony-title";
@@ -423,7 +444,10 @@ export class HarmonyUI {
       bindPress(this.btnHide, () => this.handlers.onSetUIVisible(false), { stopPropagation: true }),
     );
 
+    // Order: Prev / Play / Next / Title / Scrub / Shuffle / Repeat / Vol / Vibe / Hide
+    this.bar.appendChild(this.btnPrev);
     this.bar.appendChild(this.btnPlay);
+    this.bar.appendChild(this.btnNext);
     this.bar.appendChild(titleWrap);
     this.bar.appendChild(this.scrub);
     this.bar.appendChild(this.btnShuffle);

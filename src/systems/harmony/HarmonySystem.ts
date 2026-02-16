@@ -57,6 +57,17 @@ export class HarmonySystem {
         // No local position write here; AudioSystem will confirm via audio:state ticks.
       },
 
+      // NEW: Prev/Next track (Phase 2 navigation)
+      onPrevTrack: () => {
+        this.emit("audio:unlock-request", {});
+        this.emit("audio:cmd:prevTrack", { source: "harmony" });
+      },
+
+      onNextTrack: () => {
+        this.emit("audio:unlock-request", {});
+        this.emit("audio:cmd:nextTrack", { source: "harmony" });
+      },
+
       onToggleShuffle: () => this.setShuffle(!this.state.shuffle),
       onCycleRepeat: () => this.cycleRepeat(),
 
