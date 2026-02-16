@@ -465,8 +465,10 @@ export class PersistenceSystem {
     const nextTimeSec = Number.isFinite(partial.timeSec ?? NaN) ? Math.max(0, Number(partial.timeSec)) : this.state.audio.timeSec;
 
     const nextDurationSec =
-      partial.durationSec == null
-        ? this.state.audio.durationSec
+    partial.durationSec === undefined
+      ? this.state.audio.durationSec
+      : partial.durationSec === null
+        ? null
         : Number.isFinite(partial.durationSec)
           ? Math.max(0, Number(partial.durationSec))
           : this.state.audio.durationSec;

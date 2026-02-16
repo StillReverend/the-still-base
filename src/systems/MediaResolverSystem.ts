@@ -111,8 +111,10 @@ export class MediaResolverSystem {
     }
 
     // DEV URL candidates
-    // We return multiple candidates so you can change extensions/paths later without touching AudioSystem.
-    const urls = this.getDevUrlCandidates(trackId);
+    // - Prefer explicit TrackCatalog URLs when present (lets you alias IDs like lift_alt -> lift.mp3)
+    // - Also provide a DEV alias fallback for "/audio/*" -> `${devBasePath}/*`
+    // - Fall back to conventional `${devBasePath}/${trackId}.{ext}` candidates
+    const urls = this.getDevUrlCandidates(trackId, meta);
 
     this.emitResult({
       requestId,
@@ -122,11 +124,49 @@ export class MediaResolverSystem {
     });
   }
 
-  private getDevUrlCandidates(trackId: string): string[] {
+  /**
+   * DEV alias helper:
+   * If TrackCatalog uses "/audio/foo.mp3" but DEV serves from devBasePath (e.g. "/assets/audio"),
+   * provide a mapped fallback URL so AudioSystem can still load the file.
+   */
+  private mapDevAudioAlias(url: string): string | null {
+    if (!url) return null;
+
+    const u = url.trim();
+    if (!u.startsWith("/audio/")) return null;
+
+    const filename = u.split("/").pop() || "";
+    if (!filename) return null;
+
+    return `${this.devBasePath}/${filename}`;
+  }
+
+  private getDevUrlCandidates(trackId: string, meta?: ReturnType<typeof getTrackMeta>): string[] {
+    const urls: string[] = [];
+
+    // 1) TrackCatalog explicit urls (highest priority)
+    // NOTE: TrackCatalog can store urls like "/audio/lift.mp3" or "/assets/audio/lift.mp3".
+    // We accept absolute (http...), root-relative ("/...") and relative ("assets/...") paths.
+    const metaUrls = (meta as any)?.urls as unknown;
+    if (Array.isArray(metaUrls)) {
+      for (const u of metaUrls) {
+        if (typeof u !== "string") continue;
+        const trimmed = u.trim();
+        if (!trimmed) continue;
+
+        // Original catalog URL
+        urls.push(trimmed);
+
+        // DEV alias fallback: "/audio/foo.mp3" -> `${devBasePath}/foo.mp3`
+        const mapped = this.mapDevAudioAlias(trimmed);
+        if (mapped) urls.push(mapped);
+      }
+    }
+
+    // 2) Conventional candidates (so existing behavior still works)
     const id = trackId;
     const lower = trackId.toLowerCase();
 
-    const urls: string[] = [];
     urls.push(`${this.devBasePath}/${id}.mp3`);
     urls.push(`${this.devBasePath}/${id}.m4a`);
     urls.push(`${this.devBasePath}/${id}.ogg`);
@@ -137,8 +177,8 @@ export class MediaResolverSystem {
       urls.push(`${this.devBasePath}/${lower}.ogg`);
     }
 
-    // De-dupe
-    return Array.from(new Set(urls));
+    // De-dupe + drop empties
+    return Array.from(new Set(urls)).filter(Boolean);
   }
 
   private emitResult(res: MediaResolveResult): void {

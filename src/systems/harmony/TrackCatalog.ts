@@ -22,7 +22,10 @@ export type TrackMeta = {
 };
 
 // NOTE: Keep this list small for now. Add as you wire more.
-const TRACKS: TrackMeta[] = [{ id: "Lift", title: "Lift", kind: "song", order: 1, defaultUnlocked: true }];
+const TRACKS: TrackMeta[] = [
+  { id: "Lift", title: "Lift", kind: "song", order: 1, defaultUnlocked: true },
+  { id: "Legacy", title: "Legacy", kind: "song", defaultUnlocked: true, order: 2 },
+];
 
 /**
  * Returns all tracks sorted by `order`.

@@ -159,6 +159,9 @@ export class AudioSystem {
   private peakHold = 0;
   private readonly peakDecayPerSec = 0.42;
 
+  // UX: If you press Prev after this many seconds, restart the current track instead.
+  private readonly prevRestartThresholdSec = 3;
+
   // ----------------------------------------------------------
   // Shuffle history (Phase 2)
   // ----------------------------------------------------------
@@ -382,6 +385,63 @@ export class AudioSystem {
     if (this.state.isPlaying) this.pause(reason);
     else void this.play(reason);
   }
+
+  // Phase 2: Next/Prev (Harmony UI)
+  nextTrack(reason = "audio:next"): void {
+    const currentId = this.state.activeTrackId;
+    if (!currentId) return;
+
+    const nextId = this.pickNextTrackId(currentId);
+    if (!nextId) return;
+
+    const wasPlaying = this.state.isPlaying;
+
+    // ✅ Stop current source so play() will actually restart on the new track
+    if (wasPlaying) this.pause(`${reason}:before-skip`);
+
+    this.setTrackSilently(nextId, reason, { resumeFromLastTime: false });
+
+    if (wasPlaying) void this.play(`${reason}:auto-play`);
+  }
+
+  // Phase 2: Prev/Next (Harmony UI)
+prevTrack(reason = "audio:prev"): void {
+  const currentId = this.state.activeTrackId;
+  if (!currentId) return;
+
+  const wasPlaying = this.state.isPlaying;
+
+  // If we're far enough into the track, "Prev" restarts the current track (music player behavior).
+  const threshold = this.prevRestartThresholdSec;
+  const curTime = Number.isFinite(this.state.timeSec) ? this.state.timeSec : 0;
+
+  if (curTime > threshold) {
+    // Restart current track at 0:00
+    if (wasPlaying) this.pause(`${reason}:restart-current`);
+
+    // Important: force playhead to 0 for this track (and persist it)
+    this.state.timeSec = 0;
+    if (currentId) this.persistence.setTrackLastTime(currentId, 0, `${reason}:restart-current:setLastTime`);
+
+    // Keep player state consistent
+    this.persistence.setAudioPlayer({ timeSec: 0 }, `${reason}:restart-current:setPlayerTime`);
+    this.emitState(`${reason}:restart-current`);
+
+    if (wasPlaying) void this.play(`${reason}:restart-current:auto-play`);
+    return;
+  }
+
+  // Otherwise: go to previous track
+  const prevId = this.pickPrevTrackId(currentId);
+  if (!prevId) return;
+
+  if (wasPlaying) this.pause(`${reason}:before-skip`);
+
+  // Start prev track from the beginning (not lastTimeSec)
+  this.setTrackSilently(prevId, reason, { resumeFromLastTime: false });
+
+  if (wasPlaying) void this.play(`${reason}:auto-play`);
+}
 
   seek(timeSec: number, reason = "audio:seek"): void {
     const t = Math.max(0, Number.isFinite(timeSec) ? timeSec : 0);
@@ -1068,6 +1128,15 @@ export class AudioSystem {
       this.setTrack(id, "audio:cmd:selectTrack");
     });
 
+    // Phase 2: Next/Prev Track
+    this.bind("audio:cmd:nextTrack", () => {
+      this.nextTrack("audio:cmd:nextTrack");
+    });
+
+    this.bind("audio:cmd:prevTrack", () => {
+      this.prevTrack("audio:cmd:prevTrack");
+    });
+
     this.bind("audio:cmd:setRepeatMode", (p: { mode: RepeatMode }) => {
       this.setRepeat(p?.mode ?? this.state.repeat, "audio:cmd:setRepeatMode");
     });
@@ -1194,15 +1263,55 @@ export class AudioSystem {
     return next ?? null;
   }
 
-  private setTrackSilently(trackId: string | null, reason: string): void {
+  // Phase 2: Prev behavior (uses shuffleHistory when shuffle is enabled)
+  private pickPrevTrackId(currentId: string): string | null {
+    const playable = this.getPlayableTrackIds("song");
+
+    if (playable.length === 0) return null;
+    if (playable.length === 1) return playable[0] ?? null;
+
+    if (this.state.shuffle) {
+      const h = this.shuffleHistory;
+      if (h.length >= 2) {
+        for (let i = h.length - 1; i >= 0; i--) {
+          if (h[i] === currentId) {
+            const prev = h[i - 1];
+            if (prev) return prev;
+            break;
+          }
+        }
+        const prev = h[h.length - 2];
+        if (prev) return prev;
+      }
+
+      const pool = playable.filter((id) => id !== currentId);
+      return (pool[pool.length - 1] ?? playable[0]) ?? null;
+    }
+
+    const idx = playable.indexOf(currentId);
+    if (idx < 0) return playable[0] ?? null;
+
+    const prev = playable[(idx - 1 + playable.length) % playable.length];
+    return prev ?? null;
+  }
+
+  private setTrackSilently(
+    trackId: string | null,
+    reason: string,
+    opts?: { resumeFromLastTime?: boolean },
+  ): void {
     // Persist current before switching
     this.persistCurrentTrackTime(`${reason}:before-switch`);
 
     this.state.activeTrackId = trackId;
 
-    // Phase 2: resume from per-track lastTimeSec if available
+    const resume = opts?.resumeFromLastTime ?? true;
+
+    // Resume behavior is configurable:
+    // - resume=true  => use per-track lastTimeSec (podcast-like)
+    // - resume=false => start at 0 (music-player next/prev behavior)
     let startTime = 0;
-    if (trackId) {
+    if (trackId && resume) {
       const t = this.persistence.getTrack(trackId);
       if (t && Number.isFinite(t.lastTimeSec) && t.lastTimeSec > 0) startTime = Math.max(0, t.lastTimeSec);
     }
