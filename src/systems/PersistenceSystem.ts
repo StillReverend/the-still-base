@@ -131,6 +131,8 @@ export interface PersistenceSavedPayload {
 
 const SAVE_KEY = "userState";
 
+// We intentionally treat SaveManager as schema-agnostic via a narrow escape hatch.
+// This avoids changing SaveManager typings for Phase 1.
 type SaveManagerAny = SaveManager & {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   get: (key: any) => any;
@@ -191,12 +193,8 @@ const sanitizeState = (state: UserState): UserState => {
     version: 1,
     gate: {
       status: state.gate?.status === "closed" ? "closed" : "open",
-      lastOpenedAtMs: Number.isFinite(state.gate?.lastOpenedAtMs ?? NaN)
-        ? (state.gate.lastOpenedAtMs as number)
-        : null,
-      lastClosedAtMs: Number.isFinite(state.gate?.lastClosedAtMs ?? NaN)
-        ? (state.gate.lastClosedAtMs as number)
-        : null,
+      lastOpenedAtMs: Number.isFinite(state.gate?.lastOpenedAtMs ?? NaN) ? (state.gate.lastOpenedAtMs as number) : null,
+      lastClosedAtMs: Number.isFinite(state.gate?.lastClosedAtMs ?? NaN) ? (state.gate.lastClosedAtMs as number) : null,
       reopenCount: Number.isFinite(state.gate?.reopenCount ?? NaN) ? Math.max(0, state.gate.reopenCount) : 0,
     },
     player: {
@@ -216,20 +214,11 @@ const sanitizeState = (state: UserState): UserState => {
     },
     audio: {
       activeTrackId: typeof state.audio?.activeTrackId === "string" ? state.audio.activeTrackId : null,
-
       isPlaying: Boolean((state.audio as Partial<AudioPlayerState>)?.isPlaying),
-
       timeSec: Number.isFinite((state.audio as Partial<AudioPlayerState>)?.timeSec ?? NaN)
         ? Math.max(0, Number((state.audio as Partial<AudioPlayerState>).timeSec))
         : 0,
-
-      durationSec:
-        rawDuration == null
-          ? null
-          : Number.isFinite(rawDuration)
-            ? Math.max(0, Number(rawDuration))
-            : null,
-
+      durationSec: rawDuration == null ? null : Number.isFinite(rawDuration) ? Math.max(0, Number(rawDuration)) : null,
       shuffle: Boolean(state.audio?.shuffle),
       repeat: state.audio?.repeat === "one" || state.audio?.repeat === "all" ? state.audio.repeat : "off",
       volume: clamp01(state.audio?.volume ?? 0),
@@ -271,12 +260,15 @@ const sanitizeState = (state: UserState): UserState => {
 const isUserStateV1 = (raw: unknown): raw is UserState => {
   if (!raw || typeof raw !== "object") return false;
   const r = raw as Partial<UserState>;
-  return (
-    r.version === 1 &&
-    typeof r.gate === "object" &&
-    typeof r.harmony === "object" &&
-    typeof r.audio === "object"
-  );
+  return r.version === 1 && typeof r.gate === "object" && typeof r.harmony === "object" && typeof r.audio === "object";
+};
+
+const safeClone = <T>(v: T): T => {
+  // structuredClone is ideal; JSON fallback is fine for our plain-data state.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sc = (globalThis as any).structuredClone as ((x: unknown) => unknown) | undefined;
+  if (typeof sc === "function") return sc(v) as T;
+  return JSON.parse(JSON.stringify(v)) as T;
 };
 
 export class PersistenceSystem {
@@ -306,7 +298,7 @@ export class PersistenceSystem {
 
   /** Returns a deep-ish copy safe for consumers (no mutation). */
   getState(): UserState {
-    return structuredClone(this.state);
+    return safeClone(this.state);
   }
 
   /**
@@ -347,7 +339,7 @@ export class PersistenceSystem {
   }
 
   // ---------------------------------------------------------------------------
-  // Convenience setters (kept small; we can add more as systems come online)
+  // Convenience setters
   // ---------------------------------------------------------------------------
 
   setGateStatus(status: GateStatus, reason = "gate:setStatus"): void {
@@ -358,9 +350,7 @@ export class PersistenceSystem {
       lastOpenedAtMs: status === "open" ? t : this.state.gate.lastOpenedAtMs,
       lastClosedAtMs: status === "closed" ? t : this.state.gate.lastClosedAtMs,
       reopenCount:
-        status === "open" && this.state.gate.status === "closed"
-          ? this.state.gate.reopenCount + 1
-          : this.state.gate.reopenCount,
+        status === "open" && this.state.gate.status === "closed" ? this.state.gate.reopenCount + 1 : this.state.gate.reopenCount,
     };
     this.update({ gate }, reason);
   }
@@ -409,11 +399,9 @@ export class PersistenceSystem {
   }
 
   setAudioPlayer(partial: Partial<AudioPlayerState>, reason = "audio:update"): void {
-    const nextIsPlaying =
-      typeof partial.isPlaying === "boolean" ? partial.isPlaying : this.state.audio.isPlaying;
+    const nextIsPlaying = typeof partial.isPlaying === "boolean" ? partial.isPlaying : this.state.audio.isPlaying;
 
-    const nextTimeSec =
-      Number.isFinite(partial.timeSec ?? NaN) ? Math.max(0, Number(partial.timeSec)) : this.state.audio.timeSec;
+    const nextTimeSec = Number.isFinite(partial.timeSec ?? NaN) ? Math.max(0, Number(partial.timeSec)) : this.state.audio.timeSec;
 
     const nextDurationSec =
       partial.durationSec == null
@@ -436,10 +424,7 @@ export class PersistenceSystem {
       durationSec: nextDurationSec,
 
       volume: clamp01(partial.volume ?? this.state.audio.volume),
-      repeat:
-        partial.repeat === "one" || partial.repeat === "all" || partial.repeat === "off"
-          ? (partial.repeat ?? this.state.audio.repeat)
-          : this.state.audio.repeat,
+      repeat: partial.repeat === "one" || partial.repeat === "all" || partial.repeat === "off" ? (partial.repeat ?? this.state.audio.repeat) : this.state.audio.repeat,
     };
 
     this.update({ audio }, reason);

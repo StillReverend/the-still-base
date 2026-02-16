@@ -23,6 +23,8 @@ import { HowlerAudioSystem } from "../systems/HowlerAudioSystem";
 import { InteractionSystem } from "../systems/InteractionSystem";
 import { HarmonySystem } from "../systems/harmony/HarmonySystem";
 
+import { MediaResolverSystem } from "../systems/MediaResolverSystem";
+
 interface SceneSwitchPayload {
   name: SceneName;
 }
@@ -51,6 +53,9 @@ export class Engine {
   private readonly controlSystem: ControlSystem;
 
   private readonly persistence: PersistenceSystem;
+
+  private readonly mediaResolver: MediaResolverSystem;
+
   private readonly gateSystem: GateSystem;
   private readonly audioSystem: AudioSystem;
   private readonly howlerAudioSystem: HowlerAudioSystem;
@@ -73,6 +78,9 @@ export class Engine {
   private lastResizeH = -1;
   private lastResizePR = -1;
 
+  // ✅ Keep a stable reference so we can unbind on dispose (HMR-safe)
+  private readonly onSceneSwitch: (payload: SceneSwitchPayload) => void;
+
   constructor(deps: EngineDeps) {
     this.canvas = deps.canvas;
     this.bus = deps.bus;
@@ -86,6 +94,14 @@ export class Engine {
       save: this.save,
       autosaveDebounceMs: 750,
     });
+
+    // Media resolver (Engine-owned)
+    this.mediaResolver = new MediaResolverSystem({
+      bus: this.bus,
+      persistence: this.persistence,
+      devBasePath: "/assets/audio",
+    });
+    this.mediaResolver.init();
 
     // Gate (local wall-clock midnight enforcement)
     this.gateSystem = new GateSystem(this.bus, this.persistence);
@@ -202,8 +218,8 @@ export class Engine {
       this.lastRenderScene = current.scene;
     }
 
-    // Listen for scene switch events
-    this.bus.on<SceneSwitchPayload>("scene:switch", (payload) => {
+    // ✅ Scene switch handler (stored for cleanup)
+    this.onSceneSwitch = (payload: SceneSwitchPayload) => {
       const next = this.resolveScene(payload.name);
       if (!next) {
         // eslint-disable-next-line no-console
@@ -211,7 +227,10 @@ export class Engine {
         return;
       }
       this.sceneManager.requestScene(next);
-    });
+    };
+
+    // Listen for scene switch events
+    this.bus.on<SceneSwitchPayload>("scene:switch", this.onSceneSwitch);
 
     // DEV-only debug overlay + dev tools
     if (import.meta.env.DEV) {
@@ -432,6 +451,9 @@ export class Engine {
     this.stop();
     window.removeEventListener("resize", this.handleResize);
 
+    // ✅ Unbind bus listeners created by Engine
+    this.bus.off("scene:switch", this.onSceneSwitch);
+
     if (this.devTools) {
       this.devTools.dispose();
       this.devTools = null;
@@ -451,6 +473,8 @@ export class Engine {
 
     // Audio: detach bus handlers
     this.audioSystem.dispose();
+
+    this.mediaResolver.dispose();
 
     // Persistence: cancel any pending autosave timers
     this.gateSystem.dispose();

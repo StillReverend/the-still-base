@@ -10,12 +10,11 @@
 //
 // MVP:
 //  - WebAudio unlock + minimal graph (music channel only for now)
-//  - Load + play an mp3 (trackId -> url candidates) via fetch + decode
+//  - Resolve media URLs via MediaResolverSystem (EventBus request/response)
+//  - Load + play via fetch + decodeAudioData
 //  - Play/Pause/Seek/Volume; emits audio:state + diagnostics
 //
 // Notes:
-//  - Track catalog is intentionally "best-effort" URL resolution right now.
-//    We'll formalize this into a proper TrackRegistry later.
 //  - IMPORTANT ARCH RULE:
 //      "audio:fade-to-silence" and "audio:resume" are *REQUEST* events.
 //      AudioSystem must NEVER emit them, or it can recurse through its own handlers.
@@ -27,6 +26,8 @@ import type { PersistenceSystem, RepeatMode } from "./PersistenceSystem";
 // ✅ Single canonical contract for audio:state payload.state
 // (Harmony consumes this via EventBus only; no runtime coupling required.)
 import type { AudioSystemState } from "./harmony/types";
+
+import { getAllTracks } from "./harmony/TrackCatalog";
 
 export type AudioFadeReason = "gate" | "user" | "system";
 
@@ -48,6 +49,16 @@ export interface AudioSystemDeps {
    */
   defaultFadeMs?: number;
 }
+
+type MediaPurpose = "decode" | "duration";
+
+type MediaResolveResultPayload = {
+  requestId: string;
+  trackId: string;
+  ok: boolean;
+  urls?: string[];
+  error?: string;
+};
 
 export class AudioSystem {
   private readonly bus: EventBus;
@@ -90,6 +101,23 @@ export class AudioSystem {
 
   // keep reference to the current decoded buffer so we can live-seek while playing
   private currentMusicBuffer: AudioBuffer | null = null;
+
+  // ----------------------------------------------------------
+  // Media Resolver (EventBus request/response)
+  // ----------------------------------------------------------
+
+  private mediaReqSeq = 0;
+
+  private pendingMedia = new Map<
+    string,
+    {
+      resolve: (urls: string[]) => void;
+      reject: (err: Error) => void;
+      trackId: string;
+      purpose: MediaPurpose;
+      timeoutId: number;
+    }
+  >();
 
   // ----------------------------------------------------------
   // Audio frame (FFT -> bands) for reactive systems
@@ -325,7 +353,11 @@ export class AudioSystem {
       const safeT = clampFinite(t, 0, Math.max(0, buffer.duration - 0.0001));
 
       // Keep duration consistent
-      if (this.state.durationSec == null || !Number.isFinite(this.state.durationSec) || this.state.durationSec <= 0) {
+      if (
+        this.state.durationSec == null ||
+        !Number.isFinite(this.state.durationSec) ||
+        this.state.durationSec <= 0
+      ) {
         this.state.durationSec = buffer.duration;
       }
 
@@ -469,6 +501,17 @@ export class AudioSystem {
   }
 
   dispose(): void {
+    // Cancel any pending media resolves
+    for (const [id, p] of this.pendingMedia.entries()) {
+      try {
+        window.clearTimeout(p.timeoutId);
+      } catch {}
+      try {
+        p.reject(new Error("AudioSystem disposed."));
+      } catch {}
+      this.pendingMedia.delete(id);
+    }
+
     this.detachBusHandlers();
     this.stopMusicSource("dispose");
 
@@ -553,13 +596,30 @@ export class AudioSystem {
     this.emit("audio:graph", { reason, master, ctxState: this.audioCtx.state });
   }
 
+  private resolveMediaUrls(trackId: string, purpose: MediaPurpose): Promise<string[]> {
+    const requestId = `m${Date.now()}_${++this.mediaReqSeq}_${trackId}`;
+
+    return new Promise((resolve, reject) => {
+      const timeoutMs = 6000;
+
+      const timeoutId = window.setTimeout(() => {
+        this.pendingMedia.delete(requestId);
+        reject(new Error(`Media resolve timed out for "${trackId}".`));
+      }, timeoutMs);
+
+      this.pendingMedia.set(requestId, { resolve, reject, trackId, purpose, timeoutId });
+
+      this.emit("media:resolve", { requestId, trackId, purpose });
+    });
+  }
+
   private async getDecodedBuffer(trackId: string): Promise<AudioBuffer> {
     const cached = this.decoded.get(trackId);
     if (cached) return cached;
 
     if (!this.audioCtx) throw new Error("AudioContext not ready.");
 
-    const urls = this.getTrackUrlCandidates(trackId);
+    const urls = await this.resolveMediaUrls(trackId, "decode");
     let lastErr: unknown = null;
 
     for (const url of urls) {
@@ -594,12 +654,20 @@ export class AudioSystem {
     this.durationPreloadInFlight = (async () => {
       try {
         await this.ensureGraph(); // safe; won’t start playback
-        const buf = await this.getDecodedBuffer(trackId);
+
+        // Prefer a lightweight "duration" resolve, even though DEV currently returns the same URLs.
+        // This future-proofs signed URLs / analytics without changing AudioSystem later.
+        const urls = await this.resolveMediaUrls(trackId, "duration");
+
+        // If decode cache already has it, use it.
+        const cached = this.decoded.get(trackId);
+        const buf = cached ?? (await this.tryDecodeFirstWorkingUrl(trackId, urls));
+
+        if (!buf) return;
 
         // Only apply if still the active track
         if (this.state.activeTrackId !== trackId) return;
 
-        // Update duration if we didn’t know it yet (or it changed)
         const dur = buf.duration;
         if (Number.isFinite(dur) && dur > 0) {
           this.state.durationSec = dur;
@@ -614,16 +682,51 @@ export class AudioSystem {
     })();
   }
 
+  private async tryDecodeFirstWorkingUrl(trackId: string, urls: string[]): Promise<AudioBuffer | null> {
+    if (!this.audioCtx) return null;
+
+    let lastErr: unknown = null;
+
+    for (const url of urls) {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+        const arr = await res.arrayBuffer();
+
+        const audioBuf = await this.decodeArrayBuffer(arr);
+        this.decoded.set(trackId, audioBuf);
+
+        this.emit("audio:track-decoded", { trackId, url, durationSec: audioBuf.duration, purpose: "duration" });
+        return audioBuf;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    // Don’t throw for duration preload; just emit a soft diagnostic.
+    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    this.emit("audio:duration-preload-failed", { trackId, message: msg });
+    return null;
+  }
+
   private decodeArrayBuffer(arr: ArrayBuffer): Promise<AudioBuffer> {
     if (!this.audioCtx) return Promise.reject(new Error("AudioContext not ready."));
     const ctx = this.audioCtx;
 
+    // ✅ FIX: Avoid double-resolve on browsers where decodeAudioData returns a Promise
+    // but also accepts callbacks (Safari/WebKit edge cases).
+    try {
+      const maybePromise = (ctx.decodeAudioData as unknown as (buffer: ArrayBuffer) => Promise<AudioBuffer>)(arr);
+      if (maybePromise && typeof (maybePromise as any).then === "function") {
+        return maybePromise;
+      }
+    } catch {
+      // fall through to callback style
+    }
+
     return new Promise((resolve, reject) => {
       try {
-        const p = ctx.decodeAudioData(arr, resolve, reject);
-        if (p && typeof (p as any).then === "function") {
-          (p as Promise<AudioBuffer>).then(resolve).catch(reject);
-        }
+        ctx.decodeAudioData(arr, resolve, reject);
       } catch (e) {
         reject(e);
       }
@@ -649,26 +752,49 @@ export class AudioSystem {
     if (!this.state.isUnlocked) return;
     if (!this.state.activeTrackId) return;
 
-    // NOTE:
-    // - "all" will eventually mean "advance to next track in catalog/playlist".
-    // - Until we have that catalog wiring, treat "all" as looping the current track.
-    const shouldLoop = this.state.repeat === "one" || this.state.repeat === "all";
-    if (!shouldLoop) return;
+    // Repeat One: loop the same buffer
+    if (this.state.repeat === "one") {
+      try {
+        this.state.timeSec = 0;
+        this.startMusicSource(endedBuffer, 0, "audio:repeat-one");
+        this.state.isPlaying = true;
 
-    try {
-      this.state.timeSec = 0;
-      this.startMusicSource(endedBuffer, 0, "audio:repeat");
-      this.state.isPlaying = true;
-
-      this.emit("audio:repeat", { mode: this.state.repeat, trackId: this.state.activeTrackId });
-      this.emitState("audio:repeat");
-      this.persistPlayer("audio:repeat");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.state.lastError = msg;
-      this.emit("audio:repeat-failed", { message: msg });
-      this.emitState("audio:repeat-failed");
+        this.emit("audio:repeat", { mode: "one", trackId: this.state.activeTrackId });
+        this.emitState("audio:repeat-one");
+        this.persistPlayer("audio:repeat-one");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.state.lastError = msg;
+        this.emit("audio:repeat-failed", { message: msg });
+        this.emitState("audio:repeat-failed");
+      }
+      return;
     }
+
+    // Repeat All: advance through TrackCatalog order (or shuffle) across UNLOCKED songs
+    if (this.state.repeat === "all") {
+      const currentId = this.state.activeTrackId;
+      const nextId = this.pickNextTrackId(currentId);
+
+      if (!nextId) return;
+
+      try {
+        // If only one playable track exists, this behaves like looping.
+        this.setTrackSilently(nextId, "audio:repeat-all-next");
+        awaitableVoid(this.play("audio:repeat-all-next"));
+
+        this.emit("audio:repeat", { mode: "all", from: currentId, to: nextId });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.state.lastError = msg;
+        this.emit("audio:repeat-failed", { message: msg });
+        this.emitState("audio:repeat-failed");
+      }
+      return;
+    }
+
+    // Repeat Off: do nothing
+    return;
   }
 
   private startMusicSource(
@@ -731,24 +857,6 @@ export class AudioSystem {
     if (Number.isFinite(t)) this.state.timeSec = t;
   }
 
-  private getTrackUrlCandidates(trackId: string): string[] {
-    const name = trackId;
-
-    const urls: string[] = [];
-    urls.push(`/assets/audio/${name}.mp3`);
-    urls.push(`/audio/${name}.mp3`);
-    urls.push(`/${name}.mp3`);
-
-    const lower = name.toLowerCase();
-    if (lower !== name) {
-      urls.push(`/assets/audio/${lower}.mp3`);
-      urls.push(`/audio/${lower}.mp3`);
-      urls.push(`/${lower}.mp3`);
-    }
-
-    return Array.from(new Set(urls));
-  }
-
   // ---------------------------------------------------------------------------
   // Reactive frame emission (FFT -> energy/low/mid/high + onset + peakHold)
   // ---------------------------------------------------------------------------
@@ -805,7 +913,13 @@ export class AudioSystem {
     this.prevRawEnergy = rawEnergy;
 
     const onsetTarget = clamp01(Math.pow(delta * this.onsetGain, 0.85));
-    this.smoothedOnset = smoothAR(this.smoothedOnset, onsetTarget, this.onsetAttackHz, this.onsetReleaseHz, dt);
+    this.smoothedOnset = smoothAR(
+      this.smoothedOnset,
+      onsetTarget,
+      this.onsetAttackHz,
+      this.onsetReleaseHz,
+      dt,
+    );
 
     // Peak hold
     if (rawEnergy >= this.peakHold) {
@@ -862,13 +976,18 @@ export class AudioSystem {
 
     this.bind("audio:announce", () => this.announceState("audio:announce"));
 
-    this.bind("audio:set-track", (p: { trackId: string | null }) => this.setTrack(p?.trackId ?? null, "audio:set-track"));
+    this.bind("audio:set-track", (p: { trackId: string | null }) =>
+      this.setTrack(p?.trackId ?? null, "audio:set-track"),
+    );
     this.bind("audio:play-request", () => {
       void this.play("audio:play-request");
     });
     this.bind("audio:pause-request", () => this.pause("audio:pause-request"));
     this.bind("audio:toggle-request", () => this.togglePlay("audio:toggle-request"));
     this.bind("audio:seek-request", (p: { timeSec: number }) => this.seek(p?.timeSec ?? 0, "audio:seek-request"));
+
+    // Media resolver response
+    this.bind("media:resolve:result", (p: MediaResolveResultPayload) => this.handleMediaResolveResult(p));
 
     // Harmony UI commands (audio:cmd:*)
     this.bind("audio:cmd:togglePlay", () => this.togglePlay("audio:cmd:togglePlay"));
@@ -897,7 +1016,9 @@ export class AudioSystem {
       // TODO (Harmony Phase 1.5): wire to PersistenceSystem favorites store
     });
 
-    this.bind("audio:set-volume", (p: { volume: number }) => this.setVolume(p?.volume ?? this.state.volume, "audio:set-volume"));
+    this.bind("audio:set-volume", (p: { volume: number }) =>
+      this.setVolume(p?.volume ?? this.state.volume, "audio:set-volume"),
+    );
 
     this.bind("audio:volume-nudge", (p: { delta: number }) => {
       const d = Number.isFinite(p?.delta) ? p.delta : 0;
@@ -906,7 +1027,9 @@ export class AudioSystem {
 
     this.bind("audio:set-shuffle", (p: { shuffle: boolean }) => this.setShuffle(!!p?.shuffle, "audio:set-shuffle"));
 
-    this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) => this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"));
+    this.bind("audio:set-repeat", (p: { repeat: RepeatMode }) =>
+      this.setRepeat(p?.repeat ?? this.state.repeat, "audio:set-repeat"),
+    );
 
     // REQUEST events (do NOT re-emit from within the handler chain)
     this.bind("audio:fade-to-silence", (p: { reason?: AudioFadeReason; durationSec?: number }) =>
@@ -923,6 +1046,26 @@ export class AudioSystem {
     this.bind("gate:opening", () => this.resumeSystemAudio("gate"));
   }
 
+  private handleMediaResolveResult(p: MediaResolveResultPayload): void {
+    const requestId = typeof p?.requestId === "string" ? p.requestId : "";
+    if (!requestId) return;
+
+    const pending = this.pendingMedia.get(requestId);
+    if (!pending) return;
+
+    this.pendingMedia.delete(requestId);
+    try {
+      window.clearTimeout(pending.timeoutId);
+    } catch {}
+
+    if (p.ok && Array.isArray(p.urls) && p.urls.length > 0) {
+      pending.resolve(p.urls);
+    } else {
+      const msg = typeof p?.error === "string" && p.error ? p.error : `Failed to resolve media for "${pending.trackId}".`;
+      pending.reject(new Error(msg));
+    }
+  }
+
   private detachBusHandlers(): void {
     for (const h of this.handlers) {
       this.bus.off(h.event, h.fn);
@@ -935,6 +1078,58 @@ export class AudioSystem {
     const anyFn = fn as any;
     this.handlers.push({ event, fn: anyFn });
     this.bus.on(event, anyFn);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Repeat-All + Playlist semantics (TrackCatalog order)
+  // ---------------------------------------------------------------------------
+
+  private getPlayableTrackIds(kind: "song" | "podcast" | "hidden" | "any" = "song"): string[] {
+    const user = this.persistence.getState();
+
+    return getAllTracks()
+      .filter((t) => (kind === "any" ? true : t.kind === kind))
+      .filter((t) => {
+        const existing = user.tracks?.[t.id];
+        const unlocked = Boolean(existing?.unlocked) || Boolean(t.defaultUnlocked);
+        return unlocked;
+      })
+      .map((t) => t.id);
+  }
+
+  private pickNextTrackId(currentId: string): string | null {
+    const playable = this.getPlayableTrackIds("song");
+
+    if (playable.length === 0) return null;
+    if (playable.length === 1) return playable[0] ?? null;
+
+    if (this.state.shuffle) {
+      const options = playable.filter((id) => id !== currentId);
+      const pool = options.length > 0 ? options : playable;
+      const idx = Math.floor(Math.random() * pool.length);
+      return pool[idx] ?? null;
+    }
+
+    const idx = playable.indexOf(currentId);
+    if (idx < 0) return playable[0] ?? null;
+
+    const next = playable[(idx + 1) % playable.length];
+    return next ?? null;
+  }
+
+  private setTrackSilently(trackId: string | null, reason: string): void {
+    this.state.activeTrackId = trackId;
+    this.state.timeSec = 0;
+    this.state.durationSec = null;
+
+    this.persistence.setAudioPlayer({ activeTrackId: trackId, timeSec: 0, durationSec: null }, reason);
+
+    // Keep UI/state in sync without emitting the "audio:set-track" event (avoids echo loops).
+    this.emitState(reason);
+
+    if (trackId) {
+      this.preloadDurationFor(trackId, `${reason}:duration-preload`);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1000,6 +1195,10 @@ const clampFinite = (v: number, lo: number, hi: number): number => {
   if (!Number.isFinite(v)) return lo;
   if (hi <= lo) return lo;
   return Math.min(hi, Math.max(lo, v));
+};
+
+const awaitableVoid = (p: Promise<unknown>): void => {
+  void p;
 };
 
 /**
