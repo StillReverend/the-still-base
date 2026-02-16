@@ -399,7 +399,7 @@ export class AudioSystem {
     // ✅ Stop current source so play() will actually restart on the new track
     if (wasPlaying) this.pause(`${reason}:before-skip`);
 
-    this.setTrackSilently(nextId, reason, { resumeFromLastTime: false });
+    this.setTrackSilently(nextId, reason, { ignoreResume: true, startTimeSec: 0 });
 
     if (wasPlaying) void this.play(`${reason}:auto-play`);
   }
@@ -438,7 +438,7 @@ prevTrack(reason = "audio:prev"): void {
   if (wasPlaying) this.pause(`${reason}:before-skip`);
 
   // Start prev track from the beginning (not lastTimeSec)
-  this.setTrackSilently(prevId, reason, { resumeFromLastTime: false });
+  this.setTrackSilently(prevId, reason, { ignoreResume: true, startTimeSec: 0 });
 
   if (wasPlaying) void this.play(`${reason}:auto-play`);
 }
@@ -901,7 +901,7 @@ prevTrack(reason = "audio:prev"): void {
 
       try {
         // If only one playable track exists, this behaves like looping.
-        this.setTrackSilently(nextId, "audio:repeat-all-next");
+        this.setTrackSilently(nextId, "audio:repeat-all-next", { ignoreResume: true, startTimeSec: 0 });
         awaitableVoid(this.play("audio:repeat-all-next"));
 
         this.emit("audio:repeat", { mode: "all", from: currentId, to: nextId });
@@ -1298,22 +1298,25 @@ prevTrack(reason = "audio:prev"): void {
   private setTrackSilently(
     trackId: string | null,
     reason: string,
-    opts?: { resumeFromLastTime?: boolean },
+    opts?: { ignoreResume?: boolean; startTimeSec?: number },
   ): void {
     // Persist current before switching
     this.persistCurrentTrackTime(`${reason}:before-switch`);
 
     this.state.activeTrackId = trackId;
 
-    const resume = opts?.resumeFromLastTime ?? true;
-
-    // Resume behavior is configurable:
-    // - resume=true  => use per-track lastTimeSec (podcast-like)
-    // - resume=false => start at 0 (music-player next/prev behavior)
+    // Default behavior: resume from per-track lastTimeSec
     let startTime = 0;
-    if (trackId && resume) {
-      const t = this.persistence.getTrack(trackId);
-      if (t && Number.isFinite(t.lastTimeSec) && t.lastTimeSec > 0) startTime = Math.max(0, t.lastTimeSec);
+
+    const ignoreResume = Boolean(opts?.ignoreResume);
+
+    if (trackId) {
+      if (ignoreResume) {
+        startTime = Math.max(0, Number.isFinite(opts?.startTimeSec) ? (opts?.startTimeSec as number) : 0);
+      } else {
+        const t = this.persistence.getTrack(trackId);
+        if (t && Number.isFinite(t.lastTimeSec) && t.lastTimeSec > 0) startTime = Math.max(0, t.lastTimeSec);
+      }
     }
 
     this.state.timeSec = startTime;

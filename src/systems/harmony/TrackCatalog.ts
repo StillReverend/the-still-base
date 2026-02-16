@@ -25,6 +25,8 @@ export type TrackMeta = {
 const TRACKS: TrackMeta[] = [
   { id: "Lift", title: "Lift", kind: "song", order: 1, defaultUnlocked: true },
   { id: "Legacy", title: "Legacy", kind: "song", defaultUnlocked: true, order: 2 },
+  { id: "Graystar", title: "Graystar", kind: "song", defaultUnlocked: true, order: 3 },
+  { id: "Luna", title: "Luna", kind: "song", defaultUnlocked: true, order: 4 },
 ];
 
 /**
