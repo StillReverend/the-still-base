@@ -53,6 +53,19 @@ function repeatLabel(mode: RepeatMode): string {
 }
 
 /**
+ * Safari range "fill" helper:
+ * We paint the fill via background-size on the input itself using CSS var --pct.
+ */
+function setSliderPct(el: HTMLInputElement): void {
+  const min = Number(el.min || "0");
+  const max = Number(el.max || "1");
+  const val = Number(el.value || "0");
+  const denom = Math.max(0.000001, max - min);
+  const pct = ((val - min) / denom) * 100;
+  el.style.setProperty("--pct", `${pct}%`);
+}
+
+/**
  * Attach fast, reliable button interaction:
  * - pointerdown = instant response (Safari trackpad taps included)
  * - preventDefault to avoid click delay/selection quirks
@@ -213,6 +226,28 @@ export class HarmonyUI {
         color: rgba(255,255,255,0.65);
       }
 
+      /* ------------------------------------------------------------
+         Safari-proof range fill (scrub + volume)
+         We paint the "filled" portion on the input itself via --pct.
+      ------------------------------------------------------------ */
+
+      .harmony-scrub,
+      .harmony-vol {
+        -webkit-appearance: none;
+        appearance: none;
+        background: transparent;
+        cursor: pointer;
+
+        /* Fill painted here */
+        --track: rgba(255, 255, 255, 0.18);
+        --fill: #d4af37;
+        --pct: 0%;
+
+        background:
+          linear-gradient(var(--fill), var(--fill)) 0 50% / var(--pct) 4px no-repeat,
+          linear-gradient(var(--track), var(--track)) 0 50% / 100% 4px no-repeat;
+      }
+
       .harmony-scrub {
         flex: 1;
         min-width: 120px;
@@ -222,6 +257,45 @@ export class HarmonyUI {
       .harmony-vol {
         width: 110px;
         height: 30px;
+      }
+
+      /* WebKit track */
+      .harmony-scrub::-webkit-slider-runnable-track,
+      .harmony-vol::-webkit-slider-runnable-track {
+        height: 4px;
+        background: transparent;
+        border-radius: 999px;
+      }
+
+      /* WebKit thumb */
+      .harmony-scrub::-webkit-slider-thumb,
+      .harmony-vol::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #d4af37;
+        border: 2px solid rgba(0,0,0,0.4);
+        margin-top: -5px;
+      }
+
+      /* Firefox track */
+      .harmony-scrub::-moz-range-track,
+      .harmony-vol::-moz-range-track {
+        height: 4px;
+        background: rgba(255, 255, 255, 0.18);
+        border-radius: 999px;
+      }
+
+      /* Firefox thumb */
+      .harmony-scrub::-moz-range-thumb,
+      .harmony-vol::-moz-range-thumb {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #d4af37;
+        border: 2px solid rgba(0,0,0,0.4);
       }
 
       .harmony-panel {
@@ -325,6 +399,7 @@ export class HarmonyUI {
     this.scrub.max = "1";
     this.scrub.step = "0.01";
     this.scrub.value = "0";
+    setSliderPct(this.scrub);
 
     // Scrub behavior
     const scrubStart = () => {
@@ -341,6 +416,9 @@ export class HarmonyUI {
         cancelAnimationFrame(this.scrubSeekRaf);
         this.scrubSeekRaf = 0;
       }
+
+      // Ensure fill snaps to current value on end
+      setSliderPct(this.scrub);
     };
 
     const scrubLive = () => {
@@ -348,6 +426,8 @@ export class HarmonyUI {
 
       const timeSec = Number(this.scrub.value);
       if (!Number.isFinite(timeSec)) return;
+
+      setSliderPct(this.scrub);
 
       const dur = Math.max(0, this.lastDurationSec);
       this.timeText.textContent = `${formatTime(timeSec)} / ${formatTime(dur)}`;
@@ -399,10 +479,13 @@ export class HarmonyUI {
     this.vol.max = "1";
     this.vol.step = "0.01";
     this.vol.value = "0.85";
+    setSliderPct(this.vol);
 
     const volumeLive = () => {
       const v = clamp01(Number(this.vol.value));
       this.volPending = v;
+
+      setSliderPct(this.vol);
 
       if (!this.volRaf) {
         this.volRaf = requestAnimationFrame(() => {
@@ -423,6 +506,9 @@ export class HarmonyUI {
         cancelAnimationFrame(this.volRaf);
         this.volRaf = 0;
       }
+
+      setSliderPct(this.vol);
+
       this.handlers.onSetVolume(v);
     };
 
@@ -520,6 +606,10 @@ export class HarmonyUI {
 
   public mount(parent: HTMLElement): void {
     parent.appendChild(this.root);
+
+    // Ensure sliders show correct fill immediately
+    setSliderPct(this.scrub);
+    setSliderPct(this.vol);
   }
 
   public dispose(): void {
@@ -556,6 +646,7 @@ export class HarmonyUI {
     const v = clamp01(Number.isFinite(state.volume) ? state.volume : 0.85);
     if (document.activeElement !== this.vol) {
       this.vol.value = String(v);
+      setSliderPct(this.vol);
     }
 
     const dur = Number.isFinite(state.durationSec) ? state.durationSec : 0;
@@ -572,6 +663,10 @@ export class HarmonyUI {
 
     if (!this.isScrubbing) {
       this.scrub.value = String(clamp(pos, 0, max));
+      setSliderPct(this.scrub);
+    } else {
+      // While scrubbing, the user is driving value; keep fill synced.
+      setSliderPct(this.scrub);
     }
 
     this.syncToggleVisual("particle", state.particles);
