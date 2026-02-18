@@ -185,6 +185,13 @@ export class Engine {
       width: window.innerWidth,
       height: window.innerHeight,
       pixelRatio: this.config.pixelRatio,
+
+      // ✅ Pass bus so PostFX can listen for:
+      //  - "postfx:audio-energy" (impact/transient)
+      //  - "postfx:impulse" (gongs)
+      //  - "postfx:ritual" (hold ramp)
+      bus: this.bus,
+
       settings: {
         enabled: true,
         bloom: {

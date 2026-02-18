@@ -117,8 +117,8 @@ export class ClockSystem {
     // Hour ring (12)
     this.hourRing = new RingPoints(
       {
-        radius: baseRadius * 4.0,
-        thickness: 20.0,
+        radius: baseRadius * 2.0,
+        thickness: 15.0,
         points: this.pointsPerRing * 144,
         falloffFactor: 1.0,
         minTailLength: minTail,
@@ -132,8 +132,8 @@ export class ClockSystem {
     // Minute ring (60)
     this.minuteRing = new RingPoints(
       {
-        radius: baseRadius * 3.0,
-        thickness: 15.0,
+        radius: baseRadius * 1.5,
+        thickness: 10.0,
         points: this.pointsPerRing * 144,
         falloffFactor: 1.0,
         minTailLength: minTail,
@@ -147,8 +147,8 @@ export class ClockSystem {
     // Second ring (360)
     this.secondRing = new RingPoints(
       {
-        radius: baseRadius * 2.0,
-        thickness: 10.0,
+        radius: baseRadius + 5,
+        thickness: 5.0,
         points: this.pointsPerRing * 144,
         falloffFactor: 1.0,
         minTailLength: minTail,

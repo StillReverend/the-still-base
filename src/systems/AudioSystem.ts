@@ -143,14 +143,17 @@ export class AudioSystem {
   private smoothedMid = 0;
   private smoothedHigh = 0;
 
-  // "note pop" onset (0..1)
-  private smoothedOnset = 0;
+  // Transient/Impact (0..1)
+  private impact01 = 0;
   private prevRawEnergy = 0;
 
-  // onset tuning
-  private readonly onsetGain = 14; // try 10..22
-  private readonly onsetAttackHz = 80; // try 60..140
-  private readonly onsetReleaseHz = 16; // try 10..28
+  // Impact tuning:
+  // - Treat impact as "fast transient" not loudness.
+  private readonly impactGain = 22; // raise this if you want more snap
+  private readonly impactPow = 0.85; // shaping
+  private readonly impactAttackHz = 140; // snap up
+  private readonly impactReleaseHz = 26; // settle down
+  private readonly impactFloor = 0.002; // tiny noise floor for stability
 
   // Existing smoothing speed for bands/energy
   private readonly bandSmoothHz = 10;
@@ -158,6 +161,15 @@ export class AudioSystem {
   // peak hold (0..1) for "big moment" visuals.
   private peakHold = 0;
   private readonly peakDecayPerSec = 0.42;
+
+  // Quiet detection with hysteresis (prevents chatter)
+  private quiet = true;
+  private readonly quietOnThreshold = 0.006; // below => quiet
+  private readonly quietOffThreshold = 0.012; // above => not quiet
+
+  // dt spike guard (tab-switch, breakpoint, suspend)
+  private readonly maxFrameDtSec = 0.25; // if gap > this, treat as discontinuity
+  private skipNextFrameAfterGap = false;
 
   // UX: If you press Prev after this many seconds, restart the current track instead.
   private readonly prevRestartThresholdSec = 3;
@@ -405,43 +417,43 @@ export class AudioSystem {
   }
 
   // Phase 2: Prev/Next (Harmony UI)
-prevTrack(reason = "audio:prev"): void {
-  const currentId = this.state.activeTrackId;
-  if (!currentId) return;
+  prevTrack(reason = "audio:prev"): void {
+    const currentId = this.state.activeTrackId;
+    if (!currentId) return;
 
-  const wasPlaying = this.state.isPlaying;
+    const wasPlaying = this.state.isPlaying;
 
-  // If we're far enough into the track, "Prev" restarts the current track (music player behavior).
-  const threshold = this.prevRestartThresholdSec;
-  const curTime = Number.isFinite(this.state.timeSec) ? this.state.timeSec : 0;
+    // If we're far enough into the track, "Prev" restarts the current track (music player behavior).
+    const threshold = this.prevRestartThresholdSec;
+    const curTime = Number.isFinite(this.state.timeSec) ? this.state.timeSec : 0;
 
-  if (curTime > threshold) {
-    // Restart current track at 0:00
-    if (wasPlaying) this.pause(`${reason}:restart-current`);
+    if (curTime > threshold) {
+      // Restart current track at 0:00
+      if (wasPlaying) this.pause(`${reason}:restart-current`);
 
-    // Important: force playhead to 0 for this track (and persist it)
-    this.state.timeSec = 0;
-    if (currentId) this.persistence.setTrackLastTime(currentId, 0, `${reason}:restart-current:setLastTime`);
+      // Important: force playhead to 0 for this track (and persist it)
+      this.state.timeSec = 0;
+      this.persistence.setTrackLastTime(currentId, 0, `${reason}:restart-current:setLastTime`);
 
-    // Keep player state consistent
-    this.persistence.setAudioPlayer({ timeSec: 0 }, `${reason}:restart-current:setPlayerTime`);
-    this.emitState(`${reason}:restart-current`);
+      // Keep player state consistent
+      this.persistence.setAudioPlayer({ timeSec: 0 }, `${reason}:restart-current:setPlayerTime`);
+      this.emitState(`${reason}:restart-current`);
 
-    if (wasPlaying) void this.play(`${reason}:restart-current:auto-play`);
-    return;
+      if (wasPlaying) void this.play(`${reason}:restart-current:auto-play`);
+      return;
+    }
+
+    // Otherwise: go to previous track
+    const prevId = this.pickPrevTrackId(currentId);
+    if (!prevId) return;
+
+    if (wasPlaying) this.pause(`${reason}:before-skip`);
+
+    // Start prev track from the beginning (not lastTimeSec)
+    this.setTrackSilently(prevId, reason, { ignoreResume: true, startTimeSec: 0 });
+
+    if (wasPlaying) void this.play(`${reason}:auto-play`);
   }
-
-  // Otherwise: go to previous track
-  const prevId = this.pickPrevTrackId(currentId);
-  if (!prevId) return;
-
-  if (wasPlaying) this.pause(`${reason}:before-skip`);
-
-  // Start prev track from the beginning (not lastTimeSec)
-  this.setTrackSilently(prevId, reason, { ignoreResume: true, startTimeSec: 0 });
-
-  if (wasPlaying) void this.play(`${reason}:auto-play`);
-}
 
   seek(timeSec: number, reason = "audio:seek"): void {
     const t = Math.max(0, Number.isFinite(timeSec) ? timeSec : 0);
@@ -612,7 +624,7 @@ prevTrack(reason = "audio:prev"): void {
       this.applyGainsFromState("fade:update");
     }
 
-    // Emit audio:frame for reactive systems (Core, rings, etc.)
+    // Emit audio:frame for reactive systems (Core, rings, stars, PostFX, etc.)
     this.maybeEmitAudioFrame("update");
   }
 
@@ -690,9 +702,12 @@ prevTrack(reason = "audio:prev"): void {
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 2048;
 
+    // Clean routing:
+    // music -> musicGain -> masterGain -> destination
+    // masterGain -> analyser (tap)
     this.musicGain.connect(this.masterGain);
+    this.masterGain.connect(ctx.destination);
     this.masterGain.connect(this.analyser);
-    this.analyser.connect(ctx.destination);
 
     // Allocate FFT buffer once
     this.fftBins = new Uint8Array(this.analyser.frequencyBinCount);
@@ -915,7 +930,6 @@ prevTrack(reason = "audio:prev"): void {
     }
 
     // Repeat Off: do nothing
-    return;
   }
 
   private startMusicSource(
@@ -938,6 +952,13 @@ prevTrack(reason = "audio:prev"): void {
     this.currentMusicBuffer = buffer;
     this.musicStartAtCtxTime = this.audioCtx.currentTime;
     this.musicStartOffsetSec = offset;
+
+    // Reset reactive state on start for consistency (prevents ghost impact)
+    this.prevRawEnergy = 0;
+    this.impact01 = 0;
+    this.peakHold = 0;
+    this.quiet = true;
+    this.skipNextFrameAfterGap = true;
 
     src.onended = () => {
       if (this.musicSource !== src) return;
@@ -965,6 +986,13 @@ prevTrack(reason = "audio:prev"): void {
       src.disconnect();
     } catch {}
 
+    // Reset reactive outputs when stopped
+    this.prevRawEnergy = 0;
+    this.impact01 = 0;
+    this.peakHold = 0;
+    this.quiet = true;
+    this.skipNextFrameAfterGap = true;
+
     this.emit("audio:music-stop", { reason });
   }
 
@@ -979,7 +1007,7 @@ prevTrack(reason = "audio:prev"): void {
   }
 
   // ---------------------------------------------------------------------------
-  // Reactive frame emission (FFT -> energy/low/mid/high + onset + peakHold)
+  // Reactive frame emission (FFT -> energy/low/mid/high + impact + peakHold)
   // ---------------------------------------------------------------------------
 
   private maybeEmitAudioFrame(reason: string): void {
@@ -994,9 +1022,21 @@ prevTrack(reason = "audio:prev"): void {
 
     if (this.lastFrameEmitCtxTime >= 0 && now - this.lastFrameEmitCtxTime < interval) return;
 
-    // Capture previous timestamp BEFORE updating
-    const prev = this.lastFrameEmitCtxTime >= 0 ? this.lastFrameEmitCtxTime : now - interval;
+    const prevTime = this.lastFrameEmitCtxTime >= 0 ? this.lastFrameEmitCtxTime : now - interval;
+    const rawDt = Math.max(0, now - prevTime);
     this.lastFrameEmitCtxTime = now;
+
+    // If we had a huge gap, the analyser snapshot is essentially a discontinuity.
+    // Skip one emission so downstream doesn't get a fake “impact” spike.
+    if (rawDt > this.maxFrameDtSec) {
+      this.skipNextFrameAfterGap = true;
+    }
+    if (this.skipNextFrameAfterGap) {
+      this.skipNextFrameAfterGap = false;
+      return;
+    }
+
+    const dt = Math.max(0.000001, Math.min(rawDt, this.maxFrameDtSec));
 
     // Pull frequency-domain data (0..255)
     this.analyser.getByteFrequencyData(this.fftBins);
@@ -1018,31 +1058,21 @@ prevTrack(reason = "audio:prev"): void {
     // Energy: weighted blend (low carries “pulse”, highs carry “sparkle”)
     const rawEnergy = clamp01(low * 0.30 + mid * 0.60 + high * 0.10);
 
-    // dt in seconds between emitted frames
-    const dt = Math.max(0.000001, now - prev);
-
     // Smooth energy/bands for aesthetics (time-based one-pole)
     const alpha = clamp01(1 - Math.exp(-dt * this.bandSmoothHz));
-
     this.smoothedLow = lerp(this.smoothedLow, low, alpha);
     this.smoothedMid = lerp(this.smoothedMid, mid, alpha);
     this.smoothedHigh = lerp(this.smoothedHigh, high, alpha);
     this.smoothedEnergy = lerp(this.smoothedEnergy, rawEnergy, alpha);
 
-    // Onset (note pops)
+    // Impact (transient): derived from positive energy delta
     const delta = Math.max(0, rawEnergy - this.prevRawEnergy);
     this.prevRawEnergy = rawEnergy;
 
-    const onsetTarget = clamp01(Math.pow(delta * this.onsetGain, 0.85));
-    this.smoothedOnset = smoothAR(
-      this.smoothedOnset,
-      onsetTarget,
-      this.onsetAttackHz,
-      this.onsetReleaseHz,
-      dt,
-    );
+    const impactTarget = clamp01(Math.pow(Math.max(0, delta - this.impactFloor) * this.impactGain, this.impactPow));
+    this.impact01 = smoothAR(this.impact01, impactTarget, this.impactAttackHz, this.impactReleaseHz, dt);
 
-    // Peak hold
+    // Peak hold (use raw energy for decisive moments)
     if (rawEnergy >= this.peakHold) {
       this.peakHold = rawEnergy;
     } else {
@@ -1050,15 +1080,28 @@ prevTrack(reason = "audio:prev"): void {
     }
     this.peakHold = clamp01(this.peakHold);
 
+    // Quiet hysteresis based on smoothed energy (stable)
+    const e = clamp01(this.smoothedEnergy);
+    if (this.quiet) {
+      if (e >= this.quietOffThreshold) this.quiet = false;
+    } else {
+      if (e <= this.quietOnThreshold) this.quiet = true;
+    }
+
+    // Emit frame:
+    // - Keep energy/low/mid/high stable for existing consumers (Stars, etc.)
+    // - Provide impact01 for PostFX “impulse” style shaping
+    // - Provide peak for ceremonial “big moment” moments if you want them later
     this.emit("audio:frame", {
       reason,
       frame: {
-        energy: clamp01(this.smoothedEnergy),
+        energy: e,
         low: clamp01(this.smoothedLow),
         mid: clamp01(this.smoothedMid),
         high: clamp01(this.smoothedHigh),
-        onset: clamp01(this.smoothedOnset),
-        peak: this.peakHold,
+        impact01: clamp01(this.impact01),
+        peak01: this.peakHold,
+        quiet: this.quiet,
       },
       isPlaying: this.state.isPlaying,
       trackId: this.state.activeTrackId,
@@ -1069,8 +1112,9 @@ prevTrack(reason = "audio:prev"): void {
   private avgBand01(hzLo: number, hzHi: number, hzPerBin: number): number {
     if (!this.fftBins) return 0;
 
-    const lo = Math.max(0, Math.floor(hzLo / Math.max(0.000001, hzPerBin)));
-    const hi = Math.min(this.fftBins.length - 1, Math.ceil(hzHi / Math.max(0.000001, hzPerBin)));
+    const safeHzPerBin = Math.max(0.000001, hzPerBin);
+    const lo = Math.max(0, Math.floor(hzLo / safeHzPerBin));
+    const hi = Math.min(this.fftBins.length - 1, Math.ceil(hzHi / safeHzPerBin));
 
     if (hi <= lo) return 0;
 

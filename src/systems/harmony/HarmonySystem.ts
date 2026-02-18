@@ -9,6 +9,7 @@ import type { EventBus } from "../../core/EventBus";
 import { HarmonyUI } from "./HarmonyUI";
 import { HARMONY_DEFAULT_STATE, type HarmonyState, type AudioStateEvent } from "./types";
 import type { RepeatMode } from "../PersistenceSystem";
+import { getTrackMeta } from "./TrackCatalog";
 
 type AnyFn = (...args: any[]) => void;
 
@@ -20,11 +21,9 @@ export class HarmonySystem {
   private state: HarmonyState = { ...HARMONY_DEFAULT_STATE };
   private disposers: Array<() => void> = [];
 
-  // Coalesce UI renders to 1x/RAF (prevents UI “stickiness” under load)
   private renderRaf = 0;
   private renderQueued = false;
 
-  // NEW: keep last applied audio snapshot so we can skip pointless renders
   private lastAudioApplied: {
     playing: boolean;
     trackId: string | null;
@@ -45,19 +44,14 @@ export class HarmonySystem {
 
     this.ui = new HarmonyUI({
       onTogglePlay: () => {
-        // Ensure browser audio is unlocked (safe even if already unlocked)
         this.emit("audio:unlock-request", {});
-        // Request-style event consumed by AudioSystem
         this.emit("audio:toggle-request", { source: "harmony" });
-        // Do not force local play state; AudioSystem is the authority.
       },
 
       onSeek: (timeSec) => {
         this.emit("audio:seek-request", { timeSec, source: "harmony" });
-        // No local position write here; AudioSystem will confirm via audio:state ticks.
       },
 
-      // NEW: Prev/Next track (Phase 2 navigation)
       onPrevTrack: () => {
         this.emit("audio:unlock-request", {});
         this.emit("audio:cmd:prevTrack", { source: "harmony" });
@@ -70,7 +64,6 @@ export class HarmonySystem {
 
       onToggleShuffle: () => this.setShuffle(!this.state.shuffle),
       onCycleRepeat: () => this.cycleRepeat(),
-
       onSetVolume: (volume01) => this.setVolume(volume01),
 
       onToggleVibePanel: () => this.toggleVibePanel(),
@@ -82,12 +75,15 @@ export class HarmonySystem {
       onSelectFilter: (id) => this.selectFilter(id),
 
       onSetRitualDuration: (durationSec) => this.setRitualDuration(durationSec),
+
+      // ✅ UI SFX hooks (canonical)
+      onUiHover: () => this.emitUiHover(),
+      onUiClick: () => this.emitUiClick(),
     });
 
     this.ui.mount(document.body);
     this.ui.render(this.state);
 
-    // Bus subscriptions
     this.on("audio:state", (p: AudioStateEvent) => this.onAudioState(p));
 
     this.on("harmony:ui:setVisible", (p: { visible: boolean }) => this.setUIVisible(Boolean(p?.visible)));
@@ -96,7 +92,6 @@ export class HarmonySystem {
     this.on("harmony:vibePanel:setOpen", (p: { open: boolean }) => this.setVibePanelOpen(Boolean(p?.open)));
     this.on("harmony:vibePanel:toggle", () => this.toggleVibePanel());
 
-    // Small UX: ESC closes the vibe panel
     window.addEventListener("keydown", this.onKeyDown, { passive: true });
     this.disposers.push(() => window.removeEventListener("keydown", this.onKeyDown));
   }
@@ -116,11 +111,22 @@ export class HarmonySystem {
   }
 
   // ------------------------------------------------------------
-  // State updates
+  // ✅ UI SFX emitters (canonical names)
   // ------------------------------------------------------------
 
+  private emitUiHover(): void {
+  // IMPORTANT: Hover is NOT a user gesture for autoplay policies.
+  // Do NOT attempt unlock here or Chrome will warn.
+  this.emit("ui:sfx:hover", { source: "harmony" });
+}
+
+  private emitUiClick(): void {
+    // Click is a user gesture: ensure audio is unlocked before SFX playback attempts.
+    this.emit("audio:unlock-request", { source: "harmony-ui-click" });
+    this.emit("ui:sfx:click", { source: "harmony" });
+  }
+
   private onAudioState(payload: AudioStateEvent): void {
-    // Strict contract: AudioSystem emits { state, reason }
     const s = payload?.state;
     if (!s) return;
 
@@ -136,9 +142,14 @@ export class HarmonySystem {
 
     const safeRepeat: RepeatMode = repeat === "off" || repeat === "one" || repeat === "all" ? repeat : "off";
 
-    const title = typeof payload.title === "string" && payload.title ? payload.title : trackId ?? "No track";
+    // ✅ Title from TrackCatalog
+    let title = "";
+    if (trackId) {
+      const meta = getTrackMeta(trackId);
+      title = String((meta as any)?.title ?? (meta as any)?.label ?? (meta as any)?.name ?? "").trim();
+    }
+    if (!title) title = trackId ?? "No track";
 
-    // Skip doing work if nothing meaningful changed (reduces Safari hiccups)
     const snapshot = {
       playing,
       trackId,
@@ -150,9 +161,7 @@ export class HarmonySystem {
       volume,
     };
 
-    if (this.lastAudioApplied && this.audioSnapshotEquals(this.lastAudioApplied, snapshot)) {
-      return;
-    }
+    if (this.lastAudioApplied && this.audioSnapshotEquals(this.lastAudioApplied, snapshot)) return;
 
     this.lastAudioApplied = snapshot;
 
@@ -161,7 +170,6 @@ export class HarmonySystem {
     this.state.title = title;
     this.state.positionSec = timeSec;
     this.state.durationSec = durationSec;
-
     this.state.shuffle = shuffle;
     this.state.repeat = safeRepeat;
     this.state.volume = volume;
@@ -173,8 +181,6 @@ export class HarmonySystem {
     a: NonNullable<HarmonySystem["lastAudioApplied"]>,
     b: NonNullable<HarmonySystem["lastAudioApplied"]>,
   ): boolean {
-    // NOTE: positionSec changes frequently; we still compare it.
-    // If you ever want even less churn, you can quantize positionSec to, say, 0.05s here.
     return (
       a.playing === b.playing &&
       a.trackId === b.trackId &&
@@ -203,31 +209,22 @@ export class HarmonySystem {
 
   private setShuffle(enabled: boolean): void {
     const v = Boolean(enabled);
-
-    // Optimistic UI
     this.state.shuffle = v;
     this.emit("audio:set-shuffle", { shuffle: v, source: "harmony" });
-
     this.requestRender();
   }
 
   private cycleRepeat(): void {
     const next: RepeatMode = this.state.repeat === "off" ? "all" : this.state.repeat === "all" ? "one" : "off";
-
-    // Optimistic UI
     this.state.repeat = next;
     this.emit("audio:set-repeat", { repeat: next, source: "harmony" });
-
     this.requestRender();
   }
 
   private setVolume(volume01: number): void {
     const v = clamp01(Number.isFinite(volume01) ? volume01 : this.state.volume);
-
-    // Optimistic UI
     this.state.volume = v;
     this.emit("audio:set-volume", { volume: v, source: "harmony" });
-
     this.requestRender();
   }
 
@@ -262,7 +259,6 @@ export class HarmonySystem {
     this.requestRender();
   }
 
-  // one render per RAF
   private requestRender(): void {
     if (!this.ui) return;
     if (this.renderQueued) return;
@@ -275,10 +271,6 @@ export class HarmonySystem {
     });
   }
 
-  // ------------------------------------------------------------
-  // EventBus adapter (centralized)
-  // ------------------------------------------------------------
-
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private emit(event: string, payload?: any): void {
     this.bus.emit(event, payload);
@@ -286,19 +278,10 @@ export class HarmonySystem {
 
   private on(event: string, handler: AnyFn): void {
     this.bus.on(event, handler);
-
-    this.disposers.push(() => {
-      this.bus.off(event, handler);
-    });
+    this.disposers.push(() => this.bus.off(event, handler));
   }
 
-  // ------------------------------------------------------------
-  // UX
-  // ------------------------------------------------------------
-
   private onKeyDown = (e: KeyboardEvent): void => {
-    if (e.key === "Escape" && this.state.vibePanelOpen) {
-      this.setVibePanelOpen(false);
-    }
+    if (e.key === "Escape" && this.state.vibePanelOpen) this.setVibePanelOpen(false);
   };
 }

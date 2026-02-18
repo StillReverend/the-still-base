@@ -171,6 +171,43 @@ export class DevTools {
       },
     });
 
+    // --------------------------------------------------------
+    // PostFX debug helpers
+    // --------------------------------------------------------
+    // M: Max bloom to detect bright-blob / threshold issues fast
+    // Shift+M: Disable max-bloom override
+    //
+    // T: Telemetry spam (throttled) to understand PostFX timing
+    // Shift+T: Disable telemetry
+    this.register("m", {
+      label: "PostFX Debug — Max Bloom (M on, Shift+M off)",
+      action: (e) => {
+        const enabled = !e.shiftKey;
+
+        this.bus.emit("postfx:debug-max-bloom", {
+          enabled,
+          strength: 30,
+          radius: 1.0,
+          threshold: 0.0,
+        });
+
+        // eslint-disable-next-line no-console
+        console.log(`[Dev] PostFX debug max-bloom ${enabled ? "ON" : "OFF"}`);
+      },
+    });
+
+    this.register("t", {
+      label: "PostFX Debug — Telemetry (T on, Shift+T off)",
+      action: (e) => {
+        const enabled = !e.shiftKey;
+
+        this.bus.emit("postfx:debug-telemetry", { enabled, hz: 6 });
+
+        // eslint-disable-next-line no-console
+        console.log(`[Dev] PostFX debug telemetry ${enabled ? "ON" : "OFF"}`);
+      },
+    });
+
     // Tab toggles overlay visibility. Prevent default Tab focus behavior.
     this.register("tab", {
       label: "Toggle Debug Overlay (Tab)",

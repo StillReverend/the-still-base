@@ -13,6 +13,10 @@
 //  - If audio is NOT playing: BAND goes true dark (writes zeros)
 //  - NEAR ritual lane stays as-is (BAND does not conflict)
 //  - No per-frame geometry rebuild; stable cached arrays
+//
+// Ryan spec (Feb 2026):
+//  - Core can glow/swell at low intensity, but NEAR stars should NOT “pop” early.
+//  - NEAR activates only after an intensity threshold (with feather) is crossed.
 // ============================================================
 
 import * as THREE from "three";
@@ -188,12 +192,27 @@ export class StarSystem {
   private afterRippleSpeedMul = 0.92;
 
   // ==========================================================
+  // NEAR ACTIVATION THRESHOLD (so Core can glow first)
+  // ==========================================================
+  // NEAR does not contribute visually until energy crosses this floor.
+  // (Keeps NEAR quiet during low/ambient playback.)
+  private nearEnergyOn = 0.50;
+  private nearEnergyFeather = 0.10;
+
+  // If you want NEAR to be *truly* 0 until activation, leave this at 0.
+  // If you ever want a faint dust after activation, you can raise it slightly.
+  private nearMinVisibleV = 0.0;
+
+  // Shape once active
+  private nearCurvePow = 1.0;
+
+  // ==========================================================
   // BAND KNOBS (keep these together for Harmony + tuning)
   // ==========================================================
 
   // Palette (Harmony will override later)
-  private bandColorLow: RGB01 = hexToRgb01(0xffffed);  // low
-  private bandColorMid: RGB01 = hexToRgb01(0xffdd70);  // mid
+  private bandColorLow: RGB01 = hexToRgb01(0xffffed); // low
+  private bandColorMid: RGB01 = hexToRgb01(0xffdd70); // mid
   private bandColorHigh: RGB01 = hexToRgb01(0xffdd70); // high
 
   // Gating + curves (drives the smoothed levels BEFORE visibility thresholds)
@@ -270,7 +289,7 @@ export class StarSystem {
   // ----------------------------------------------------------
 
   private bandHighShimmerAmt = 0.10; // 0..1 (multiplies high level)
-  private bandHighShimmerHz = 0.75;  // cycles/sec (visual shimmer speed)
+  private bandHighShimmerHz = 0.75; // cycles/sec (visual shimmer speed)
 
   // ----------------------------------------------------------
   // Dark snap (write zeros)
@@ -607,15 +626,21 @@ export class StarSystem {
     }
     this.externalTouchedThisFrame = false;
 
-    // NEAR stars reacitvity
+    // NEAR stars reactivity
     // audio target (continuous breathing)
     let audioTarget = 0.0;
     if (this.audioDriven && this.isAudioPlaying) {
       const e = clamp01(this.lastAudio.energy);
-      const gate = 0.50;
-      const raw = smoothstep(gate, 0.79, e);
-      const curved = Math.pow(raw, 1.0);
-      audioTarget = clamp01(curved);
+
+      // Gate: NEAR stays dark until intensity crosses the threshold.
+      const g = gate01(e, this.nearEnergyOn, this.nearEnergyFeather);
+
+      // Once gated on, map remaining range to 0..1 (so we don't waste headroom)
+      const t = clamp01((e - this.nearEnergyOn) / Math.max(1e-6, 1 - this.nearEnergyOn));
+      const shaped = Math.pow(t, Math.max(0.01, this.nearCurvePow));
+
+      // Final: hard gate * shaped response
+      audioTarget = clamp01(g * shaped);
     } else {
       // no audio playing => true darkness unless ritual lane is driving it
       audioTarget = 0.0;
@@ -643,11 +668,7 @@ export class StarSystem {
     } else {
       const nearFadingToDark = nearShouldBeDark && this.nearIntensity01 > 0.0;
 
-      if (
-        Math.abs(this.nearIntensity01 - prevNear) > 0.0 ||
-        this.pulses.length > 0 ||
-        nearFadingToDark
-      ) {
+      if (Math.abs(this.nearIntensity01 - prevNear) > 0.0 || this.pulses.length > 0 || nearFadingToDark) {
         this.applyNearColorsWithPulse(this.nearIntensity01);
         (this.nearGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
       }
@@ -761,9 +782,10 @@ export class StarSystem {
     const hasPulse = this.pulses.length > 0;
     const dim = hasPulse ? this.pulseDimBase : 1.0;
 
-    // Base brightness curve so low intensity still reads as faint “dust”
-    // but true silence is truly 0 because intensity01 goes to 0.
-    const baseBrightness = lerp(0.0, 1.0, clamp01(intensity01));
+    // Honor "true dark" before activation if desired
+    const i01 = clamp01(intensity01);
+    const baseBrightness = i01 <= 0 ? 0 : lerp(this.nearMinVisibleV, 1.0, i01);
+
     const baseScaled = baseBrightness * dim;
 
     for (let i = 0; i < count; i++) {
@@ -898,10 +920,7 @@ export class StarSystem {
 
     // A small quantized “key” to reduce redundant writes when nearly stable
     const q = (x: number): number => Math.floor(clamp01(x) * 1000);
-    const key =
-      (q(this.bandLevelLow) << 20) ^
-      (q(this.bandLevelMid) << 10) ^
-      q(this.bandLevelHigh);
+    const key = (q(this.bandLevelLow) << 20) ^ (q(this.bandLevelMid) << 10) ^ q(this.bandLevelHigh);
 
     if (!levelChanged && !shimmerActive && this.bandLastWriteKey === key) {
       return;

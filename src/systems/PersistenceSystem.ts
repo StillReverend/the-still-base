@@ -198,8 +198,12 @@ const sanitizeState = (state: UserState): UserState => {
     version: 1,
     gate: {
       status: state.gate?.status === "closed" ? "closed" : "open",
-      lastOpenedAtMs: Number.isFinite(state.gate?.lastOpenedAtMs ?? NaN) ? (state.gate.lastOpenedAtMs as number) : null,
-      lastClosedAtMs: Number.isFinite(state.gate?.lastClosedAtMs ?? NaN) ? (state.gate.lastClosedAtMs as number) : null,
+      lastOpenedAtMs: Number.isFinite(state.gate?.lastOpenedAtMs ?? NaN)
+        ? (state.gate.lastOpenedAtMs as number)
+        : null,
+      lastClosedAtMs: Number.isFinite(state.gate?.lastClosedAtMs ?? NaN)
+        ? (state.gate.lastClosedAtMs as number)
+        : null,
       reopenCount: Number.isFinite(state.gate?.reopenCount ?? NaN) ? Math.max(0, state.gate.reopenCount) : 0,
     },
     player: {
@@ -367,7 +371,9 @@ export class PersistenceSystem {
       lastOpenedAtMs: status === "open" ? t : this.state.gate.lastOpenedAtMs,
       lastClosedAtMs: status === "closed" ? t : this.state.gate.lastClosedAtMs,
       reopenCount:
-        status === "open" && this.state.gate.status === "closed" ? this.state.gate.reopenCount + 1 : this.state.gate.reopenCount,
+        status === "open" && this.state.gate.status === "closed"
+          ? this.state.gate.reopenCount + 1
+          : this.state.gate.reopenCount,
     };
     this.update({ gate }, reason);
   }
@@ -465,13 +471,13 @@ export class PersistenceSystem {
     const nextTimeSec = Number.isFinite(partial.timeSec ?? NaN) ? Math.max(0, Number(partial.timeSec)) : this.state.audio.timeSec;
 
     const nextDurationSec =
-    partial.durationSec === undefined
-      ? this.state.audio.durationSec
-      : partial.durationSec === null
-        ? null
-        : Number.isFinite(partial.durationSec)
-          ? Math.max(0, Number(partial.durationSec))
-          : this.state.audio.durationSec;
+      partial.durationSec === undefined
+        ? this.state.audio.durationSec
+        : partial.durationSec === null
+          ? null
+          : Number.isFinite(partial.durationSec)
+            ? Math.max(0, Number(partial.durationSec))
+            : this.state.audio.durationSec;
 
     const audio: AudioPlayerState = {
       ...this.state.audio,

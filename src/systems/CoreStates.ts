@@ -98,7 +98,7 @@ const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   blackHole: {
     glowIntensity: 0,
     ringIntensity: 0.79,
-    audioPunch: 2.25,
+    audioPunch: 1.50,
     ringColor: 0xffffed,
     glowColor: 0xffffed,
     enableRealLight: true,
@@ -107,16 +107,16 @@ const defaultTuning: Record<CoreStateName, CoreStateTuning> = {
   sol: {
     glowIntensity: 0,
     ringIntensity: 0.79,
-    audioPunch: 1.75,
+    audioPunch: 3.1,
     ringColor: 0xffdd70,
-    glowColor: 0xfffdd0,
+    glowColor: 0xffdd70,
     enableRealLight: true,
     realLightIntensity: 0.99,
   },
   luna: {
     glowIntensity: 0,
-    ringIntensity: 0.50,
-    audioPunch: 1.75,
+    ringIntensity: 0.10,
+    audioPunch: 1.0,
     ringColor: 0xffffed,
     glowColor: 0xfffdd0,
     enableRealLight: true,
@@ -142,9 +142,9 @@ function mergeTuning(base: CoreStateTuning, override?: Partial<CoreStateTuning>)
 // ------------------------------------------------------------
 
 const fillEdgesByState: Record<CoreStateName, { start: number; end: number; curve: number }> = {
-  blackHole: { start: 0.85, end: 0.94, curve: 0.97 },
-  sol: { start: 0.50, end: 1.26, curve: 0.53 },
-  luna: { start: 0.50, end: 0.85, curve: 0.85 },
+  blackHole: { start: 0.79, end: 1.0, curve: 0.31},
+  sol: { start: 0.31, end: 3.0, curve: 0.79 },
+  luna: { start: 0.31, end: 1.0, curve: 0.79 },
 };
 
 // ------------------------------------------------------------
@@ -305,11 +305,11 @@ function createLunaRegolithMaterial(): THREE.ShaderMaterial {
     uEnergy: { value: 0 }, // 0..1
     uDetail: { value: 1.0 }, // 0..2-ish
 
-    uBase: { value: new THREE.Color(0x8f97a6) },
+    uBase: { value: new THREE.Color(0xffffed) },
     uShadow: { value: new THREE.Color(0x2b303a) },
 
-    uRim: { value: new THREE.Color(0xe6ecff) },
-    uRimStrength: { value: 0.05 },
+    uRim: { value: new THREE.Color(0xffffed) },
+    uRimStrength: { value: 0.31 },
 
     uCraterScale: { value: 2.1 },
     uCraterDepth: { value: 1.0 },
@@ -1181,7 +1181,7 @@ export class CoreStates {
 
     const sustained = Math.pow(e, 0.55);
 
-    const transient = onset * 0.79;
+    const transient = onset * 0.85;
 
     const eBoost = THREE.MathUtils.clamp((sustained + transient) * punch, 0, 3.0);
 
@@ -1189,7 +1189,7 @@ export class CoreStates {
     // Ring "fill" behavior at peaks (PER-STATE tuned)
     // -------------------------------------------------------------------------
     const fillBase = peak;
-    const fillSpice = onset * 0.35;
+    const fillSpice = onset * 0.20;
     const fillRaw = clamp01(fillBase + fillSpice);
 
     const f = fillEdgesByState[this.active];

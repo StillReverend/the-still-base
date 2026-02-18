@@ -4,6 +4,9 @@
 //  - Adds simple "current orbit target" guard so you cannot re-click the SAME target you're already orbiting.
 //  - Adds targetId hints into camera:play params (Director can optionally use these now / later).
 //  - Fixes a stray `{0` typo in buildConstellations signature.)
+// NEW (Feb 2026):
+//  - Forwards audio:frame -> postfx:audio-energy (impact01 = energy) so PostFX telemetry stops showing rx=0.
+//  - DEV-only fallback: if no audio frames arrive for a while, emits a gentle sine pulse to prove wiring.
 
 import * as THREE from "three";
 
@@ -69,6 +72,17 @@ export class DemoScene implements SceneController {
     return this.currentOrbitTargetId === id;
   }
 
+  // ---------------------------------------------------------------------------
+  // PostFX wiring helpers (Feb 2026)
+  // ---------------------------------------------------------------------------
+
+  private lastAudioFrameAtMs = -Infinity;
+
+  // DEV-only: emit a gentle pulse when no real audio frames are arriving,
+  // so PostFX telemetry proves rx/age immediately.
+  private postfxDevPulseEnabled = import.meta.env.DEV;
+  private postfxDevPulseT = 0;
+
   private onToggleRegions = (): void => {
     if (!this.regionDebugRoot) return;
     this.regionDebugRoot.visible = !this.regionDebugRoot.visible;
@@ -126,6 +140,8 @@ export class DemoScene implements SceneController {
     const f = p?.frame;
     if (!f || !this.starSystem) return;
 
+    this.lastAudioFrameAtMs = performance.now();
+
     this.starSystem.setAudioFrame({
       energy: f.energy,
       low: f.low,
@@ -134,6 +150,18 @@ export class DemoScene implements SceneController {
     });
 
     this.starSystem.setAudioPlaying(Boolean(p?.isPlaying));
+
+    // NEW: forward to PostFX
+    // PostFX expects an "impact-style" 0..1 energy input. For now we map to energy directly.
+    // (You can later swap this to a transient/peak metric without changing PostFX.)
+    const impact01 = THREE.MathUtils.clamp(Number(f.energy ?? 0), 0, 1);
+
+    this.ctx?.bus.emit("postfx:audio-energy", {
+      impact01,
+      low01: THREE.MathUtils.clamp(Number(f.low ?? 0), 0, 1),
+      mid01: THREE.MathUtils.clamp(Number(f.mid ?? 0), 0, 1),
+      high01: THREE.MathUtils.clamp(Number(f.high ?? 0), 0, 1),
+    });
   };
 
   // ----------------------------------------------------------
@@ -353,7 +381,7 @@ export class DemoScene implements SceneController {
 
     m.scale.setScalar(0.2);
 
-    this.scene.add(m);
+    //this.scene.add(m);
     this.gsapProofMesh = m;
 
     gsap
@@ -553,9 +581,7 @@ export class DemoScene implements SceneController {
     this.regionDebugRoot = root;
 
     // eslint-disable-next-line no-console
-    console.log(
-      `[DemoScene] Region overlay enabled. SystemRadius=${systemRadius}, UniverseRadius=${universeRadius}`,
-    );
+    console.log(`[DemoScene] Region overlay enabled. SystemRadius=${systemRadius}, UniverseRadius=${universeRadius}`);
   }
 
   public update(delta: number): void {
@@ -578,6 +604,22 @@ export class DemoScene implements SceneController {
     this.starSystem?.update(delta);
     this.constellationSystem?.update(delta);
     this.ritual?.update();
+
+    // DEV-only: if no audio frames are coming in, emit a gentle pulse so PostFX telemetry proves wiring.
+    if (import.meta.env.DEV && this.postfxDevPulseEnabled && this.ctx) {
+      const now = performance.now();
+      const ageMs = now - this.lastAudioFrameAtMs;
+
+      // If we've seen no audio frames in the last ~250ms, we're likely idle.
+      if (!Number.isFinite(ageMs) || ageMs > 250) {
+        this.postfxDevPulseT += delta;
+
+        // Slow smooth 0..1
+        const impact01 = 0.5 + 0.5 * Math.sin(this.postfxDevPulseT * 2.0);
+
+        this.ctx.bus.emit("postfx:audio-energy", { impact01 });
+      }
+    }
   }
 
   public dispose(): void {

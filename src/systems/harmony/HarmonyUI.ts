@@ -29,6 +29,10 @@ type UIHandlers = {
   onSelectFilter(id: string): void;
 
   onSetRitualDuration(durationSec: number): void;
+
+  // ✅ Optional UI SFX hooks (HarmonySystem can wire these to EventBus)
+  onUiHover?: () => void;
+  onUiClick?: () => void;
 };
 
 function clamp(n: number, min: number, max: number): number {
@@ -70,19 +74,32 @@ function setSliderPct(el: HTMLInputElement): void {
  * - pointerdown = instant response (Safari trackpad taps included)
  * - preventDefault to avoid click delay/selection quirks
  * - keyboard fallback for accessibility (Enter/Space)
+ *
+ * Also supports optional UI SFX hooks:
+ * - pointerenter => onHover
+ * - pointerdown/Enter/Space => onClick
  */
 function bindPress(
   el: HTMLElement,
   onPress: () => void,
-  opts?: { allowRepeatWhileHeld?: boolean; stopPropagation?: boolean },
+  opts?: {
+    stopPropagation?: boolean;
+    onHover?: () => void;
+    onClick?: () => void;
+  },
 ): () => void {
   const stopProp = opts?.stopPropagation ?? true;
 
+  const safeCall = (fn?: () => void) => {
+    try {
+      fn?.();
+    } catch {
+      // UI SFX should never break interaction
+    }
+  };
+
   const fire = (e?: Event) => {
-    // Prevent Safari quirks: "tap" vs "click" delays, text selection, etc.
-    // Also helps ensure the gesture counts as a "user interaction" for audio unlock.
     if (e) {
-      // NOTE: pointer events on buttons are not passive, so this is allowed.
       try {
         e.preventDefault();
       } catch {}
@@ -95,23 +112,33 @@ function bindPress(
     onPress();
   };
 
+  const onPointerEnter = () => {
+    safeCall(opts?.onHover);
+  };
+
   const onPointerDown = (e: PointerEvent) => {
     // Only primary button/tap.
     if (typeof e.button === "number" && e.button !== 0) return;
+
+    // SFX click should happen on down (feels snappy + counts as gesture)
+    safeCall(opts?.onClick);
     fire(e);
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
-    // Buttons already respond to Enter/Space via click in many browsers,
-    // but Safari can be inconsistent when we lean on pointerdown.
     if (e.key !== "Enter" && e.key !== " ") return;
+
+    // Match pointerdown behavior for keyboard users
+    safeCall(opts?.onClick);
     fire(e);
   };
 
+  el.addEventListener("pointerenter", onPointerEnter);
   el.addEventListener("pointerdown", onPointerDown);
   el.addEventListener("keydown", onKeyDown);
 
   return () => {
+    el.removeEventListener("pointerenter", onPointerEnter);
     el.removeEventListener("pointerdown", onPointerDown);
     el.removeEventListener("keydown", onKeyDown);
   };
@@ -122,7 +149,6 @@ export class HarmonyUI {
   private bar: HTMLDivElement;
   private panel: HTMLDivElement;
 
-  // Phase 2: prev/next
   private btnPrev: HTMLButtonElement;
   private btnPlay: HTMLButtonElement;
   private btnNext: HTMLButtonElement;
@@ -140,20 +166,14 @@ export class HarmonyUI {
 
   private handlers: UIHandlers;
 
-  // NEW: keep a list of event unbinders for clean dispose
   private unbinds: Array<() => void> = [];
 
-  // Scrub coordination:
-  // - While scrubbing, render() must NOT overwrite scrub.value.
-  // - During scrubbing, we emit seek continuously (live scrub) using RAF throttling.
   private isScrubbing = false;
   private scrubSeekRaf = 0;
   private scrubPendingSec: number | null = null;
 
-  // Keep last known duration so we can update the timer text while scrubbing.
   private lastDurationSec = 0;
 
-  // Avoid flooding volume events while dragging; keep it smooth.
   private volRaf = 0;
   private volPending: number | null = null;
 
@@ -226,11 +246,7 @@ export class HarmonyUI {
         color: rgba(255,255,255,0.65);
       }
 
-      /* ------------------------------------------------------------
-         Safari-proof range fill (scrub + volume)
-         We paint the "filled" portion on the input itself via --pct.
-      ------------------------------------------------------------ */
-
+      /* Safari-proof range fill (scrub + volume) */
       .harmony-scrub,
       .harmony-vol {
         -webkit-appearance: none;
@@ -238,7 +254,6 @@ export class HarmonyUI {
         background: transparent;
         cursor: pointer;
 
-        /* Fill painted here */
         --track: rgba(255, 255, 255, 0.18);
         --fill: #d4af37;
         --pct: 0%;
@@ -259,7 +274,6 @@ export class HarmonyUI {
         height: 30px;
       }
 
-      /* WebKit track */
       .harmony-scrub::-webkit-slider-runnable-track,
       .harmony-vol::-webkit-slider-runnable-track {
         height: 4px;
@@ -267,7 +281,6 @@ export class HarmonyUI {
         border-radius: 999px;
       }
 
-      /* WebKit thumb */
       .harmony-scrub::-webkit-slider-thumb,
       .harmony-vol::-webkit-slider-thumb {
         -webkit-appearance: none;
@@ -280,7 +293,6 @@ export class HarmonyUI {
         margin-top: -5px;
       }
 
-      /* Firefox track */
       .harmony-scrub::-moz-range-track,
       .harmony-vol::-moz-range-track {
         height: 4px;
@@ -288,7 +300,6 @@ export class HarmonyUI {
         border-radius: 999px;
       }
 
-      /* Firefox thumb */
       .harmony-scrub::-moz-range-thumb,
       .harmony-vol::-moz-range-thumb {
         width: 14px;
@@ -355,28 +366,33 @@ export class HarmonyUI {
       }
     `;
 
+    const onHover = () => this.handlers.onUiHover?.();
+    const onClick = () => this.handlers.onUiClick?.();
+
     // Bottom bar
     this.bar = document.createElement("div");
     this.bar.className = "harmony-bar";
 
-    // Phase 2: Prev / Play / Next cluster
+    // Prev
     this.btnPrev = document.createElement("button");
     this.btnPrev.className = "harmony-btn";
     this.btnPrev.type = "button";
     this.btnPrev.textContent = "Prev";
-    this.unbinds.push(bindPress(this.btnPrev, () => this.handlers.onPrevTrack()));
+    this.unbinds.push(bindPress(this.btnPrev, () => this.handlers.onPrevTrack(), { onHover, onClick }));
 
+    // Play
     this.btnPlay = document.createElement("button");
     this.btnPlay.className = "harmony-btn";
     this.btnPlay.type = "button";
     this.btnPlay.textContent = "Play";
-    this.unbinds.push(bindPress(this.btnPlay, () => this.handlers.onTogglePlay()));
+    this.unbinds.push(bindPress(this.btnPlay, () => this.handlers.onTogglePlay(), { onHover, onClick }));
 
+    // Next
     this.btnNext = document.createElement("button");
     this.btnNext.className = "harmony-btn";
     this.btnNext.type = "button";
     this.btnNext.textContent = "Next";
-    this.unbinds.push(bindPress(this.btnNext, () => this.handlers.onNextTrack()));
+    this.unbinds.push(bindPress(this.btnNext, () => this.handlers.onNextTrack(), { onHover, onClick }));
 
     const titleWrap = document.createElement("div");
     titleWrap.className = "harmony-title";
@@ -392,6 +408,7 @@ export class HarmonyUI {
     titleWrap.appendChild(this.titleText);
     titleWrap.appendChild(this.timeText);
 
+    // Scrub
     this.scrub = document.createElement("input");
     this.scrub.className = "harmony-scrub";
     this.scrub.type = "range";
@@ -401,9 +418,10 @@ export class HarmonyUI {
     this.scrub.value = "0";
     setSliderPct(this.scrub);
 
-    // Scrub behavior
     const scrubStart = () => {
       this.isScrubbing = true;
+      // optional: tiny click tick when user begins scrubbing
+      this.handlers.onUiClick?.();
     };
 
     const scrubEnd = () => {
@@ -417,7 +435,6 @@ export class HarmonyUI {
         this.scrubSeekRaf = 0;
       }
 
-      // Ensure fill snaps to current value on end
       setSliderPct(this.scrub);
     };
 
@@ -445,6 +462,7 @@ export class HarmonyUI {
       }
     };
 
+    this.scrub.addEventListener("pointerenter", () => this.handlers.onUiHover?.());
     this.scrub.addEventListener("pointerdown", scrubStart);
     this.scrub.addEventListener("pointerup", scrubEnd);
     this.scrub.addEventListener("pointercancel", scrubEnd);
@@ -462,14 +480,14 @@ export class HarmonyUI {
     this.btnShuffle.className = "harmony-btn";
     this.btnShuffle.type = "button";
     this.btnShuffle.textContent = "Shuf";
-    this.unbinds.push(bindPress(this.btnShuffle, () => this.handlers.onToggleShuffle()));
+    this.unbinds.push(bindPress(this.btnShuffle, () => this.handlers.onToggleShuffle(), { onHover, onClick }));
 
-    // Repeat (cycle)
+    // Repeat
     this.btnRepeat = document.createElement("button");
     this.btnRepeat.className = "harmony-btn";
     this.btnRepeat.type = "button";
     this.btnRepeat.textContent = "R0";
-    this.unbinds.push(bindPress(this.btnRepeat, () => this.handlers.onCycleRepeat()));
+    this.unbinds.push(bindPress(this.btnRepeat, () => this.handlers.onCycleRepeat(), { onHover, onClick }));
 
     // Volume
     this.vol = document.createElement("input");
@@ -509,28 +527,33 @@ export class HarmonyUI {
 
       setSliderPct(this.vol);
 
+      // optional “tick” on volume release
+      this.handlers.onUiClick?.();
       this.handlers.onSetVolume(v);
     };
 
+    this.vol.addEventListener("pointerenter", () => this.handlers.onUiHover?.());
     this.vol.addEventListener("input", volumeLive);
     this.vol.addEventListener("change", volumeEnd);
     this.vol.addEventListener("blur", volumeEnd);
 
+    // Vibe
     this.btnVibe = document.createElement("button");
     this.btnVibe.className = "harmony-btn";
     this.btnVibe.type = "button";
     this.btnVibe.textContent = "Vibe";
-    this.unbinds.push(bindPress(this.btnVibe, () => this.handlers.onToggleVibePanel()));
+    this.unbinds.push(bindPress(this.btnVibe, () => this.handlers.onToggleVibePanel(), { onHover, onClick }));
 
+    // Hide
     this.btnHide = document.createElement("button");
     this.btnHide.className = "harmony-btn";
     this.btnHide.type = "button";
     this.btnHide.textContent = "Hide";
     this.unbinds.push(
-      bindPress(this.btnHide, () => this.handlers.onSetUIVisible(false), { stopPropagation: true }),
+      bindPress(this.btnHide, () => this.handlers.onSetUIVisible(false), { stopPropagation: true, onHover, onClick }),
     );
 
-    // Order: Prev / Play / Next / Title / Scrub / Shuffle / Repeat / Vol / Vibe / Hide
+    // Order
     this.bar.appendChild(this.btnPrev);
     this.bar.appendChild(this.btnPlay);
     this.bar.appendChild(this.btnNext);
@@ -606,8 +629,6 @@ export class HarmonyUI {
 
   public mount(parent: HTMLElement): void {
     parent.appendChild(this.root);
-
-    // Ensure sliders show correct fill immediately
     setSliderPct(this.scrub);
     setSliderPct(this.vol);
   }
@@ -628,21 +649,15 @@ export class HarmonyUI {
   }
 
   public render(state: HarmonyState): void {
-    // Only toggle visibility here.
-    // IMPORTANT: do NOT set root.pointerEvents="auto" or you'll block clicks
-    // into the 3D world (the CSS already routes pointer events correctly).
     this.root.style.display = state.uiVisible ? "block" : "none";
-
     this.panel.classList.toggle("open", state.vibePanelOpen);
 
     this.btnPlay.textContent = state.playing ? "Pause" : "Play";
     this.titleText.textContent = state.title || "No track";
 
-    // Shuffle / Repeat
     this.btnShuffle.classList.toggle("on", !!state.shuffle);
     this.btnRepeat.textContent = repeatLabel(state.repeat);
 
-    // Volume (don’t fight the user while they drag it)
     const v = clamp01(Number.isFinite(state.volume) ? state.volume : 0.85);
     if (document.activeElement !== this.vol) {
       this.vol.value = String(v);
@@ -665,7 +680,6 @@ export class HarmonyUI {
       this.scrub.value = String(clamp(pos, 0, max));
       setSliderPct(this.scrub);
     } else {
-      // While scrubbing, the user is driving value; keep fill synced.
       setSliderPct(this.scrub);
     }
 
@@ -695,12 +709,15 @@ export class HarmonyUI {
       b.className = "harmony-tile";
       b.textContent = text;
 
-      // A11y + keyboard support (bindPress already listens to keydown)
       b.setAttribute("role", "button");
       b.tabIndex = 0;
 
-      // Bulletproof: pointerdown + Enter/Space, no click delay
-      this.unbinds.push(bindPress(b, fn));
+      this.unbinds.push(
+        bindPress(b, fn, {
+          onHover: () => this.handlers.onUiHover?.(),
+          onClick: () => this.handlers.onUiClick?.(),
+        }),
+      );
 
       grid.appendChild(b);
     }
@@ -731,7 +748,6 @@ export class HarmonyUI {
       tile.dataset.kind = kind;
       tile.dataset.id = id;
 
-      // A11y + keyboard support
       tile.setAttribute("role", "button");
       tile.tabIndex = 0;
       tile.setAttribute("aria-pressed", "false");
@@ -743,8 +759,12 @@ export class HarmonyUI {
         onToggle(id, next);
       };
 
-      // Bulletproof: pointerdown + Enter/Space
-      this.unbinds.push(bindPress(tile, press));
+      this.unbinds.push(
+        bindPress(tile, press, {
+          onHover: () => this.handlers.onUiHover?.(),
+          onClick: () => this.handlers.onUiClick?.(),
+        }),
+      );
 
       grid.appendChild(tile);
     }

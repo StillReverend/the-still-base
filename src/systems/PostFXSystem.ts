@@ -8,8 +8,16 @@
 //  - Guard all numeric settings against non-finite values
 //
 // Audio-reactive bloom (Feb 2026):
-//  - Optional setAudioEnergy(0..1) input
-//  - Base bloom from profile + audio boost (smoothed)
+//  - Optional setAudioEnergy(0..1) input (impact-style recommended)
+//  - Optional impulse channel (gong / ritual pop / scripted events)
+//  - Optional ritual charge (0..1 ramp while holding)
+//
+// Debug tools (Feb 2026):
+//  - Max Bloom Mode: bypasses audio mapping + clamps, pins bloom to extreme values
+//  - Bloom Telemetry: throttled logging of audio + swell + applied bloom params
+//
+// Patch (Feb 2026):
+//  - Add audio RX counters + ageMs to telemetry to confirm event flow.
 // ============================================================
 
 import * as THREE from "three";
@@ -17,6 +25,8 @@ import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+
+import type { EventBus } from "../core/EventBus";
 
 // ------------------------------------------------------------
 // Types
@@ -73,12 +83,52 @@ export interface PostFXDeps {
   height: number;
   pixelRatio: number;
 
+  // Optional event bus for decoupled driving (recommended)
+  bus?: EventBus;
+
   settings?: Partial<PostFXSettings> & {
     enabled?: boolean;
     bloom?: Partial<BloomSettings>;
   };
 
   profiles?: PostFXProfile[];
+}
+
+// Event payloads (decoupled, flexible)
+export interface PostFXAudioEnergyPayload {
+  /** 0..1 "impact" energy. Recommended: peaks/transients, not UI. */
+  impact01: number;
+  /** Optional: flavor if you ever want it later (does NOT need to be used yet). */
+  low01?: number;
+  mid01?: number;
+  high01?: number;
+}
+
+export interface PostFXImpulsePayload {
+  /** 0..1 impulse amount; 1 is "big cosmic punch". */
+  amount01: number;
+}
+
+export interface PostFXRitualPayload {
+  /** 0..1 ritual hold charge (ramps as you hold). */
+  charge01: number;
+}
+
+// NEW: Debug controls via bus (optional)
+export interface PostFXDebugMaxBloomPayload {
+  enabled: boolean;
+  /** If provided, overrides internal default. */
+  strength?: number;
+  /** 0..1 */
+  radius?: number;
+  /** 0..1 */
+  threshold?: number;
+}
+
+export interface PostFXDebugTelemetryPayload {
+  enabled: boolean;
+  /** log rate (Hz). default: 6 */
+  hz?: number;
 }
 
 // ------------------------------------------------------------
@@ -130,9 +180,9 @@ const DEFAULT_SETTINGS: PostFXSettings = {
   enabled: true,
   bloom: {
     enabled: true,
-    strength: 0.79,
-    radius: 0.31,
-    threshold: 0.10,
+    strength: 1.0,
+    radius: 1.0,
+    threshold: 0,
   },
   stability: {
     dtClampSeconds: 1 / 30,
@@ -147,14 +197,10 @@ const DEFAULT_SETTINGS: PostFXSettings = {
 };
 
 const DEFAULT_PROFILES: PostFXProfile[] = [
-  { name: "default", enabled: true, bloom: { enabled: true, strength: 1.05, radius: 0.55, threshold: 0.12 } },
-  { name: "solar", enabled: true, bloom: { enabled: true, strength: 0.79, radius: 0.65, threshold: 0.10 } },
-  { name: "luna", enabled: true, bloom: { enabled: true, strength: 0.79, radius: 0.5, threshold: 0.18 } },
-  { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.6, threshold: 0.14 } },
-  { name: "sun", enabled: true, bloom: { enabled: true, strength: 1.25, radius: 0.65, threshold: 0.10 } },
-  { name: "moon", enabled: true, bloom: { enabled: true, strength: 0.9, radius: 0.5, threshold: 0.18 } },
-  { name: "void", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.6, threshold: 0.14 } },
-  { name: "off", enabled: false, bloom: { enabled: false, strength: 0.0, radius: 0.0, threshold: 1.0 } },
+  { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.5, radius: 0.3, threshold: 0.01 } },
+  { name: "sol", enabled: true, bloom: { enabled: true, strength: 5.0, radius: 0.9, threshold: 0.01 } },
+  { name: "luna", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.5, threshold: 0.01 } },
+  { name: "void", enabled: true, bloom: { enabled: true, strength: 0.0, radius: 0.1, threshold: 0.01 } },
 ];
 
 // ------------------------------------------------------------
@@ -178,6 +224,9 @@ export class PostFXSystem {
   private bloomStrengthCurrent = 0;
   private bloomStrengthTarget = 0;
 
+  private bloomRadiusCurrent = 0;
+  private bloomRadiusTarget = 0;
+
   private targetScene: THREE.Scene;
   private targetCamera: THREE.Camera;
 
@@ -189,18 +238,104 @@ export class PostFXSystem {
   private framesToStabilize = 0;
   private primeRendersRemaining = 0;
 
-  // ✅ Opaque baseline (black)
+  // Opaque baseline (black)
   private readonly opaqueClearColor = new THREE.Color(0x000000);
 
   // ------------------------------------------------------------
-  // Audio-driven bloom (optional)
+  // Audio-driven bloom (impact-first) + scripted inputs
   // ------------------------------------------------------------
   private audioEnergyCurrent = 0; // smoothed 0..1
   private audioEnergyTarget = 0; // last input 0..1
 
-  // "MORE" knobs (safe defaults)
-  private audioBloomGain = 1.05; // strength added at peak energy
-  private audioBloomMin = 0.0; // constant offset (usually 0)
+  // Telemetry proof: did we actually receive any audio events?
+  private audioEnergyRxCount = 0;
+  private audioEnergyLastRxMs = -1;
+
+  // Impulse for gongs / scripted hits
+  private impulseCurrent = 0; // smoothed current
+  private impulseTarget = 0; // raw target accumulator (decays toward 0)
+
+  // Ritual ramp (0..1)
+  private ritualChargeCurrent = 0;
+  private ritualChargeTarget = 0;
+
+  // ------------------------------------------------------------
+  // Core bloom behavior (strength + radius are driven by intensity)
+  // ------------------------------------------------------------
+
+  // QUIET baseline values (what you see when no meaningful audio drive)
+  private quietStrength = 0.4;
+  private quietRadius = 0.1;
+
+  // Below this intensity, we do NOT swell (prevents ambient noise from heating bloom).
+  private intensityFloor = 0.05;
+
+  // Curve shape: higher = more peak-driven, less “always-on”.
+  private intensityPow = 1.0;
+
+  // How much the “swell factor” matters.
+  // NOTE: max values come from the current profile’s bloom.strength / bloom.radius.
+  private swellToMaxStrength01 = 1.0;
+  private swellToMaxRadius01 = 1.0;
+
+  // ------------------------------------------------------------
+  // New explicit knobs (requested)
+  // ------------------------------------------------------------
+
+  private quietEnergyCutoff = 0.001;
+  private minBloomWhenPlaying01 = 0.31;
+
+  // ------------------------------------------------------------
+  // Scripted contributors (strength lane)
+  // ------------------------------------------------------------
+  private impulseGain = 1.35;
+  private ritualGain = 1.85;
+
+  // ------------------------------------------------------------
+  // DEBUG: Max Bloom Mode + telemetry
+  // ------------------------------------------------------------
+
+  private debugMaxBloomEnabled = false;
+
+  // Defaults are deliberately absurd to find the ceiling.
+  // NOTE: We bypass stability.maxBloomStrength while enabled.
+  private debugMaxBloomStrength = 30.0;
+  private debugMaxBloomRadius = 1.0;
+  private debugMaxBloomThreshold = 0.0;
+
+  private debugTelemetryEnabled = false;
+  private debugTelemetryHz = 6;
+  private debugTelemetryAcc = 0;
+
+  // Optional bus wiring (decoupled)
+  private bus: EventBus | null = null;
+
+  private readonly onAudioEnergyEvent = (payload: PostFXAudioEnergyPayload): void => {
+    this.audioEnergyRxCount += 1;
+    this.audioEnergyLastRxMs = performance.now();
+    this.setAudioEnergy(payload?.impact01 ?? 0);
+  };
+  private readonly onImpulseEvent = (payload: PostFXImpulsePayload): void => {
+    this.addImpulse(payload?.amount01 ?? 0);
+  };
+  private readonly onRitualEvent = (payload: PostFXRitualPayload): void => {
+    this.setRitualCharge(payload?.charge01 ?? 0);
+  };
+
+  private readonly onDebugMaxBloomEvent = (payload: PostFXDebugMaxBloomPayload): void => {
+    const enabled = !!payload?.enabled;
+    this.setDebugMaxBloomEnabled(enabled, {
+      strength: payload?.strength,
+      radius: payload?.radius,
+      threshold: payload?.threshold,
+    });
+  };
+
+  private readonly onDebugTelemetryEvent = (payload: PostFXDebugTelemetryPayload): void => {
+    const enabled = !!payload?.enabled;
+    const hz = payload?.hz;
+    this.setDebugTelemetryEnabled(enabled, hz);
+  };
 
   constructor(deps: PostFXDeps) {
     this.renderer = deps.renderer;
@@ -219,6 +354,28 @@ export class PostFXSystem {
 
     const allProfiles = [...DEFAULT_PROFILES, ...(deps.profiles ?? [])];
     this.profiles = new Map(allProfiles.map((p) => [p.name, p]));
+
+    // Optional bus
+    if (deps.bus) {
+      this.bus = deps.bus;
+
+      this.bus.on<PostFXAudioEnergyPayload>(
+        "postfx:audio-energy",
+        this.onAudioEnergyEvent as unknown as (p: unknown) => void,
+      );
+      this.bus.on<PostFXImpulsePayload>("postfx:impulse", this.onImpulseEvent as unknown as (p: unknown) => void);
+      this.bus.on<PostFXRitualPayload>("postfx:ritual", this.onRitualEvent as unknown as (p: unknown) => void);
+
+      // NEW: debug event channels (no coupling to DevTools required)
+      this.bus.on<PostFXDebugMaxBloomPayload>(
+        "postfx:debug-max-bloom",
+        this.onDebugMaxBloomEvent as unknown as (p: unknown) => void,
+      );
+      this.bus.on<PostFXDebugTelemetryPayload>(
+        "postfx:debug-telemetry",
+        this.onDebugTelemetryEvent as unknown as (p: unknown) => void,
+      );
+    }
 
     this.composer = new EffectComposer(this.renderer);
     this.composer.setPixelRatio(this.pixelRatio);
@@ -244,17 +401,99 @@ export class PostFXSystem {
     this.setBloomEnabled(this.settings.bloom.enabled, true);
     this.setEnabled(this.settings.enabled, true);
 
+    // Initialize dynamic params
+    this.bloomStrengthCurrent = 0;
+    this.bloomStrengthTarget = 0;
+    this.bloomRadiusCurrent = clamp01(n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius));
+    this.bloomRadiusTarget = this.bloomRadiusCurrent;
+    this.bloomPass.radius = this.bloomRadiusCurrent;
+
     this.resize(this.width, this.height, this.pixelRatio);
   }
 
-  /**
-   * Feed audio energy (0..1) into PostFX so bloom can react.
-   * Call once per frame BEFORE postfx.update(dt).
-   */
+  // ------------------------------------------------------------
+  // Public debug API (also reachable via EventBus)
+  // ------------------------------------------------------------
+
+  public setDebugMaxBloomEnabled(
+    enabled: boolean,
+    opts?: { strength?: number; radius?: number; threshold?: number },
+  ): void {
+    this.debugMaxBloomEnabled = !!enabled;
+
+    if (isFiniteNumber(opts?.strength as number)) this.debugMaxBloomStrength = Math.max(0, opts!.strength as number);
+    if (isFiniteNumber(opts?.radius as number)) this.debugMaxBloomRadius = clamp01(opts!.radius as number);
+    if (isFiniteNumber(opts?.threshold as number)) this.debugMaxBloomThreshold = clamp01(opts!.threshold as number);
+
+    if (this.debugEnabled) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[PostFX] DebugMaxBloom ${this.debugMaxBloomEnabled ? "ENABLED" : "DISABLED"} ` +
+          `(str=${this.debugMaxBloomStrength.toFixed(2)} rad=${this.debugMaxBloomRadius.toFixed(
+            2,
+          )} thr=${this.debugMaxBloomThreshold.toFixed(3)})`,
+      );
+    }
+
+    if (this.debugMaxBloomEnabled) {
+      this.bloomPass.threshold = this.debugMaxBloomThreshold;
+      this.framesToStabilize = Math.max(1, this.framesToStabilize);
+    } else {
+      this.syncBloomStaticParams();
+    }
+  }
+
+  public setDebugTelemetryEnabled(enabled: boolean, hz?: number): void {
+    this.debugTelemetryEnabled = !!enabled;
+    if (isFiniteNumber(hz as number)) this.debugTelemetryHz = clamp(hz as number, 0.2, 60);
+
+    if (this.debugEnabled) {
+      // eslint-disable-next-line no-console
+      console.log(`[PostFX] DebugTelemetry ${this.debugTelemetryEnabled ? "ENABLED" : "DISABLED"} hz=${this.debugTelemetryHz}`);
+    }
+
+    this.debugTelemetryAcc = 0;
+  }
+
+  // ------------------------------------------------------------
+  // New knobs (requested)
+  // ------------------------------------------------------------
+
+  public setQuietEnergyCutoff(v: number): void {
+    this.quietEnergyCutoff = clamp01(isFiniteNumber(v) ? v : this.quietEnergyCutoff);
+  }
+
+  public setMinBloomWhenPlaying01(v01: number): void {
+    this.minBloomWhenPlaying01 = clamp01(isFiniteNumber(v01) ? v01 : this.minBloomWhenPlaying01);
+  }
+
+  public setQuietBloom(strength: number, radius: number): void {
+    this.quietStrength = Math.max(0, isFiniteNumber(strength) ? strength : this.quietStrength);
+    this.quietRadius = clamp01(isFiniteNumber(radius) ? radius : this.quietRadius);
+  }
+
+  // ------------------------------------------------------------
+  // Inputs
+  // ------------------------------------------------------------
+
   public setAudioEnergy(energy01: number): void {
     const e = clamp01(isFiniteNumber(energy01) ? energy01 : 0);
     this.audioEnergyTarget = e;
   }
+
+  public addImpulse(amount01: number): void {
+    const a = clamp01(isFiniteNumber(amount01) ? amount01 : 0);
+    this.impulseTarget = clamp01(this.impulseTarget + a);
+  }
+
+  public setRitualCharge(charge01: number): void {
+    const c = clamp01(isFiniteNumber(charge01) ? charge01 : 0);
+    this.ritualChargeTarget = c;
+  }
+
+  // ------------------------------------------------------------
+  // Profiles / settings
+  // ------------------------------------------------------------
 
   public setProfile(profileName: PostFXProfileName): void {
     if (this.debugEnabled) {
@@ -277,7 +516,6 @@ export class PostFXSystem {
 
     this.settings = deepMergeSettings(this.settings, next);
 
-    // ✅ sanitize any external/merged numeric values
     this.settings.bloom.strength = n(this.settings.bloom.strength, DEFAULT_SETTINGS.bloom.strength);
     this.settings.bloom.radius = n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius);
     this.settings.bloom.threshold = n(this.settings.bloom.threshold, DEFAULT_SETTINGS.bloom.threshold);
@@ -287,10 +525,7 @@ export class PostFXSystem {
       DEFAULT_SETTINGS.stability.dtClampSeconds,
     );
     this.settings.stability.bloomAttack = n(this.settings.stability.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack);
-    this.settings.stability.bloomRelease = n(
-      this.settings.stability.bloomRelease,
-      DEFAULT_SETTINGS.stability.bloomRelease,
-    );
+    this.settings.stability.bloomRelease = n(this.settings.stability.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease);
     this.settings.stability.maxBloomStrength = n(
       this.settings.stability.maxBloomStrength,
       DEFAULT_SETTINGS.stability.maxBloomStrength,
@@ -299,6 +534,10 @@ export class PostFXSystem {
     this.syncBloomStaticParams();
     this.setEnabled(this.settings.enabled);
     this.setBloomEnabled(this.settings.bloom.enabled);
+
+    if (this.debugMaxBloomEnabled) {
+      this.bloomPass.threshold = this.debugMaxBloomThreshold;
+    }
   }
 
   public getSettings(): PostFXSettings {
@@ -341,6 +580,10 @@ export class PostFXSystem {
     }
   }
 
+  // ------------------------------------------------------------
+  // Update / render
+  // ------------------------------------------------------------
+
   public update(dtSeconds: number): void {
     const st = this.settings.stability;
 
@@ -348,55 +591,176 @@ export class PostFXSystem {
     const dtClamp = Math.max(1 / 120, n(st.dtClampSeconds, DEFAULT_SETTINGS.stability.dtClampSeconds));
     const dt = clamp(dtSafe, 0, dtClamp);
 
-    this.syncBloomStaticParams();
+    if (!this.debugMaxBloomEnabled) {
+      this.syncBloomStaticParams();
+    } else {
+      this.bloomPass.threshold = this.debugMaxBloomThreshold;
+    }
 
-    const base =
+    if (this.debugMaxBloomEnabled) {
+      const targetStr = Math.max(0, this.debugMaxBloomStrength);
+      const targetRad = clamp01(this.debugMaxBloomRadius);
+
+      this.bloomStrengthTarget = targetStr;
+      this.bloomRadiusTarget = targetRad;
+
+      if (this.framesToStabilize > 0) {
+        this.bloomStrengthCurrent = this.bloomStrengthTarget;
+        this.bloomRadiusCurrent = this.bloomRadiusTarget;
+
+        this.bloomPass.strength = this.bloomStrengthCurrent;
+        this.bloomPass.radius = this.bloomRadiusCurrent;
+
+        this.framesToStabilize -= 1;
+        this.maybeTelemetryLog(dt, {
+          quiet: false,
+          swell01: 1,
+          impulseBoost: 0,
+          ritualBoost: 0,
+          maxStrengthBase: targetStr,
+          maxRadiusBase: targetRad,
+          strengthFromAudio: targetStr,
+        });
+        return;
+      }
+
+      const attack = n(st.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack);
+      const release = n(st.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease);
+
+      const speedStr = this.bloomStrengthTarget > this.bloomStrengthCurrent ? attack : release;
+      this.bloomStrengthCurrent = expSmooth(this.bloomStrengthCurrent, this.bloomStrengthTarget, speedStr, dt);
+
+      const speedRad = this.bloomRadiusTarget > this.bloomRadiusCurrent ? attack : release;
+      this.bloomRadiusCurrent = expSmooth(this.bloomRadiusCurrent, this.bloomRadiusTarget, speedRad, dt);
+
+      if (!isFiniteNumber(this.bloomStrengthCurrent)) this.bloomStrengthCurrent = 0;
+      if (!isFiniteNumber(this.bloomRadiusCurrent)) this.bloomRadiusCurrent = 0;
+
+      this.bloomPass.strength = this.bloomStrengthCurrent;
+      this.bloomPass.radius = this.bloomRadiusCurrent;
+
+      this.maybeTelemetryLog(dt, {
+        quiet: false,
+        swell01: 1,
+        impulseBoost: 0,
+        ritualBoost: 0,
+        maxStrengthBase: targetStr,
+        maxRadiusBase: targetRad,
+        strengthFromAudio: targetStr,
+      });
+
+      return;
+    }
+
+    const maxStrengthBase =
       this.settings.enabled && this.settings.bloom.enabled
         ? Math.max(0, n(this.settings.bloom.strength, DEFAULT_SETTINGS.bloom.strength))
         : 0;
 
-    // ------------------------------------------------------------
-    // Audio energy smoothing (uses bloom attack/release feel)
-    // ------------------------------------------------------------
-    const attackE = Math.max(0, n(st.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack)) * 1.35;
-    const releaseE = Math.max(0, n(st.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease)) * 0.85;
+    const maxRadiusBase =
+      this.settings.enabled && this.settings.bloom.enabled
+        ? clamp01(n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius))
+        : 0;
+
+    const attackE = Math.max(0, n(st.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack)) * 1.65;
+    const releaseE = Math.max(0, n(st.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease)) * 1.05;
     const speedE = this.audioEnergyTarget > this.audioEnergyCurrent ? attackE : releaseE;
 
     this.audioEnergyCurrent = expSmooth(this.audioEnergyCurrent, this.audioEnergyTarget, speedE, dt);
     if (!isFiniteNumber(this.audioEnergyCurrent)) this.audioEnergyCurrent = 0;
 
-    // Expand energy so "quiet vs loud" is obvious.
-    const lifted = clamp01((this.audioEnergyCurrent - 0.02) * 1.9);
-    const punch = clamp01(Math.pow(lifted, 0.42)); // <1 => more pop at mid levels
-    const audioBoost = this.audioBloomMin + punch * this.audioBloomGain;
+    const quiet = this.audioEnergyTarget <= this.quietEnergyCutoff;
 
-    const maxStrength = Math.max(0.25, n(st.maxBloomStrength, DEFAULT_SETTINGS.stability.maxBloomStrength));
-    this.bloomStrengthTarget = clamp(base + audioBoost, 0, maxStrength);
+    const gated = clamp01(
+      (this.audioEnergyCurrent - this.intensityFloor) / Math.max(0.0001, 1 - this.intensityFloor),
+    );
+
+    const shaped = Math.pow(gated, Math.max(0.01, this.intensityPow));
+    const swell01Raw = clamp01(shaped);
+
+    const swell01 = quiet ? 0 : Math.max(this.minBloomWhenPlaying01, swell01Raw);
+
+    const impulseAttack = 40;
+    const impulseRelease = 10;
+    const impulseSpeed = this.impulseTarget > this.impulseCurrent ? impulseAttack : impulseRelease;
+
+    this.impulseCurrent = expSmooth(this.impulseCurrent, this.impulseTarget, impulseSpeed, dt);
+    if (!isFiniteNumber(this.impulseCurrent)) this.impulseCurrent = 0;
+
+    this.impulseTarget = expSmooth(this.impulseTarget, 0, 16, dt);
+    if (!isFiniteNumber(this.impulseTarget)) this.impulseTarget = 0;
+
+    const impulseBoost = clamp01(this.impulseCurrent) * this.impulseGain;
+
+    const ritualAttack = 8;
+    const ritualRelease = 10;
+    const ritualSpeed = this.ritualChargeTarget > this.ritualChargeCurrent ? ritualAttack : ritualRelease;
+
+    this.ritualChargeCurrent = expSmooth(this.ritualChargeCurrent, this.ritualChargeTarget, ritualSpeed, dt);
+    if (!isFiniteNumber(this.ritualChargeCurrent)) this.ritualChargeCurrent = 0;
+
+    const ritualCurve = clamp01(Math.pow(clamp01(this.ritualChargeCurrent), 2.2));
+    const ritualBoost = ritualCurve * this.ritualGain;
+
+    const strengthFloor = Math.max(0, this.quietStrength);
+    const strengthHot = maxStrengthBase;
+
+    const strengthFromAudio =
+      strengthFloor + (strengthHot - strengthFloor) * clamp01(swell01) * this.swellToMaxStrength01;
+
+    const maxStrength = Math.max(0.0, n(st.maxBloomStrength, DEFAULT_SETTINGS.stability.maxBloomStrength));
+    this.bloomStrengthTarget = clamp(strengthFromAudio + impulseBoost + ritualBoost, 0, maxStrength);
+
+    const radiusFloor = clamp01(this.quietRadius);
+    const radiusHot = maxRadiusBase;
+
+    this.bloomRadiusTarget = clamp01(
+      radiusFloor + (radiusHot - radiusFloor) * clamp01(swell01) * this.swellToMaxRadius01,
+    );
 
     if (this.debugEnabled && Math.abs(this.bloomStrengthTarget - this.lastLoggedBloomTarget) > 0.15) {
       this.lastLoggedBloomTarget = this.bloomStrengthTarget;
       // eslint-disable-next-line no-console
       console.log(
-        `[PostFX] bloomTarget=${this.bloomStrengthTarget.toFixed(3)} current=${this.bloomStrengthCurrent.toFixed(
+        `[PostFX] target(str=${this.bloomStrengthTarget.toFixed(3)} rad=${this.bloomRadiusTarget.toFixed(
           3,
-        )} enabled=${this.settings.enabled} bloomEnabled=${this.settings.bloom.enabled} profile=${
-          this.settings.activeProfile ?? "?"
-        } @ ${performance.now().toFixed(0)}ms`,
+        )}) current(str=${this.bloomStrengthCurrent.toFixed(3)} rad=${this.bloomRadiusCurrent.toFixed(
+          3,
+        )}) swell01=${swell01.toFixed(3)} quiet=${quiet ? "Y" : "N"} cutoff=${this.quietEnergyCutoff.toFixed(
+          4,
+        )} floor=${this.intensityFloor.toFixed(3)} pow=${this.intensityPow.toFixed(2)} minPlay=${this.minBloomWhenPlaying01.toFixed(
+          3,
+        )} profile=${this.settings.activeProfile ?? "?"} @ ${performance.now().toFixed(0)}ms`,
       );
     }
 
     if (this.framesToStabilize > 0) {
       this.bloomStrengthCurrent = this.bloomStrengthTarget;
+      this.bloomRadiusCurrent = this.bloomRadiusTarget;
+
       this.bloomPass.strength = this.bloomStrengthCurrent;
+      this.bloomPass.radius = this.bloomRadiusCurrent;
+
       this.framesToStabilize -= 1;
+
+      this.maybeTelemetryLog(dt, {
+        quiet,
+        swell01,
+        impulseBoost,
+        ritualBoost,
+        maxStrengthBase,
+        maxRadiusBase,
+        strengthFromAudio,
+      });
+
       return;
     }
 
     const attack = n(st.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack);
     const release = n(st.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease);
-    const speed = this.bloomStrengthTarget > this.bloomStrengthCurrent ? attack : release;
 
-    this.bloomStrengthCurrent = expSmooth(this.bloomStrengthCurrent, this.bloomStrengthTarget, speed, dt);
+    const speedStr = this.bloomStrengthTarget > this.bloomStrengthCurrent ? attack : release;
+    this.bloomStrengthCurrent = expSmooth(this.bloomStrengthCurrent, this.bloomStrengthTarget, speedStr, dt);
 
     if (!isFiniteNumber(this.bloomStrengthCurrent)) {
       if (this.debugEnabled) {
@@ -407,23 +771,52 @@ export class PostFXSystem {
       this.bloomStrengthTarget = 0;
     }
 
+    const speedRad = this.bloomRadiusTarget > this.bloomRadiusCurrent ? attack : release;
+    this.bloomRadiusCurrent = expSmooth(this.bloomRadiusCurrent, this.bloomRadiusTarget, speedRad, dt);
+
+    if (!isFiniteNumber(this.bloomRadiusCurrent)) {
+      if (this.debugEnabled) {
+        // eslint-disable-next-line no-console
+        console.error("[PostFX] bloomRadiusCurrent became non-finite. Forcing to 0.", this.bloomRadiusCurrent);
+      }
+      this.bloomRadiusCurrent = 0;
+      this.bloomRadiusTarget = 0;
+    }
+
     this.bloomPass.strength = this.bloomStrengthCurrent;
+    this.bloomPass.radius = this.bloomRadiusCurrent;
+
+    this.maybeTelemetryLog(dt, {
+      quiet,
+      swell01,
+      impulseBoost,
+      ritualBoost,
+      maxStrengthBase,
+      maxRadiusBase,
+      strengthFromAudio,
+    });
   }
 
   public render(): void {
-    // ✅ The money shot: force opaque baseline every frame
     this.renderer.autoClear = true;
     this.renderer.setClearColor(this.opaqueClearColor, 1.0);
     this.renderer.clear(true, true, true);
 
-    // Prime RTs after resize (bloom=0) to avoid RT garbage
     if (this.primeRendersRemaining > 0) {
       this.primeRendersRemaining -= 1;
 
-      const saved = this.bloomPass.strength;
+      const savedStr = this.bloomPass.strength;
+      const savedRad = this.bloomPass.radius;
+      const savedThr = this.bloomPass.threshold;
+
       this.bloomPass.strength = 0;
+      this.bloomPass.radius = 0;
+      this.bloomPass.threshold = 1;
       this.composer.render();
-      this.bloomPass.strength = saved;
+
+      this.bloomPass.strength = savedStr;
+      this.bloomPass.radius = savedRad;
+      this.bloomPass.threshold = savedThr;
 
       this.renderer.setClearColor(this.opaqueClearColor, 1.0);
       this.renderer.clear(true, true, true);
@@ -469,12 +862,66 @@ export class PostFXSystem {
   }
 
   public dispose(): void {
+    if (this.bus) {
+      this.bus.off("postfx:audio-energy", this.onAudioEnergyEvent as unknown as (p: unknown) => void);
+      this.bus.off("postfx:impulse", this.onImpulseEvent as unknown as (p: unknown) => void);
+      this.bus.off("postfx:ritual", this.onRitualEvent as unknown as (p: unknown) => void);
+
+      this.bus.off("postfx:debug-max-bloom", this.onDebugMaxBloomEvent as unknown as (p: unknown) => void);
+      this.bus.off("postfx:debug-telemetry", this.onDebugTelemetryEvent as unknown as (p: unknown) => void);
+
+      this.bus = null;
+    }
+
     const anyComposer = this.composer as unknown as { dispose?: () => void };
     if (typeof anyComposer.dispose === "function") anyComposer.dispose();
   }
 
   private syncBloomStaticParams(): void {
-    this.bloomPass.radius = clamp01(n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius));
     this.bloomPass.threshold = clamp01(n(this.settings.bloom.threshold, DEFAULT_SETTINGS.bloom.threshold));
+  }
+
+  private maybeTelemetryLog(
+    dt: number,
+    info: {
+      quiet: boolean;
+      swell01: number;
+      impulseBoost: number;
+      ritualBoost: number;
+      maxStrengthBase: number;
+      maxRadiusBase: number;
+      strengthFromAudio: number;
+    },
+  ): void {
+    if (!this.debugTelemetryEnabled) return;
+
+    const hz = Math.max(0.2, this.debugTelemetryHz);
+    const interval = 1 / hz;
+
+    this.debugTelemetryAcc += Math.max(0, dt);
+    if (this.debugTelemetryAcc < interval) return;
+    this.debugTelemetryAcc = 0;
+
+    const now = performance.now();
+    const ageMs = this.audioEnergyLastRxMs < 0 ? -1 : Math.max(0, now - this.audioEnergyLastRxMs);
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[PostFX:telemetry] profile=${this.settings.activeProfile ?? "?"} maxMode=${this.debugMaxBloomEnabled ? "Y" : "N"} ` +
+        `rx=${this.audioEnergyRxCount} ageMs=${ageMs < 0 ? "NA" : ageMs.toFixed(0)} ` +
+        `E(tgt=${this.audioEnergyTarget.toFixed(3)} cur=${this.audioEnergyCurrent.toFixed(3)}) ` +
+        `quiet=${info.quiet ? "Y" : "N"} cutoff=${this.quietEnergyCutoff.toFixed(4)} floor=${this.intensityFloor.toFixed(
+          3,
+        )} pow=${this.intensityPow.toFixed(2)} ` +
+        `swell=${info.swell01.toFixed(3)} minPlay=${this.minBloomWhenPlaying01.toFixed(3)} ` +
+        `base(str=${info.maxStrengthBase.toFixed(2)} rad=${info.maxRadiusBase.toFixed(2)}) ` +
+        `fromAudio=${info.strengthFromAudio.toFixed(2)} +imp=${info.impulseBoost.toFixed(2)} +rit=${info.ritualBoost.toFixed(
+          2,
+        )} ` +
+        `=> target(str=${this.bloomStrengthTarget.toFixed(2)} rad=${this.bloomRadiusTarget.toFixed(2)} thr=${this.bloomPass.threshold.toFixed(
+          3,
+        )}) ` +
+        `applied(str=${this.bloomPass.strength.toFixed(2)} rad=${this.bloomPass.radius.toFixed(2)})`,
+    );
   }
 }
