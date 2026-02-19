@@ -82,6 +82,17 @@ export interface AudioPlayerState {
   volume: number; // 0..1
 }
 
+// ------------------------------------------------------------
+// NEW: Harmony Environment persistence (vibe selections)
+// ------------------------------------------------------------
+
+export interface HarmonyEnvironmentState {
+  colorId: string;
+  filterId: string;
+  particles: Record<string, boolean>;
+  ambients: Record<string, boolean>;
+}
+
 export interface UserState {
   /** Schema version for migrations. */
   version: 1;
@@ -91,6 +102,9 @@ export interface UserState {
 
   harmony: HarmonyState;
   audio: AudioPlayerState;
+
+  /** NEW: Canonical environment/vibe selections (color/filter/particles/ambients). */
+  harmonyEnvironment: HarmonyEnvironmentState;
 
   /** Canonical collection of tracks */
   tracks: Record<string, TrackState>;
@@ -154,6 +168,35 @@ const clampNonNeg = (v: number): number => {
 
 const nowMs = (): number => Date.now();
 
+const DEFAULT_ENV: HarmonyEnvironmentState = {
+  colorId: "c1",
+  filterId: "f1",
+  particles: {},
+  ambients: {},
+};
+
+const safeString = (v: unknown, fallback: string): string => (typeof v === "string" && v.trim() ? v : fallback);
+
+const safeRecordBool = (v: unknown): Record<string, boolean> => {
+  if (!v || typeof v !== "object") return {};
+  const out: Record<string, boolean> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof k !== "string" || !k) continue;
+    out[k] = Boolean(val);
+  }
+  return out;
+};
+
+const normalizeEnv = (raw: unknown): HarmonyEnvironmentState => {
+  const r = (raw ?? {}) as Partial<HarmonyEnvironmentState>;
+  return {
+    colorId: safeString(r.colorId, DEFAULT_ENV.colorId),
+    filterId: safeString(r.filterId, DEFAULT_ENV.filterId),
+    particles: safeRecordBool(r.particles),
+    ambients: safeRecordBool(r.ambients),
+  };
+};
+
 const createDefaultState = (): UserState => {
   const t = nowMs();
 
@@ -183,6 +226,7 @@ const createDefaultState = (): UserState => {
       repeat: "off",
       volume: 0.85,
     },
+    harmonyEnvironment: { ...DEFAULT_ENV },
     tracks: {},
     createdAtMs: t,
     updatedAtMs: t,
@@ -232,6 +276,7 @@ const sanitizeState = (state: UserState): UserState => {
       repeat: state.audio?.repeat === "one" || state.audio?.repeat === "all" ? state.audio.repeat : "off",
       volume: clamp01(state.audio?.volume ?? 0),
     },
+    harmonyEnvironment: normalizeEnv((state as unknown as { harmonyEnvironment?: unknown })?.harmonyEnvironment),
     tracks: {},
     createdAtMs: Number.isFinite(state.createdAtMs) ? state.createdAtMs : nowMs(),
     updatedAtMs: nowMs(),
@@ -308,6 +353,40 @@ export class PersistenceSystem {
   /** Returns a deep-ish copy safe for consumers (no mutation). */
   getState(): UserState {
     return safeClone(this.state);
+  }
+
+  // ------------------------------------------------------------
+  // NEW: Convenience getters for Harmony environment
+  // ------------------------------------------------------------
+
+  getHarmonyEnvironment(): HarmonyEnvironmentState {
+    return safeClone(this.state.harmonyEnvironment);
+  }
+
+  /**
+   * Canonical API expected by HarmonyEnvironmentSystem:
+   *   setHarmonyEnvironment(partial, reason)
+   */
+  setHarmonyEnvironment(partial: Partial<HarmonyEnvironmentState>, reason = "harmonyEnvironment:set"): void {
+    const prev = this.state.harmonyEnvironment ?? { ...DEFAULT_ENV };
+
+    const next: HarmonyEnvironmentState = normalizeEnv({
+      ...prev,
+      ...partial,
+      particles: partial.particles ? { ...prev.particles, ...partial.particles } : prev.particles,
+      ambients: partial.ambients ? { ...prev.ambients, ...partial.ambients } : prev.ambients,
+    });
+
+    // No-op guard (keeps autosave calm)
+    const same =
+      prev.colorId === next.colorId &&
+      prev.filterId === next.filterId &&
+      JSON.stringify(prev.particles) === JSON.stringify(next.particles) &&
+      JSON.stringify(prev.ambients) === JSON.stringify(next.ambients);
+
+    if (same) return;
+
+    this.update({ harmonyEnvironment: next }, reason);
   }
 
   /**
@@ -511,7 +590,12 @@ export class PersistenceSystem {
     const raw = this.save.get(SAVE_KEY as any) as unknown;
 
     if (isUserStateV1(raw)) {
-      return { state: sanitizeState(raw), fromSave: true };
+      // Back-compat: older saves may not have harmonyEnvironment.
+      const withEnv = raw as UserState;
+      if (!(withEnv as any).harmonyEnvironment) {
+        (withEnv as any).harmonyEnvironment = { ...DEFAULT_ENV };
+      }
+      return { state: sanitizeState(withEnv), fromSave: true };
     }
 
     return { state: createDefaultState(), fromSave: false };

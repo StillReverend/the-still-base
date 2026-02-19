@@ -20,7 +20,7 @@ type UIHandlers = {
   onCycleRepeat(): void;
   onSetVolume(volume01: number): void;
 
-  onToggleVibePanel(): void;
+  onToggleEnvironmentPanel(): void;
   onSetUIVisible(visible: boolean): void;
 
   onToggleParticle(id: string, enabled: boolean): void;
@@ -105,6 +105,7 @@ function bindPress(
       } catch {}
       if (stopProp) {
         try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           (e as any).stopPropagation?.();
         } catch {}
       }
@@ -161,7 +162,7 @@ export class HarmonyUI {
   private btnRepeat: HTMLButtonElement;
   private vol: HTMLInputElement;
 
-  private btnVibe: HTMLButtonElement;
+  private btnEnvironment: HTMLButtonElement;
   private btnHide: HTMLButtonElement;
 
   private handlers: UIHandlers;
@@ -418,13 +419,29 @@ export class HarmonyUI {
     this.scrub.value = "0";
     setSliderPct(this.scrub);
 
-    const scrubStart = () => {
+    const scrubStart = (e?: PointerEvent) => {
       this.isScrubbing = true;
-      // optional: tiny click tick when user begins scrubbing
+
+      // Capture pointer so we reliably get pointerup even if cursor leaves the control.
+      if (e && typeof (this.scrub as any).setPointerCapture === "function" && e.pointerId != null) {
+        try {
+          this.scrub.setPointerCapture(e.pointerId);
+        } catch {}
+      }
+
+      // Optional: tiny click tick when user begins scrubbing
       this.handlers.onUiClick?.();
     };
 
-    const scrubEnd = () => {
+    const scrubEnd = (e?: PointerEvent) => {
+      if (!this.isScrubbing) return;
+
+      if (e && typeof (this.scrub as any).releasePointerCapture === "function" && e.pointerId != null) {
+        try {
+          this.scrub.releasePointerCapture(e.pointerId);
+        } catch {}
+      }
+
       const timeSec = Number(this.scrub.value);
       if (Number.isFinite(timeSec)) this.handlers.onSeek(timeSec);
 
@@ -463,17 +480,17 @@ export class HarmonyUI {
     };
 
     this.scrub.addEventListener("pointerenter", () => this.handlers.onUiHover?.());
-    this.scrub.addEventListener("pointerdown", scrubStart);
-    this.scrub.addEventListener("pointerup", scrubEnd);
-    this.scrub.addEventListener("pointercancel", scrubEnd);
-    this.scrub.addEventListener("lostpointercapture", scrubEnd);
+    this.scrub.addEventListener("pointerdown", (e) => scrubStart(e));
+    this.scrub.addEventListener("pointerup", (e) => scrubEnd(e));
+    this.scrub.addEventListener("pointercancel", (e) => scrubEnd(e));
+    this.scrub.addEventListener("lostpointercapture", () => scrubEnd());
 
-    this.scrub.addEventListener("touchstart", scrubStart, { passive: true });
-    this.scrub.addEventListener("touchend", scrubEnd);
+    this.scrub.addEventListener("touchstart", () => scrubStart(), { passive: true });
+    this.scrub.addEventListener("touchend", () => scrubEnd());
 
     this.scrub.addEventListener("input", scrubLive);
-    this.scrub.addEventListener("change", scrubEnd);
-    this.scrub.addEventListener("blur", scrubEnd);
+    this.scrub.addEventListener("change", () => scrubEnd());
+    this.scrub.addEventListener("blur", () => scrubEnd());
 
     // Shuffle
     this.btnShuffle = document.createElement("button");
@@ -527,7 +544,7 @@ export class HarmonyUI {
 
       setSliderPct(this.vol);
 
-      // optional “tick” on volume release
+      // Optional “tick” on volume release
       this.handlers.onUiClick?.();
       this.handlers.onSetVolume(v);
     };
@@ -538,11 +555,11 @@ export class HarmonyUI {
     this.vol.addEventListener("blur", volumeEnd);
 
     // Vibe
-    this.btnVibe = document.createElement("button");
-    this.btnVibe.className = "harmony-btn";
-    this.btnVibe.type = "button";
-    this.btnVibe.textContent = "Vibe";
-    this.unbinds.push(bindPress(this.btnVibe, () => this.handlers.onToggleVibePanel(), { onHover, onClick }));
+    this.btnEnvironment = document.createElement("button");
+    this.btnEnvironment.className = "harmony-btn";
+    this.btnEnvironment.type = "button";
+    this.btnEnvironment.textContent = "Vibe";
+    this.unbinds.push(bindPress(this.btnEnvironment, () => this.handlers.onToggleEnvironmentPanel(), { onHover, onClick }));
 
     // Hide
     this.btnHide = document.createElement("button");
@@ -562,7 +579,7 @@ export class HarmonyUI {
     this.bar.appendChild(this.btnShuffle);
     this.bar.appendChild(this.btnRepeat);
     this.bar.appendChild(this.vol);
-    this.bar.appendChild(this.btnVibe);
+    this.bar.appendChild(this.btnEnvironment);
     this.bar.appendChild(this.btnHide);
 
     // Vibe panel
@@ -570,20 +587,20 @@ export class HarmonyUI {
     this.panel.className = "harmony-panel";
 
     this.panel.appendChild(
-      this.makeSection("Color", [
-        ["C1", () => this.handlers.onSelectColor("c1")],
-        ["C2", () => this.handlers.onSelectColor("c2")],
-        ["C3", () => this.handlers.onSelectColor("c3")],
-        ["C4", () => this.handlers.onSelectColor("c4")],
+      this.makeSelectSection("Color", "color", [
+        ["C1", "c1", () => this.handlers.onSelectColor("c1")],
+        ["C2", "c2", () => this.handlers.onSelectColor("c2")],
+        ["C3", "c3", () => this.handlers.onSelectColor("c3")],
+        ["C4", "c4", () => this.handlers.onSelectColor("c4")],
       ]),
     );
 
     this.panel.appendChild(
-      this.makeSection("Filter", [
-        ["F1", () => this.handlers.onSelectFilter("f1")],
-        ["F2", () => this.handlers.onSelectFilter("f2")],
-        ["F3", () => this.handlers.onSelectFilter("f3")],
-        ["F4", () => this.handlers.onSelectFilter("f4")],
+      this.makeSelectSection("Filter", "filter", [
+        ["F1", "f1", () => this.handlers.onSelectFilter("f1")],
+        ["F2", "f2", () => this.handlers.onSelectFilter("f2")],
+        ["F3", "f3", () => this.handlers.onSelectFilter("f3")],
+        ["F4", "f4", () => this.handlers.onSelectFilter("f4")],
       ]),
     );
 
@@ -650,7 +667,7 @@ export class HarmonyUI {
 
   public render(state: HarmonyState): void {
     this.root.style.display = state.uiVisible ? "block" : "none";
-    this.panel.classList.toggle("open", state.vibePanelOpen);
+    this.panel.classList.toggle("open", state.environmentPanelOpen);
 
     this.btnPlay.textContent = state.playing ? "Pause" : "Play";
     this.titleText.textContent = state.title || "No track";
@@ -683,8 +700,13 @@ export class HarmonyUI {
       setSliderPct(this.scrub);
     }
 
-    this.syncToggleVisual("particle", state.particles);
-    this.syncToggleVisual("ambient", state.ambients);
+    // Toggle visuals
+    this.syncToggleVisual("particle", (state.particles ?? {}) as Record<string, boolean>);
+    this.syncToggleVisual("ambient", (state.ambients ?? {}) as Record<string, boolean>);
+
+    // Select visuals (single-choice)
+    this.syncSelectVisual("color", String((state as any).colorId ?? ""));
+    this.syncSelectVisual("filter", String((state as any).filterId ?? ""));
   }
 
   private syncToggleVisual(kind: string, map: Record<string, boolean>): void {
@@ -693,6 +715,16 @@ export class HarmonyUI {
       const id = tile.dataset.id || "";
       tile.classList.toggle("on", Boolean(map[id]));
       tile.setAttribute("aria-pressed", Boolean(map[id]) ? "true" : "false");
+    });
+  }
+
+  private syncSelectVisual(kind: string, selectedId: string): void {
+    const tiles = this.root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="${kind}"]`);
+    tiles.forEach((tile) => {
+      const id = tile.dataset.id || "";
+      const on = id && id === selectedId;
+      tile.classList.toggle("on", on);
+      tile.setAttribute("aria-pressed", on ? "true" : "false");
     });
   }
 
@@ -720,6 +752,52 @@ export class HarmonyUI {
       );
 
       grid.appendChild(b);
+    }
+
+    wrap.appendChild(h);
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  private makeSelectSection(
+    label: string,
+    kind: "color" | "filter",
+    buttons: Array<[string, string, () => void]>,
+  ): HTMLElement {
+    const wrap = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = label;
+
+    const grid = document.createElement("div");
+    grid.className = "harmony-grid";
+
+    for (const [text, id, fn] of buttons) {
+      const tile = document.createElement("div");
+      tile.className = "harmony-tile";
+      tile.textContent = text;
+      tile.dataset.kind = kind;
+      tile.dataset.id = id;
+
+      tile.setAttribute("role", "button");
+      tile.tabIndex = 0;
+      tile.setAttribute("aria-pressed", "false");
+
+      this.unbinds.push(
+        bindPress(
+          tile,
+          () => {
+            // Optimistic UI highlight (render() will re-sync from state)
+            this.syncSelectVisual(kind, id);
+            fn();
+          },
+          {
+            onHover: () => this.handlers.onUiHover?.(),
+            onClick: () => this.handlers.onUiClick?.(),
+          },
+        ),
+      );
+
+      grid.appendChild(tile);
     }
 
     wrap.appendChild(h);

@@ -18,6 +18,10 @@
 //
 // Patch (Feb 2026):
 //  - Add audio RX counters + ageMs to telemetry to confirm event flow.
+//
+// Harmony integration (Feb 2026):
+//  - setHarmonyEnvironment({ filterId, colorId }) for HarmonyEnvironmentSystem
+//  - filterId maps to PostFX profiles (colorId stored for future tinting)
 // ============================================================
 
 import * as THREE from "three";
@@ -41,6 +45,7 @@ export type PostFXProfileName =
   | "lunar"
   | "luna"
   | "moon"
+  | "sol"
   | "off"
   | string;
 
@@ -131,6 +136,12 @@ export interface PostFXDebugTelemetryPayload {
   hz?: number;
 }
 
+// Harmony (Environment) payload (called directly, no bus required)
+export interface PostFXHarmonyEnvironmentPayload {
+  filterId: string;
+  colorId: string;
+}
+
 // ------------------------------------------------------------
 // Utils
 // ------------------------------------------------------------
@@ -172,6 +183,24 @@ const deepMergeSettings = (base: PostFXSettings, patch?: Partial<PostFXSettings>
   };
 };
 
+// Harmony filter mapping
+const mapHarmonyFilterToProfile = (filterId: string): PostFXProfileName => {
+  switch (String(filterId || "").toLowerCase()) {
+    case "f2":
+      return "blackHole";
+    case "f3":
+      return "sol";
+    case "f4":
+      return "luna";
+    case "f0":
+    case "off":
+      return "off";
+    case "f1":
+    default:
+      return "default";
+  }
+};
+
 // ------------------------------------------------------------
 // Defaults
 // ------------------------------------------------------------
@@ -197,6 +226,19 @@ const DEFAULT_SETTINGS: PostFXSettings = {
 };
 
 const DEFAULT_PROFILES: PostFXProfile[] = [
+  // ✅ PATCH: Ensure "default" exists so Harmony can reliably revert to baseline.
+  {
+    name: "default",
+    enabled: true,
+    bloom: {
+      enabled: DEFAULT_SETTINGS.bloom.enabled,
+      strength: DEFAULT_SETTINGS.bloom.strength,
+      radius: DEFAULT_SETTINGS.bloom.radius,
+      threshold: DEFAULT_SETTINGS.bloom.threshold,
+    },
+    stability: { ...DEFAULT_SETTINGS.stability },
+  },
+
   { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.5, radius: 0.3, threshold: 0.01 } },
   { name: "sol", enabled: true, bloom: { enabled: true, strength: 5.0, radius: 0.9, threshold: 0.01 } },
   { name: "luna", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.5, threshold: 0.01 } },
@@ -242,6 +284,12 @@ export class PostFXSystem {
   private readonly opaqueClearColor = new THREE.Color(0x000000);
 
   // ------------------------------------------------------------
+  // Harmony environment (stored for future tinting / palette work)
+  // ------------------------------------------------------------
+  private harmonyColorId = "c1";
+  private harmonyFilterId = "f1";
+
+  // ------------------------------------------------------------
   // Audio-driven bloom (impact-first) + scripted inputs
   // ------------------------------------------------------------
   private audioEnergyCurrent = 0; // smoothed 0..1
@@ -263,18 +311,12 @@ export class PostFXSystem {
   // Core bloom behavior (strength + radius are driven by intensity)
   // ------------------------------------------------------------
 
-  // QUIET baseline values (what you see when no meaningful audio drive)
   private quietStrength = 0.4;
   private quietRadius = 0.1;
 
-  // Below this intensity, we do NOT swell (prevents ambient noise from heating bloom).
   private intensityFloor = 0.05;
-
-  // Curve shape: higher = more peak-driven, less “always-on”.
   private intensityPow = 1.0;
 
-  // How much the “swell factor” matters.
-  // NOTE: max values come from the current profile’s bloom.strength / bloom.radius.
   private swellToMaxStrength01 = 1.0;
   private swellToMaxRadius01 = 1.0;
 
@@ -297,8 +339,6 @@ export class PostFXSystem {
 
   private debugMaxBloomEnabled = false;
 
-  // Defaults are deliberately absurd to find the ceiling.
-  // NOTE: We bypass stability.maxBloomStrength while enabled.
   private debugMaxBloomStrength = 30.0;
   private debugMaxBloomRadius = 1.0;
   private debugMaxBloomThreshold = 0.0;
@@ -307,7 +347,6 @@ export class PostFXSystem {
   private debugTelemetryHz = 6;
   private debugTelemetryAcc = 0;
 
-  // Optional bus wiring (decoupled)
   private bus: EventBus | null = null;
 
   private readonly onAudioEnergyEvent = (payload: PostFXAudioEnergyPayload): void => {
@@ -355,7 +394,6 @@ export class PostFXSystem {
     const allProfiles = [...DEFAULT_PROFILES, ...(deps.profiles ?? [])];
     this.profiles = new Map(allProfiles.map((p) => [p.name, p]));
 
-    // Optional bus
     if (deps.bus) {
       this.bus = deps.bus;
 
@@ -366,7 +404,6 @@ export class PostFXSystem {
       this.bus.on<PostFXImpulsePayload>("postfx:impulse", this.onImpulseEvent as unknown as (p: unknown) => void);
       this.bus.on<PostFXRitualPayload>("postfx:ritual", this.onRitualEvent as unknown as (p: unknown) => void);
 
-      // NEW: debug event channels (no coupling to DevTools required)
       this.bus.on<PostFXDebugMaxBloomPayload>(
         "postfx:debug-max-bloom",
         this.onDebugMaxBloomEvent as unknown as (p: unknown) => void,
@@ -401,7 +438,6 @@ export class PostFXSystem {
     this.setBloomEnabled(this.settings.bloom.enabled, true);
     this.setEnabled(this.settings.enabled, true);
 
-    // Initialize dynamic params
     this.bloomStrengthCurrent = 0;
     this.bloomStrengthTarget = 0;
     this.bloomRadiusCurrent = clamp01(n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius));
@@ -409,6 +445,32 @@ export class PostFXSystem {
     this.bloomPass.radius = this.bloomRadiusCurrent;
 
     this.resize(this.width, this.height, this.pixelRatio);
+  }
+
+  // ------------------------------------------------------------
+  // Harmony integration (called by HarmonyEnvironmentSystem)
+  // ------------------------------------------------------------
+
+  public setHarmonyEnvironment(payload: PostFXHarmonyEnvironmentPayload): void {
+    const filterId = typeof payload?.filterId === "string" ? payload.filterId : "f1";
+    const colorId = typeof payload?.colorId === "string" ? payload.colorId : "c1";
+
+    const nextProfile = mapHarmonyFilterToProfile(filterId);
+
+    this.harmonyFilterId = filterId;
+    this.harmonyColorId = colorId;
+
+    if (nextProfile === "off") {
+      this.setEnabled(false);
+      return;
+    }
+
+    this.setEnabled(true);
+    this.setProfile(nextProfile);
+  }
+
+  public getHarmonyEnvironment(): { filterId: string; colorId: string } {
+    return { filterId: this.harmonyFilterId, colorId: this.harmonyColorId };
   }
 
   // ------------------------------------------------------------
@@ -449,15 +511,13 @@ export class PostFXSystem {
 
     if (this.debugEnabled) {
       // eslint-disable-next-line no-console
-      console.log(`[PostFX] DebugTelemetry ${this.debugTelemetryEnabled ? "ENABLED" : "DISABLED"} hz=${this.debugTelemetryHz}`);
+      console.log(
+        `[PostFX] DebugTelemetry ${this.debugTelemetryEnabled ? "ENABLED" : "DISABLED"} hz=${this.debugTelemetryHz}`,
+      );
     }
 
     this.debugTelemetryAcc = 0;
   }
-
-  // ------------------------------------------------------------
-  // New knobs (requested)
-  // ------------------------------------------------------------
 
   public setQuietEnergyCutoff(v: number): void {
     this.quietEnergyCutoff = clamp01(isFiniteNumber(v) ? v : this.quietEnergyCutoff);
@@ -471,10 +531,6 @@ export class PostFXSystem {
     this.quietStrength = Math.max(0, isFiniteNumber(strength) ? strength : this.quietStrength);
     this.quietRadius = clamp01(isFiniteNumber(radius) ? radius : this.quietRadius);
   }
-
-  // ------------------------------------------------------------
-  // Inputs
-  // ------------------------------------------------------------
 
   public setAudioEnergy(energy01: number): void {
     const e = clamp01(isFiniteNumber(energy01) ? energy01 : 0);
@@ -491,14 +547,15 @@ export class PostFXSystem {
     this.ritualChargeTarget = c;
   }
 
-  // ------------------------------------------------------------
-  // Profiles / settings
-  // ------------------------------------------------------------
-
   public setProfile(profileName: PostFXProfileName): void {
     if (this.debugEnabled) {
       // eslint-disable-next-line no-console
       console.log(`[PostFX] setProfile("${profileName}") @ ${performance.now().toFixed(0)}ms`);
+    }
+
+    if (String(profileName).toLowerCase() === "off") {
+      this.setEnabled(false);
+      return;
     }
 
     const profile = this.profiles.get(profileName);
@@ -525,7 +582,10 @@ export class PostFXSystem {
       DEFAULT_SETTINGS.stability.dtClampSeconds,
     );
     this.settings.stability.bloomAttack = n(this.settings.stability.bloomAttack, DEFAULT_SETTINGS.stability.bloomAttack);
-    this.settings.stability.bloomRelease = n(this.settings.stability.bloomRelease, DEFAULT_SETTINGS.stability.bloomRelease);
+    this.settings.stability.bloomRelease = n(
+      this.settings.stability.bloomRelease,
+      DEFAULT_SETTINGS.stability.bloomRelease,
+    );
     this.settings.stability.maxBloomStrength = n(
       this.settings.stability.maxBloomStrength,
       DEFAULT_SETTINGS.stability.maxBloomStrength,
@@ -579,10 +639,6 @@ export class PostFXSystem {
       this.bloomPass.strength = this.bloomStrengthCurrent;
     }
   }
-
-  // ------------------------------------------------------------
-  // Update / render
-  // ------------------------------------------------------------
 
   public update(dtSeconds: number): void {
     const st = this.settings.stability;
@@ -858,7 +914,10 @@ export class PostFXSystem {
       0,
       n(this.settings.stability.stabilizationFrames, DEFAULT_SETTINGS.stability.stabilizationFrames),
     );
-    this.primeRendersRemaining = Math.max(0, n(this.settings.stability.primeFrames, DEFAULT_SETTINGS.stability.primeFrames));
+    this.primeRendersRemaining = Math.max(
+      0,
+      n(this.settings.stability.primeFrames, DEFAULT_SETTINGS.stability.primeFrames),
+    );
   }
 
   public dispose(): void {

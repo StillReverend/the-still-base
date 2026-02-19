@@ -3,6 +3,7 @@
 // THE STILL — HarmonySystem
 //  - Owns Harmony UI state
 //  - Talks only through EventBus (no AudioSystem imports)
+//  - Mirrors canonical environment snapshots from HarmonyEnvironmentSystem
 // ============================================================
 
 import type { EventBus } from "../../core/EventBus";
@@ -15,24 +16,81 @@ type AnyFn = (...args: any[]) => void;
 
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
+type AudioSnapshot = {
+  playing: boolean;
+  trackId: string | null;
+  title: string;
+  positionSec: number;
+  durationSec: number;
+  shuffle: boolean;
+  repeat: RepeatMode;
+  volume: number;
+};
+
+const isRepeatMode = (v: unknown): v is RepeatMode => v === "off" || v === "one" || v === "all";
+
+// Canonical environment snapshot shape (kept local to avoid importing Persistence types here)
+type HarmonyEnvironmentSnapshot = {
+  colorId?: string;
+  filterId?: string;
+  particles?: Record<string, boolean>;
+  ambients?: Record<string, boolean>;
+};
+
+type HarmonyEnvironmentStateEvent = {
+  environment: HarmonyEnvironmentSnapshot;
+  reason: string;
+};
+
+const safeString = (v: unknown, fallback = ""): string => (typeof v === "string" && v.trim() ? v : fallback);
+
+const safeBoolMap = (v: unknown): Record<string, boolean> => {
+  if (!v || typeof v !== "object") return {};
+  const out: Record<string, boolean> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof k !== "string" || !k) continue;
+    out[k] = Boolean(val);
+  }
+  return out;
+};
+
+const shallowBoolMapEquals = (a: Record<string, boolean>, b: Record<string, boolean>): boolean => {
+  if (a === b) return true;
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+};
+
+const makeDefaultState = (): HarmonyState => {
+  // Important: avoid sharing nested object references if defaults are reused.
+  return {
+    ...HARMONY_DEFAULT_STATE,
+    particles: { ...(HARMONY_DEFAULT_STATE.particles ?? {}) },
+    ambients: { ...(HARMONY_DEFAULT_STATE.ambients ?? {}) },
+  };
+};
+
 export class HarmonySystem {
   private bus: EventBus;
   private ui: HarmonyUI | null = null;
-  private state: HarmonyState = { ...HARMONY_DEFAULT_STATE };
+  private state: HarmonyState = makeDefaultState();
   private disposers: Array<() => void> = [];
 
   private renderRaf = 0;
   private renderQueued = false;
 
-  private lastAudioApplied: {
-    playing: boolean;
-    trackId: string | null;
-    title: string;
-    positionSec: number;
-    durationSec: number;
-    shuffle: boolean;
-    repeat: RepeatMode;
-    volume: number;
+  private lastAudioApplied: AudioSnapshot | null = null;
+
+  // Track last environment snapshot applied to avoid redundant renders
+  private lastEnvApplied: {
+    colorId: string;
+    filterId: string;
+    particles: Record<string, boolean>;
+    ambients: Record<string, boolean>;
   } | null = null;
 
   constructor(bus: EventBus) {
@@ -41,6 +99,9 @@ export class HarmonySystem {
 
   public init(): void {
     if (this.ui) return;
+
+    // Ensure a clean state on init (useful if system was disposed/re-inited)
+    this.state = makeDefaultState();
 
     this.ui = new HarmonyUI({
       onTogglePlay: () => {
@@ -66,7 +127,7 @@ export class HarmonySystem {
       onCycleRepeat: () => this.cycleRepeat(),
       onSetVolume: (volume01) => this.setVolume(volume01),
 
-      onToggleVibePanel: () => this.toggleVibePanel(),
+      onToggleEnvironmentPanel: () => this.toggleEnvironmentPanel(),
       onSetUIVisible: (visible) => this.setUIVisible(visible),
 
       onToggleParticle: (id, enabled) => this.toggleParticle(id, enabled),
@@ -84,13 +145,21 @@ export class HarmonySystem {
     this.ui.mount(document.body);
     this.ui.render(this.state);
 
+    // Audio state mirrors
     this.on("audio:state", (p: AudioStateEvent) => this.onAudioState(p));
 
+    // Harmony UI visibility controls
     this.on("harmony:ui:setVisible", (p: { visible: boolean }) => this.setUIVisible(Boolean(p?.visible)));
     this.on("harmony:ui:toggleVisible", () => this.setUIVisible(!this.state.uiVisible));
 
-    this.on("harmony:vibePanel:setOpen", (p: { open: boolean }) => this.setVibePanelOpen(Boolean(p?.open)));
-    this.on("harmony:vibePanel:toggle", () => this.toggleVibePanel());
+    // Environment panel controls
+    this.on("harmony:environmentPanel:setOpen", (p: { open: boolean }) => this.setEnvironmentPanelOpen(Boolean(p?.open)));
+    this.on("harmony:environmentPanel:toggle", () => this.toggleEnvironmentPanel());
+
+    // ✅ Canonical environment state mirroring (boot restore, presets, etc.)
+    this.on("harmony:environment:state", (p: HarmonyEnvironmentStateEvent) => this.onEnvironmentState(p));
+    // Optional: if you use this elsewhere, mirroring it too doesn't hurt.
+    this.on("harmony:environment:changed", (p: HarmonyEnvironmentStateEvent) => this.onEnvironmentState(p));
 
     window.addEventListener("keydown", this.onKeyDown, { passive: true });
     this.disposers.push(() => window.removeEventListener("keydown", this.onKeyDown));
@@ -105,6 +174,7 @@ export class HarmonySystem {
     this.renderQueued = false;
 
     this.lastAudioApplied = null;
+    this.lastEnvApplied = null;
 
     this.ui?.dispose();
     this.ui = null;
@@ -115,10 +185,10 @@ export class HarmonySystem {
   // ------------------------------------------------------------
 
   private emitUiHover(): void {
-  // IMPORTANT: Hover is NOT a user gesture for autoplay policies.
-  // Do NOT attempt unlock here or Chrome will warn.
-  this.emit("ui:sfx:hover", { source: "harmony" });
-}
+    // IMPORTANT: Hover is NOT a user gesture for autoplay policies.
+    // Do NOT attempt unlock here or Chrome will warn.
+    this.emit("ui:sfx:hover", { source: "harmony" });
+  }
 
   private emitUiClick(): void {
     // Click is a user gesture: ensure audio is unlocked before SFX playback attempts.
@@ -126,38 +196,75 @@ export class HarmonySystem {
     this.emit("ui:sfx:click", { source: "harmony" });
   }
 
+  // ------------------------------------------------------------
+  // Canonical environment mirroring
+  // ------------------------------------------------------------
+
+  private onEnvironmentState(payload: HarmonyEnvironmentStateEvent): void {
+    const env = payload?.environment ?? {};
+
+    const colorId = safeString(env.colorId, safeString((this.state as any).colorId, "c1"));
+    const filterId = safeString(env.filterId, safeString((this.state as any).filterId, "f1"));
+
+    const particles = safeBoolMap(env.particles);
+    const ambients = safeBoolMap(env.ambients);
+
+    const prev = this.lastEnvApplied;
+
+    const same =
+      prev &&
+      prev.colorId === colorId &&
+      prev.filterId === filterId &&
+      shallowBoolMapEquals(prev.particles, particles) &&
+      shallowBoolMapEquals(prev.ambients, ambients);
+
+    if (same) return;
+
+    this.lastEnvApplied = { colorId, filterId, particles, ambients };
+
+    this.state.colorId = colorId;
+    this.state.filterId = filterId;
+    this.state.particles = { ...particles };
+    this.state.ambients = { ...ambients };
+
+    this.requestRender();
+  }
+
+  // ------------------------------------------------------------
+  // Audio mirroring
+  // ------------------------------------------------------------
+
   private onAudioState(payload: AudioStateEvent): void {
     const s = payload?.state;
     if (!s) return;
 
     const playing = Boolean(s.isPlaying);
-    const trackId = (s.activeTrackId ?? null) as string | null;
+    const trackId = typeof s.activeTrackId === "string" ? s.activeTrackId : null;
 
-    const timeSec = Number.isFinite(s.timeSec) ? s.timeSec : 0;
-    const durationSec = Number.isFinite(s.durationSec ?? NaN) ? Number(s.durationSec) : 0;
+    const timeSec = Number.isFinite(s.timeSec) ? Math.max(0, Number(s.timeSec)) : 0;
+    const durationSec = Number.isFinite(s.durationSec ?? NaN) ? Math.max(0, Number(s.durationSec)) : 0;
 
     const shuffle = Boolean(s.shuffle);
-    const repeat = (s.repeat ?? "off") as RepeatMode;
-    const volume = clamp01(Number.isFinite(s.volume) ? s.volume : this.state.volume);
+    const repeat: RepeatMode = isRepeatMode(s.repeat) ? s.repeat : "off";
+    const volume = clamp01(Number.isFinite(s.volume) ? Number(s.volume) : this.state.volume);
 
-    const safeRepeat: RepeatMode = repeat === "off" || repeat === "one" || repeat === "all" ? repeat : "off";
-
-    // ✅ Title from TrackCatalog
+    // Title from TrackCatalog
     let title = "";
     if (trackId) {
       const meta = getTrackMeta(trackId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       title = String((meta as any)?.title ?? (meta as any)?.label ?? (meta as any)?.name ?? "").trim();
     }
     if (!title) title = trackId ?? "No track";
 
-    const snapshot = {
+    const snapshot: AudioSnapshot = {
       playing,
       trackId,
       title,
       positionSec: timeSec,
       durationSec,
       shuffle,
-      repeat: safeRepeat,
+      repeat,
       volume,
     };
 
@@ -171,16 +278,13 @@ export class HarmonySystem {
     this.state.positionSec = timeSec;
     this.state.durationSec = durationSec;
     this.state.shuffle = shuffle;
-    this.state.repeat = safeRepeat;
+    this.state.repeat = repeat;
     this.state.volume = volume;
 
     this.requestRender();
   }
 
-  private audioSnapshotEquals(
-    a: NonNullable<HarmonySystem["lastAudioApplied"]>,
-    b: NonNullable<HarmonySystem["lastAudioApplied"]>,
-  ): boolean {
+  private audioSnapshotEquals(a: AudioSnapshot, b: AudioSnapshot): boolean {
     return (
       a.playing === b.playing &&
       a.trackId === b.trackId &&
@@ -193,18 +297,28 @@ export class HarmonySystem {
     );
   }
 
+  // ------------------------------------------------------------
+  // UI state + commands
+  // ------------------------------------------------------------
+
   private setUIVisible(visible: boolean): void {
     this.state.uiVisible = visible;
+
+    // Nice UX: if you hide the UI, also close the panel so it doesn't "stick" open on show.
+    if (!visible && this.state.environmentPanelOpen) {
+      this.state.environmentPanelOpen = false;
+    }
+
     this.requestRender();
   }
 
-  private setVibePanelOpen(open: boolean): void {
-    this.state.vibePanelOpen = open;
+  private setEnvironmentPanelOpen(open: boolean): void {
+    this.state.environmentPanelOpen = open;
     this.requestRender();
   }
 
-  private toggleVibePanel(): void {
-    this.setVibePanelOpen(!this.state.vibePanelOpen);
+  private toggleEnvironmentPanel(): void {
+    this.setEnvironmentPanelOpen(!this.state.environmentPanelOpen);
   }
 
   private setShuffle(enabled: boolean): void {
@@ -230,25 +344,30 @@ export class HarmonySystem {
 
   private selectColor(colorId: string): void {
     this.state.colorId = colorId;
-    this.emit("vibe:selectColor", { colorId });
+    // ✅ align with HarmonyEnvironmentSystem event names
+    this.emit("harmony:environment:selectColor", { colorId });
     this.requestRender();
   }
 
   private selectFilter(filterId: string): void {
     this.state.filterId = filterId;
-    this.emit("vibe:selectFilter", { filterId });
+    // ✅ align with HarmonyEnvironmentSystem event names
+    this.emit("harmony:environment:selectFilter", { filterId });
     this.requestRender();
   }
 
   private toggleParticle(particleId: string, enabled: boolean): void {
-    this.state.particles[particleId] = enabled;
-    this.emit("vibe:toggleParticle", { particleId, enabled });
+    // Avoid in-place mutation in case state is ever frozen/serialized differently.
+    this.state.particles = { ...(this.state.particles ?? {}), [particleId]: enabled };
+    // ✅ align with HarmonyEnvironmentSystem event names
+    this.emit("harmony:environment:toggleParticle", { particleId, enabled });
     this.requestRender();
   }
 
   private toggleAmbient(ambientId: string, enabled: boolean): void {
-    this.state.ambients[ambientId] = enabled;
-    this.emit("vibe:toggleAmbient", { ambientId, enabled });
+    this.state.ambients = { ...(this.state.ambients ?? {}), [ambientId]: enabled };
+    // ✅ align with HarmonyEnvironmentSystem event names
+    this.emit("harmony:environment:toggleAmbient", { ambientId, enabled });
     this.requestRender();
   }
 
@@ -282,6 +401,6 @@ export class HarmonySystem {
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {
-    if (e.key === "Escape" && this.state.vibePanelOpen) this.setVibePanelOpen(false);
+    if (e.key === "Escape" && this.state.environmentPanelOpen) this.setEnvironmentPanelOpen(false);
   };
 }

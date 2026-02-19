@@ -66,7 +66,7 @@ export type AudioCatalog = {
 
 export type HarmonyState = {
   uiVisible: boolean;
-  vibePanelOpen: boolean;
+  environmentPanelOpen: boolean;
 
   // audio (from audio:state)
   playing: boolean;
@@ -92,7 +92,7 @@ export type HarmonyState = {
 
 export const HARMONY_DEFAULT_STATE: HarmonyState = {
   uiVisible: true,
-  vibePanelOpen: false,
+  environmentPanelOpen: false,
 
   playing: false,
   trackId: null,

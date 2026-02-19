@@ -22,6 +22,7 @@ import { AudioSystem } from "../systems/AudioSystem";
 import { HowlerAudioSystem } from "../systems/HowlerAudioSystem";
 import { InteractionSystem } from "../systems/InteractionSystem";
 import { HarmonySystem } from "../systems/harmony/HarmonySystem";
+import { HarmonyEnvironmentSystem } from "../systems/harmony/HarmonyEnvironmentSystem";
 
 import { MediaResolverSystem } from "../systems/MediaResolverSystem";
 
@@ -60,7 +61,9 @@ export class Engine {
   private readonly audioSystem: AudioSystem;
   private readonly howlerAudioSystem: HowlerAudioSystem;
   private readonly interactionSystem: InteractionSystem;
+
   private harmony: HarmonySystem | null = null;
+  private harmonyEnvironment: HarmonyEnvironmentSystem | null = null;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -202,6 +205,15 @@ export class Engine {
         },
       },
     });
+
+    // ✅ Harmony Environment (canonical vibe/persistence + PostFX apply)
+    // Must be created AFTER PostFX and Persistence exist.
+    this.harmonyEnvironment = new HarmonyEnvironmentSystem({
+      bus: this.bus,
+      persistence: this.persistence,
+      postFX: this.postFX,
+    });
+    this.harmonyEnvironment.init();
 
     // Attach shared context (includes postFX)
     const ctx: SceneContext = {
@@ -475,8 +487,12 @@ export class Engine {
 
     this.interactionSystem.dispose();
     this.howlerAudioSystem.dispose();
+
     this.harmony?.dispose();
     this.harmony = null;
+
+    this.harmonyEnvironment?.dispose();
+    this.harmonyEnvironment = null;
 
     // Audio: detach bus handlers
     this.audioSystem.dispose();
