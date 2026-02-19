@@ -1,7 +1,7 @@
 // src/systems/harmony/HarmonyUI.ts
 // ============================================================
 // THE STILL — Harmony UI (DOM only)
-//  - Renders bottom player bar + vibe slide-out panel
+//  - Renders bottom player bar + harmony slide-out panel
 //  - Calls handlers only (no EventBus imports)
 // ============================================================
 
@@ -27,6 +27,9 @@ type UIHandlers = {
   onToggleAmbient(id: string, enabled: boolean): void;
   onSelectColor(id: string): void;
   onSelectFilter(id: string): void;
+
+  // ✅ Presets (Phase 1)
+  onApplyPreset(presetId: string): void;
 
   onSetRitualDuration(durationSec: number): void;
 
@@ -554,11 +557,11 @@ export class HarmonyUI {
     this.vol.addEventListener("change", volumeEnd);
     this.vol.addEventListener("blur", volumeEnd);
 
-    // Vibe
+    // Environment panel
     this.btnEnvironment = document.createElement("button");
     this.btnEnvironment.className = "harmony-btn";
     this.btnEnvironment.type = "button";
-    this.btnEnvironment.textContent = "Vibe";
+    this.btnEnvironment.textContent = "Harmony";
     this.unbinds.push(bindPress(this.btnEnvironment, () => this.handlers.onToggleEnvironmentPanel(), { onHover, onClick }));
 
     // Hide
@@ -582,9 +585,18 @@ export class HarmonyUI {
     this.bar.appendChild(this.btnEnvironment);
     this.bar.appendChild(this.btnHide);
 
-    // Vibe panel
+    // Harmony panel
     this.panel = document.createElement("div");
     this.panel.className = "harmony-panel";
+
+    // Presets (overwrite snapshots)
+    this.panel.appendChild(
+      this.makePresetSection("Presets", [
+        ["Dusk", "dusk"],
+        ["Void", "void"],
+        ["Clear", "clear"],
+      ]),
+    );
 
     this.panel.appendChild(
       this.makeSelectSection("Color", "color", [
@@ -726,6 +738,48 @@ export class HarmonyUI {
       tile.classList.toggle("on", on);
       tile.setAttribute("aria-pressed", on ? "true" : "false");
     });
+  }
+
+  private makePresetSection(label: string, presets: Array<[string, string]>): HTMLElement {
+    const wrap = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = label;
+
+    const grid = document.createElement("div");
+    grid.className = "harmony-grid";
+
+    for (const [text, presetId] of presets) {
+      const tile = document.createElement("div");
+      tile.className = "harmony-tile";
+      tile.textContent = text;
+      tile.dataset.kind = "preset";
+      tile.dataset.id = presetId;
+
+      tile.setAttribute("role", "button");
+      tile.tabIndex = 0;
+      tile.setAttribute("aria-pressed", "false");
+
+      this.unbinds.push(
+        bindPress(
+          tile,
+          () => {
+            // Optimistic highlight (render() may later sync from canonical env if we add that)
+            this.syncSelectVisual("preset", presetId);
+            this.handlers.onApplyPreset(presetId);
+          },
+          {
+            onHover: () => this.handlers.onUiHover?.(),
+            onClick: () => this.handlers.onUiClick?.(),
+          },
+        ),
+      );
+
+      grid.appendChild(tile);
+    }
+
+    wrap.appendChild(h);
+    wrap.appendChild(grid);
+    return wrap;
   }
 
   private makeSection(label: string, buttons: Array<[string, () => void]>): HTMLElement {

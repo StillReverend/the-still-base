@@ -135,6 +135,9 @@ export class HarmonySystem {
       onSelectColor: (id) => this.selectColor(id),
       onSelectFilter: (id) => this.selectFilter(id),
 
+      // ✅ Presets: emit intent only; HarmonyPresetsSystem handles catalog + apply
+      onApplyPreset: (presetId) => this.applyPreset(presetId),
+
       onSetRitualDuration: (durationSec) => this.setRitualDuration(durationSec),
 
       // ✅ UI SFX hooks (canonical)
@@ -157,9 +160,9 @@ export class HarmonySystem {
     this.on("harmony:environmentPanel:toggle", () => this.toggleEnvironmentPanel());
 
     // ✅ Canonical environment state mirroring (boot restore, presets, etc.)
-    this.on("harmony:environment:state", (p: HarmonyEnvironmentStateEvent) => this.onEnvironmentState(p));
+    this.on("harmony:environment:state", (p: any) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
     // Optional: if you use this elsewhere, mirroring it too doesn't hurt.
-    this.on("harmony:environment:changed", (p: HarmonyEnvironmentStateEvent) => this.onEnvironmentState(p));
+    this.on("harmony:environment:changed", (p: any) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
 
     window.addEventListener("keydown", this.onKeyDown, { passive: true });
     this.disposers.push(() => window.removeEventListener("keydown", this.onKeyDown));
@@ -194,6 +197,16 @@ export class HarmonySystem {
     // Click is a user gesture: ensure audio is unlocked before SFX playback attempts.
     this.emit("audio:unlock-request", { source: "harmony-ui-click" });
     this.emit("ui:sfx:click", { source: "harmony" });
+  }
+
+  // ------------------------------------------------------------
+  // Presets (intent only)
+  // ------------------------------------------------------------
+
+  private applyPreset(presetId: string): void {
+    const id = safeString(presetId, "").trim().toLowerCase();
+    if (!id) return;
+    this.emit("harmony:preset:apply", { presetId: id });
   }
 
   // ------------------------------------------------------------

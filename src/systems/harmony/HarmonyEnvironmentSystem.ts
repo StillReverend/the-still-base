@@ -5,6 +5,10 @@
 //  - Persists via PersistenceSystem
 //  - Applies world effects (PostFX now, ParticleFX later)
 //  - Broadcasts canonical state snapshots for HarmonySystem/UI
+//
+// Notes (Feb 2026):
+//  - "Presets" should OVERWRITE the full environment state (A).
+//  - HarmonySystem/HarmonyUI emit intent via EventBus only.
 // ============================================================
 
 import type { EventBus } from "../../core/EventBus";
@@ -65,6 +69,15 @@ const normalizeEnv = (raw: unknown): HarmonyEnvironmentState => {
   };
 };
 
+// Payload accepted for full overwrite apply.
+// We support either:
+//  - { environment: HarmonyEnvironmentState, source?: string }
+//  - HarmonyEnvironmentState directly (legacy / convenience)
+type HarmonyEnvironmentApplyPayload =
+  | { environment: HarmonyEnvironmentState; source?: string }
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  | (HarmonyEnvironmentState & {});
+
 export class HarmonyEnvironmentSystem {
   private readonly bus: EventBus;
   private readonly persistence: PersistenceSystem;
@@ -120,6 +133,28 @@ export class HarmonyEnvironmentSystem {
 
       this.set({ ambients }, "harmonyEnvironment:toggleAmbient");
     });
+
+    // ✅ Apply a full environment snapshot (Preset apply).
+    // IMPORTANT: This OVERWRITES ALL environment values (A).
+    this.on("harmony:environment:apply", (p: HarmonyEnvironmentApplyPayload) => {
+      const envRaw =
+        p && typeof p === "object" && "environment" in (p as Record<string, unknown>)
+          ? (p as { environment: HarmonyEnvironmentState }).environment
+          : (p as unknown);
+
+      const nextFull = normalizeEnv(envRaw);
+
+      // Overwrite persistence in a way that works whether or not a dedicated
+      // replaceHarmonyEnvironment() API exists yet.
+      this.writePersistedReplace(nextFull, "harmonyEnvironment:apply");
+
+      const next = this.readPersisted();
+      this.apply(next);
+
+      // Broadcast canonical state for HarmonySystem/UI to mirror
+      this.emitState(next, "harmonyEnvironment:apply");
+      this.emitChanged(next, "harmonyEnvironment:apply");
+    });
   }
 
   public dispose(): void {
@@ -139,8 +174,33 @@ export class HarmonyEnvironmentSystem {
   }
 
   private writePersisted(partial: Partial<HarmonyEnvironmentState>, reason: string): void {
-    // Canonical API (now exists):
+    // Canonical API (merge semantics)
     this.persistence.setHarmonyEnvironment(partial, reason);
+  }
+
+  /**
+   * Overwrite semantics (Preset apply):
+   * - Prefer persistence.replaceHarmonyEnvironment(nextFull, reason) if present.
+   * - Otherwise overwrite via persistence.update({ harmonyEnvironment: nextFull }, reason).
+   */
+  private writePersistedReplace(nextFull: HarmonyEnvironmentState, reason: string): void {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const anyPersistence = this.persistence as any;
+
+    if (typeof anyPersistence.replaceHarmonyEnvironment === "function") {
+      anyPersistence.replaceHarmonyEnvironment(nextFull, reason);
+      return;
+    }
+
+    // Fallback: PersistenceSystem always has update(), so we can still overwrite.
+    if (typeof anyPersistence.update === "function") {
+      anyPersistence.update({ harmonyEnvironment: nextFull }, reason);
+      return;
+    }
+
+    // Absolute fallback (should not happen): fall back to merge,
+    // but this will NOT clear unspecified keys. Better than crash.
+    this.writePersisted(nextFull, reason);
   }
 
   private set(partial: Partial<HarmonyEnvironmentState>, reason: string): void {
@@ -191,8 +251,8 @@ export class HarmonyEnvironmentSystem {
       colorId: environment.colorId,
     });
 
-    // ParticleFX + Ambient will hook in later.
-    // environment.particles / environment.ambients are already persisted.
+    // ParticleFX + Ambient will hook in next.
+    // environment.particles / environment.ambients are already persisted and broadcast.
   }
 
   private on(event: string, handler: AnyFn): void {

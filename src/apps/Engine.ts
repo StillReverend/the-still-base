@@ -23,6 +23,7 @@ import { HowlerAudioSystem } from "../systems/HowlerAudioSystem";
 import { InteractionSystem } from "../systems/InteractionSystem";
 import { HarmonySystem } from "../systems/harmony/HarmonySystem";
 import { HarmonyEnvironmentSystem } from "../systems/harmony/HarmonyEnvironmentSystem";
+import { HarmonyPresetsSystem } from "../systems/harmony/HarmonyPresetsSystem";
 
 import { MediaResolverSystem } from "../systems/MediaResolverSystem";
 
@@ -64,6 +65,7 @@ export class Engine {
 
   private harmony: HarmonySystem | null = null;
   private harmonyEnvironment: HarmonyEnvironmentSystem | null = null;
+  private harmonyPresets: HarmonyPresetsSystem | null = null;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -214,6 +216,11 @@ export class Engine {
       postFX: this.postFX,
     });
     this.harmonyEnvironment.init();
+
+    // ✅ Harmony Presets (MVP buttons)
+    // Bus-only: emits a full snapshot; EnvironmentSystem performs overwrite apply.
+    this.harmonyPresets = new HarmonyPresetsSystem(this.bus);
+    this.harmonyPresets.init();
 
     // Attach shared context (includes postFX)
     const ctx: SceneContext = {
@@ -490,6 +497,9 @@ export class Engine {
 
     this.harmony?.dispose();
     this.harmony = null;
+
+    this.harmonyPresets?.dispose();
+    this.harmonyPresets = null;
 
     this.harmonyEnvironment?.dispose();
     this.harmonyEnvironment = null;

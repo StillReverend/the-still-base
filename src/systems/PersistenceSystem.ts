@@ -83,7 +83,7 @@ export interface AudioPlayerState {
 }
 
 // ------------------------------------------------------------
-// NEW: Harmony Environment persistence (vibe selections)
+// NEW: Harmony Environment persistence (environment selections)
 // ------------------------------------------------------------
 
 export interface HarmonyEnvironmentState {
@@ -103,7 +103,7 @@ export interface UserState {
   harmony: HarmonyState;
   audio: AudioPlayerState;
 
-  /** NEW: Canonical environment/vibe selections (color/filter/particles/ambients). */
+  /** NEW: Canonical environment selections (color/filter/particles/ambients). */
   harmonyEnvironment: HarmonyEnvironmentState;
 
   /** Canonical collection of tracks */
@@ -242,12 +242,8 @@ const sanitizeState = (state: UserState): UserState => {
     version: 1,
     gate: {
       status: state.gate?.status === "closed" ? "closed" : "open",
-      lastOpenedAtMs: Number.isFinite(state.gate?.lastOpenedAtMs ?? NaN)
-        ? (state.gate.lastOpenedAtMs as number)
-        : null,
-      lastClosedAtMs: Number.isFinite(state.gate?.lastClosedAtMs ?? NaN)
-        ? (state.gate.lastClosedAtMs as number)
-        : null,
+      lastOpenedAtMs: Number.isFinite(state.gate?.lastOpenedAtMs ?? NaN) ? (state.gate.lastOpenedAtMs as number) : null,
+      lastClosedAtMs: Number.isFinite(state.gate?.lastClosedAtMs ?? NaN) ? (state.gate.lastClosedAtMs as number) : null,
       reopenCount: Number.isFinite(state.gate?.reopenCount ?? NaN) ? Math.max(0, state.gate.reopenCount) : 0,
     },
     player: {
@@ -356,7 +352,7 @@ export class PersistenceSystem {
   }
 
   // ------------------------------------------------------------
-  // NEW: Convenience getters for Harmony environment
+  // Convenience getters for Harmony environment
   // ------------------------------------------------------------
 
   getHarmonyEnvironment(): HarmonyEnvironmentState {
@@ -366,6 +362,8 @@ export class PersistenceSystem {
   /**
    * Canonical API expected by HarmonyEnvironmentSystem:
    *   setHarmonyEnvironment(partial, reason)
+   *
+   * NOTE: This MERGES particles/ambients maps.
    */
   setHarmonyEnvironment(partial: Partial<HarmonyEnvironmentState>, reason = "harmonyEnvironment:set"): void {
     const prev = this.state.harmonyEnvironment ?? { ...DEFAULT_ENV };
@@ -387,6 +385,34 @@ export class PersistenceSystem {
     if (same) return;
 
     this.update({ harmonyEnvironment: next }, reason);
+  }
+
+  /**
+   * NEW: Replace (overwrite) the entire HarmonyEnvironmentState.
+   * Required for Harmony Presets (A semantics).
+   *
+   * NOTE: This DOES NOT merge particles/ambients maps.
+   */
+  replaceHarmonyEnvironment(next: HarmonyEnvironmentState, reason = "harmonyEnvironment:replace"): void {
+    const prev = this.state.harmonyEnvironment ?? { ...DEFAULT_ENV };
+
+    const normalized: HarmonyEnvironmentState = normalizeEnv({
+      colorId: next?.colorId,
+      filterId: next?.filterId,
+      particles: next?.particles ?? {},
+      ambients: next?.ambients ?? {},
+    });
+
+    // No-op guard
+    const same =
+      prev.colorId === normalized.colorId &&
+      prev.filterId === normalized.filterId &&
+      JSON.stringify(prev.particles) === JSON.stringify(normalized.particles) &&
+      JSON.stringify(prev.ambients) === JSON.stringify(normalized.ambients);
+
+    if (same) return;
+
+    this.update({ harmonyEnvironment: normalized }, reason);
   }
 
   /**
@@ -450,9 +476,7 @@ export class PersistenceSystem {
       lastOpenedAtMs: status === "open" ? t : this.state.gate.lastOpenedAtMs,
       lastClosedAtMs: status === "closed" ? t : this.state.gate.lastClosedAtMs,
       reopenCount:
-        status === "open" && this.state.gate.status === "closed"
-          ? this.state.gate.reopenCount + 1
-          : this.state.gate.reopenCount,
+        status === "open" && this.state.gate.status === "closed" ? this.state.gate.reopenCount + 1 : this.state.gate.reopenCount,
     };
     this.update({ gate }, reason);
   }

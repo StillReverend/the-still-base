@@ -22,6 +22,7 @@
 // Harmony integration (Feb 2026):
 //  - setHarmonyEnvironment({ filterId, colorId }) for HarmonyEnvironmentSystem
 //  - filterId maps to PostFX profiles (colorId stored for future tinting)
+//  - NEW: colorId now drives a subtle final color tint pass (real visual win)
 // ============================================================
 
 import * as THREE from "three";
@@ -29,6 +30,7 @@ import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 
 import type { EventBus } from "../core/EventBus";
 
@@ -201,6 +203,41 @@ const mapHarmonyFilterToProfile = (filterId: string): PostFXProfileName => {
   }
 };
 
+// Harmony color mapping (subtle, non-cheesy)
+// Returned amount is a *base* tint intensity; filterId can bias it.
+const mapHarmonyColorToTint = (colorId: string): { tint: THREE.Color; amount: number } => {
+  switch (String(colorId || "").toLowerCase()) {
+    // c1: warm "lantern" gold (baseline)
+    case "c1":
+    default:
+      return { tint: new THREE.Color(0xffe4b5), amount: 0.10 }; // warm wheat
+    // c2: cool cyan-blue
+    case "c2":
+      return { tint: new THREE.Color(0xa7d8ff), amount: 0.10 };
+    // c3: violet-magenta
+    case "c3":
+      return { tint: new THREE.Color(0xd3a7ff), amount: 0.10 };
+    // c4: ember red-orange
+    case "c4":
+      return { tint: new THREE.Color(0xffb08a), amount: 0.10 };
+  }
+};
+
+// Slight filter bias for the tint amount (so presets feel distinct even pre-particles)
+const mapFilterToTintBias = (filterId: string): number => {
+  switch (String(filterId || "").toLowerCase()) {
+    case "f2": // blackHole
+      return 0.06;
+    case "f3": // sol
+      return 0.12;
+    case "f4": // luna
+      return 0.08;
+    case "f1":
+    default:
+      return 0.08;
+  }
+};
+
 // ------------------------------------------------------------
 // Defaults
 // ------------------------------------------------------------
@@ -255,6 +292,10 @@ export class PostFXSystem {
   private composer: EffectComposer;
   private renderPass: RenderPass;
   private bloomPass: UnrealBloomPass;
+
+  // ✅ NEW: Harmony tint pass (final grade)
+  private harmonyTintPass: ShaderPass;
+
   private outputPass: OutputPass;
 
   private settings: PostFXSettings;
@@ -428,10 +469,43 @@ export class PostFXSystem {
     );
     this.bloomPass.enabled = true;
 
+    // ✅ NEW: simple final color tint pass (subtle grade)
+    this.harmonyTintPass = new ShaderPass({
+      uniforms: {
+        tDiffuse: { value: null },
+        uTint: { value: new THREE.Vector3(1, 1, 1) },
+        uAmount: { value: 0.0 }, // 0..~0.25 recommended
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform vec3 uTint;
+        uniform float uAmount;
+        varying vec2 vUv;
+
+        void main() {
+          vec4 col = texture2D(tDiffuse, vUv);
+
+          // Soft "grade": blend toward tinted version, preserving luminance-ish feel.
+          vec3 tinted = col.rgb * uTint;
+          col.rgb = mix(col.rgb, tinted, clamp(uAmount, 0.0, 1.0));
+
+          gl_FragColor = col;
+        }
+      `,
+    });
+
     this.outputPass = new OutputPass();
 
     this.composer.addPass(this.renderPass);
     this.composer.addPass(this.bloomPass);
+    this.composer.addPass(this.harmonyTintPass);
     this.composer.addPass(this.outputPass);
 
     this.syncBloomStaticParams();
@@ -443,6 +517,9 @@ export class PostFXSystem {
     this.bloomRadiusCurrent = clamp01(n(this.settings.bloom.radius, DEFAULT_SETTINGS.bloom.radius));
     this.bloomRadiusTarget = this.bloomRadiusCurrent;
     this.bloomPass.radius = this.bloomRadiusCurrent;
+
+    // Start with a sane tint baseline (c1, f1)
+    this.applyHarmonyTint(this.harmonyColorId, this.harmonyFilterId);
 
     this.resize(this.width, this.height, this.pixelRatio);
   }
@@ -459,6 +536,9 @@ export class PostFXSystem {
 
     this.harmonyFilterId = filterId;
     this.harmonyColorId = colorId;
+
+    // ✅ Apply tint immediately regardless of profile choice
+    this.applyHarmonyTint(this.harmonyColorId, this.harmonyFilterId);
 
     if (nextProfile === "off") {
       this.setEnabled(false);
@@ -932,12 +1012,33 @@ export class PostFXSystem {
       this.bus = null;
     }
 
+    // Dispose tint material if present
+    const anyTint = this.harmonyTintPass as unknown as { material?: { dispose?: () => void } };
+    if (anyTint.material && typeof anyTint.material.dispose === "function") {
+      anyTint.material.dispose();
+    }
+
     const anyComposer = this.composer as unknown as { dispose?: () => void };
     if (typeof anyComposer.dispose === "function") anyComposer.dispose();
   }
 
   private syncBloomStaticParams(): void {
     this.bloomPass.threshold = clamp01(n(this.settings.bloom.threshold, DEFAULT_SETTINGS.bloom.threshold));
+  }
+
+  private applyHarmonyTint(colorId: string, filterId: string): void {
+    const { tint, amount } = mapHarmonyColorToTint(colorId);
+    const bias = mapFilterToTintBias(filterId);
+
+    const amt = clamp(amount + bias * 0.5, 0, 0.22); // keep it tasteful
+
+    const u = this.harmonyTintPass.uniforms as unknown as {
+      uTint: { value: THREE.Vector3 };
+      uAmount: { value: number };
+    };
+
+    u.uTint.value.set(tint.r, tint.g, tint.b);
+    u.uAmount.value = amt;
   }
 
   private maybeTelemetryLog(

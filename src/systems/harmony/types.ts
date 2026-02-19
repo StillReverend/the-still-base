@@ -80,7 +80,8 @@ export type HarmonyState = {
   repeat: RepeatMode;
   volume: number; // 0..1
 
-  // vibe (Phase 1 placeholders)
+  // environment (Phase 1 canonical placeholders)
+  // These mirror HarmonyEnvironmentSystem snapshots.
   colorId: string | null;
   filterId: string | null;
   particles: Record<string, boolean>;
@@ -104,8 +105,9 @@ export const HARMONY_DEFAULT_STATE: HarmonyState = {
   repeat: "off",
   volume: 0.85,
 
-  colorId: null,
-  filterId: null,
+  // Match HarmonyEnvironmentSystem defaults (c1 / f1)
+  colorId: "c1",
+  filterId: "f1",
   particles: {},
   ambients: {},
 
