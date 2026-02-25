@@ -37,9 +37,15 @@ type HarmonyEnvironmentSnapshot = {
   ambients?: Record<string, boolean>;
 };
 
+// EnvironmentSystem emits a richer payload; we accept multiple aliases safely.
 type HarmonyEnvironmentStateEvent = {
-  environment: HarmonyEnvironmentSnapshot;
-  reason: string;
+  environment?: HarmonyEnvironmentSnapshot;
+  state?: HarmonyEnvironmentSnapshot;
+  colorId?: string;
+  filterId?: string;
+  particles?: Record<string, boolean>;
+  ambients?: Record<string, boolean>;
+  reason?: string;
 };
 
 const safeString = (v: unknown, fallback = ""): string => (typeof v === "string" && v.trim() ? v : fallback);
@@ -74,7 +80,7 @@ const makeDefaultState = (): HarmonyState => {
   };
 };
 
-export class HarmonySystem {
+class HarmonySystem {
   private bus: EventBus;
   private ui: HarmonyUI | null = null;
   private state: HarmonyState = makeDefaultState();
@@ -93,6 +99,15 @@ export class HarmonySystem {
     ambients: Record<string, boolean>;
   } | null = null;
 
+  // Avoid spamming AudioSystem when sliders move rapidly
+  private musicMixRaf = 0;
+  private musicMixPending: number | null = null;
+  private lastMusicMixSent: number | null = null;
+
+  // Howler state boot sync: accept master/music only once (initial),
+  // then treat Harmony as canonical for master/music to avoid coupling.
+  private howlerMixBootSynced = false;
+
   constructor(bus: EventBus) {
     this.bus = bus;
   }
@@ -105,7 +120,7 @@ export class HarmonySystem {
 
     this.ui = new HarmonyUI({
       onTogglePlay: () => {
-        this.emit("audio:unlock-request", {});
+        this.emit("audio:unlock-request", { source: "harmony-ui" });
         this.emit("audio:toggle-request", { source: "harmony" });
       },
 
@@ -114,17 +129,19 @@ export class HarmonySystem {
       },
 
       onPrevTrack: () => {
-        this.emit("audio:unlock-request", {});
+        this.emit("audio:unlock-request", { source: "harmony-ui" });
         this.emit("audio:cmd:prevTrack", { source: "harmony" });
       },
 
       onNextTrack: () => {
-        this.emit("audio:unlock-request", {});
+        this.emit("audio:unlock-request", { source: "harmony-ui" });
         this.emit("audio:cmd:nextTrack", { source: "harmony" });
       },
 
       onToggleShuffle: () => this.setShuffle(!this.state.shuffle),
       onCycleRepeat: () => this.cycleRepeat(),
+
+      // Legacy hook: still supported if any UI calls it, but Harmony lanes are canonical now.
       onSetVolume: (volume01) => this.setVolume(volume01),
 
       onToggleEnvironmentPanel: () => this.toggleEnvironmentPanel(),
@@ -135,10 +152,13 @@ export class HarmonySystem {
       onSelectColor: (id) => this.selectColor(id),
       onSelectFilter: (id) => this.selectFilter(id),
 
-      // ✅ Presets: emit intent only; HarmonyPresetsSystem handles catalog + apply
+      // ✅ Presets: emit intent only; HarmonyPresetsSystem handles apply
       onApplyPreset: (presetId) => this.applyPreset(presetId),
 
       onSetRitualDuration: (durationSec) => this.setRitualDuration(durationSec),
+
+      // ✅ Howler lane sliders (Phase 1.5)
+      onSetHowlerLane: (lane, volume01) => this.setHowlerLane(lane, volume01),
 
       // ✅ UI SFX hooks (canonical)
       onUiHover: () => this.emitUiHover(),
@@ -151,6 +171,9 @@ export class HarmonySystem {
     // Audio state mirrors
     this.on("audio:state", (p: AudioStateEvent) => this.onAudioState(p));
 
+    // ✅ Howler state mirrors (keeps lane sliders synced with actual audio state)
+    this.on("howler:state", (p: any) => this.onHowlerState(p));
+
     // Harmony UI visibility controls
     this.on("harmony:ui:setVisible", (p: { visible: boolean }) => this.setUIVisible(Boolean(p?.visible)));
     this.on("harmony:ui:toggleVisible", () => this.setUIVisible(!this.state.uiVisible));
@@ -160,9 +183,19 @@ export class HarmonySystem {
     this.on("harmony:environmentPanel:toggle", () => this.toggleEnvironmentPanel());
 
     // ✅ Canonical environment state mirroring (boot restore, presets, etc.)
-    this.on("harmony:environment:state", (p: any) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
-    // Optional: if you use this elsewhere, mirroring it too doesn't hurt.
-    this.on("harmony:environment:changed", (p: any) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
+    this.on("harmony:environment:state", (p: unknown) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
+    this.on("harmony:environment:changed", (p: unknown) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
+
+    // ✅ Boot-sync handshake (covers “late subscriber” cases)
+    // EnvironmentSystem may have emitted "boot" before Harmony UI subscribed.
+    this.emit("harmony:environment:requestState", { source: "harmony-ui" });
+
+    // Also request current Howler mix so UI sliders can sync immediately.
+    this.emit("howler:requestState", { source: "harmony-ui" });
+
+    // Ensure AudioSystem starts aligned with current master/music lanes (if any).
+    // (If state.mix is still defaults, this is a no-op-ish but safe.)
+    this.applyMusicMixToAudio("init");
 
     window.addEventListener("keydown", this.onKeyDown, { passive: true });
     this.disposers.push(() => window.removeEventListener("keydown", this.onKeyDown));
@@ -175,6 +208,11 @@ export class HarmonySystem {
     if (this.renderRaf) cancelAnimationFrame(this.renderRaf);
     this.renderRaf = 0;
     this.renderQueued = false;
+
+    if (this.musicMixRaf) cancelAnimationFrame(this.musicMixRaf);
+    this.musicMixRaf = 0;
+    this.musicMixPending = null;
+    this.lastMusicMixSent = null;
 
     this.lastAudioApplied = null;
     this.lastEnvApplied = null;
@@ -189,7 +227,6 @@ export class HarmonySystem {
 
   private emitUiHover(): void {
     // IMPORTANT: Hover is NOT a user gesture for autoplay policies.
-    // Do NOT attempt unlock here or Chrome will warn.
     this.emit("ui:sfx:hover", { source: "harmony" });
   }
 
@@ -214,13 +251,13 @@ export class HarmonySystem {
   // ------------------------------------------------------------
 
   private onEnvironmentState(payload: HarmonyEnvironmentStateEvent): void {
-    const env = payload?.environment ?? {};
+    const env = payload?.environment ?? payload?.state ?? {};
 
-    const colorId = safeString(env.colorId, safeString((this.state as any).colorId, "c1"));
-    const filterId = safeString(env.filterId, safeString((this.state as any).filterId, "f1"));
+    const colorId = safeString(env.colorId ?? payload?.colorId, safeString((this.state as any).colorId, "c1"));
+    const filterId = safeString(env.filterId ?? payload?.filterId, safeString((this.state as any).filterId, "f1"));
 
-    const particles = safeBoolMap(env.particles);
-    const ambients = safeBoolMap(env.ambients);
+    const particles = safeBoolMap(env.particles ?? payload?.particles);
+    const ambients = safeBoolMap(env.ambients ?? payload?.ambients);
 
     const prev = this.lastEnvApplied;
 
@@ -292,7 +329,52 @@ export class HarmonySystem {
     this.state.durationSec = durationSec;
     this.state.shuffle = shuffle;
     this.state.repeat = repeat;
+
+    // NOTE:
+    // AudioSystem reports its *current* volume. We mirror that as `state.volume`
+    // so any legacy UI reads stay correct. The Harmony mix lanes are still the
+    // authoritative controls, and we push desired volume via applyMusicMixToAudio().
     this.state.volume = volume;
+
+    this.requestRender();
+  }
+
+  private onHowlerState(payload: any): void {
+    const s = payload?.state;
+    if (!s || typeof s !== "object") return;
+
+    const cur = this.state.mix ?? HARMONY_DEFAULT_STATE.mix;
+
+    // We always accept these lanes from Howler (Howler owns them).
+    const next = {
+      ...cur,
+      sfx: clamp01(Number((s as any).sfx ?? cur.sfx)),
+      ambient: clamp01(Number((s as any).ambient ?? cur.ambient)),
+      ui: clamp01(Number((s as any).ui ?? cur.ui)),
+    };
+
+    // Boot sync: allow Howler to initialize master/music ONCE (first state payload),
+    // but after that, Harmony is canonical for master/music to prevent coupling.
+    if (!this.howlerMixBootSynced) {
+      next.master = clamp01(Number((s as any).master ?? cur.master));
+      next.music = clamp01(Number((s as any).music ?? cur.music));
+      this.howlerMixBootSynced = true;
+    }
+
+    const same =
+      cur.master === next.master &&
+      cur.music === next.music &&
+      cur.sfx === next.sfx &&
+      cur.ambient === next.ambient &&
+      cur.ui === next.ui;
+
+    if (same) return;
+
+    this.state.mix = next;
+
+    // ✅ Critical: keep AudioSystem (music playback) obeying Master + Music lanes too.
+    // (Howler already applies its own master internally, but AudioSystem is separate.)
+    this.applyMusicMixToAudio("howler:state");
 
     this.requestRender();
   }
@@ -308,6 +390,51 @@ export class HarmonySystem {
       a.repeat === b.repeat &&
       a.volume === b.volume
     );
+  }
+
+  // ------------------------------------------------------------
+  // Mix policy: Harmony lanes must control *everything*
+  // ------------------------------------------------------------
+
+  private getMusicMixTarget(): number {
+    const mix = this.state.mix ?? HARMONY_DEFAULT_STATE.mix;
+    const master = clamp01(Number.isFinite(mix.master) ? mix.master : 1);
+    const music = clamp01(Number.isFinite(mix.music) ? mix.music : 1);
+    return clamp01(master * music);
+  }
+
+  /**
+   * Applies Master+Music lane product to AudioSystem volume via EventBus.
+   * This keeps track playback aligned with the same mixer concept as Howler.
+   */
+  private applyMusicMixToAudio(reason: string): void {
+    const target = this.getMusicMixTarget();
+
+    // Minor de-dupe (especially useful during slider drags)
+    if (this.lastMusicMixSent != null && Math.abs(this.lastMusicMixSent - target) < 0.0005) return;
+
+    this.musicMixPending = target;
+
+    if (!this.musicMixRaf) {
+      this.musicMixRaf = requestAnimationFrame(() => {
+        this.musicMixRaf = 0;
+
+        const v = this.musicMixPending;
+        this.musicMixPending = null;
+        if (v == null) return;
+
+        // De-dupe again after RAF
+        if (this.lastMusicMixSent != null && Math.abs(this.lastMusicMixSent - v) < 0.0005) return;
+        this.lastMusicMixSent = v;
+
+        // Push to AudioSystem
+        this.emit("audio:set-volume", { volume: v, source: "harmony-mix", reason });
+
+        // Mirror immediately so UI (if any) stays responsive even before next audio:state
+        this.state.volume = v;
+        this.requestRender();
+      });
+    }
   }
 
   // ------------------------------------------------------------
@@ -348,10 +475,43 @@ export class HarmonySystem {
     this.requestRender();
   }
 
+  /**
+   * Legacy setter: keep for compatibility (and for any future “single volume” UI),
+   * but treat Harmony lanes as canonical.
+   *
+   * This sets BOTH master & music to approximate the requested single volume,
+   * without stomping other lanes (sfx/ambient/ui).
+   */
   private setVolume(volume01: number): void {
     const v = clamp01(Number.isFinite(volume01) ? volume01 : this.state.volume);
-    this.state.volume = v;
-    this.emit("audio:set-volume", { volume: v, source: "harmony" });
+
+    // Map a single volume request into the master lane (and keep music at 1).
+    // This keeps behavior intuitive if anything still uses onSetVolume.
+    this.state.mix = { ...(this.state.mix ?? HARMONY_DEFAULT_STATE.mix), master: v, music: 1.0 };
+
+    // Tell HowlerAudioSystem (master lane)
+    this.emit("howler:volume:set", { bus: "master", value01: v, source: "harmony" });
+
+    // Tell AudioSystem (master*music)
+    this.applyMusicMixToAudio("setVolume");
+
+    this.requestRender();
+  }
+
+  private setHowlerLane(lane: "master" | "music" | "sfx" | "ambient" | "ui", volume01: number): void {
+    const v = clamp01(Number.isFinite(volume01) ? volume01 : (this.state.mix?.[lane] ?? 1.0));
+
+    // Update Harmony UI state immediately (so sliders feel responsive)
+    this.state.mix = { ...(this.state.mix ?? HARMONY_DEFAULT_STATE.mix), [lane]: v };
+
+    // Tell HowlerAudioSystem
+    this.emit("howler:volume:set", { bus: lane, value01: v, source: "harmony" });
+
+    // ✅ Also ensure AudioSystem obeys Master+Music lanes.
+    if (lane === "master" || lane === "music") {
+      this.applyMusicMixToAudio(`lane:${lane}`);
+    }
+
     this.requestRender();
   }
 
@@ -417,3 +577,6 @@ export class HarmonySystem {
     if (e.key === "Escape" && this.state.environmentPanelOpen) this.setEnvironmentPanelOpen(false);
   };
 }
+
+// ✅ Guaranteed named export (matches `import { HarmonySystem } ...`)
+export { HarmonySystem };

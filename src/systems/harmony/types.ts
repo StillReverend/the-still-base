@@ -64,6 +64,20 @@ export type AudioCatalog = {
   activeTrackId?: string | null;
 };
 
+/**
+ * HarmonyMixState
+ * ------------------------------------------------------------
+ * Volume lanes for HowlerAudioSystem (and later: AudioSystem too).
+ * These are UI-facing values; actual routing is handled by systems.
+ */
+export type HarmonyMixState = {
+  master: number; // 0..1
+  music: number; // 0..1
+  sfx: number; // 0..1
+  ambient: number; // 0..1
+  ui: number; // 0..1
+};
+
 export type HarmonyState = {
   uiVisible: boolean;
   environmentPanelOpen: boolean;
@@ -89,6 +103,9 @@ export type HarmonyState = {
 
   // ritual (scaffold)
   ritualDurationSec: number;
+
+  // ✅ NEW: mixer lanes (Howler + future audio routing)
+  mix: HarmonyMixState;
 };
 
 export const HARMONY_DEFAULT_STATE: HarmonyState = {
@@ -112,4 +129,13 @@ export const HARMONY_DEFAULT_STATE: HarmonyState = {
   ambients: {},
 
   ritualDurationSec: 60,
+
+  // Sensible defaults (matches HowlerAudioSystem defaults you shared)
+  mix: {
+    master: 1.0,
+    music: 1.0,
+    sfx: 0.85,
+    ambient: 0.7,
+    ui: 0.6,
+  },
 };

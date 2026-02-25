@@ -100,8 +100,22 @@ export class HarmonyEnvironmentSystem {
     const bootEnv = this.readPersisted();
     this.apply(bootEnv);
 
-    // Broadcast canonical snapshot for late subscribers (HarmonySystem/UI, debug tools, etc.)
+    // Broadcast canonical snapshot for early subscribers
     this.emitState(bootEnv, "boot");
+
+    // ------------------------------------------------------------
+    // ✅ Boot-sync handshake: late subscribers can request state
+    // ------------------------------------------------------------
+    this.on("harmony:environment:requestState", (p: { source?: string } | undefined) => {
+      const src = safeString(p?.source, "unknown");
+      const current = this.readPersisted();
+
+      // Ensure world effects match canonical state
+      this.apply(current);
+
+      // Broadcast canonical state
+      this.emitState(current, `requestState:${src}`);
+    });
 
     // Listen to Harmony intent events (canonical names)
     this.on("harmony:environment:selectColor", (p: { colorId: string }) => {
@@ -251,7 +265,7 @@ export class HarmonyEnvironmentSystem {
       colorId: environment.colorId,
     });
 
-    // ParticleFX + Ambient will hook in next.
+    // ParticleFX + Ambient listen via bus snapshots.
     // environment.particles / environment.ambients are already persisted and broadcast.
   }
 

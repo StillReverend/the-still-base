@@ -24,6 +24,7 @@ import { InteractionSystem } from "../systems/InteractionSystem";
 import { HarmonySystem } from "../systems/harmony/HarmonySystem";
 import { HarmonyEnvironmentSystem } from "../systems/harmony/HarmonyEnvironmentSystem";
 import { HarmonyPresetsSystem } from "../systems/harmony/HarmonyPresetsSystem";
+import { HarmonyAmbientSystem } from "../systems/harmony/HarmonyAmbientSystem";
 
 import { MediaResolverSystem } from "../systems/MediaResolverSystem";
 
@@ -66,6 +67,7 @@ export class Engine {
   private harmony: HarmonySystem | null = null;
   private harmonyEnvironment: HarmonyEnvironmentSystem | null = null;
   private harmonyPresets: HarmonyPresetsSystem | null = null;
+  private harmonyAmbients: HarmonyAmbientSystem | null = null;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -131,6 +133,17 @@ export class Engine {
       },
     });
 
+    // ------------------------------------------------------------
+    // ✅ Boot sync: UI SFX enable (persisted) -> HowlerAudioSystem
+    // ------------------------------------------------------------
+    // Now that Harmony has sliders, we want UI sounds ON by default,
+    // but still fully user-controllable and persisted.
+    const userState = this.persistence.getState();
+    this.bus.emit("howler:ui-sfx:set-enabled", {
+      enabled: Boolean(userState.uiSfxEnabled),
+      source: "engine:boot",
+    });
+
     // Renderer
     // ✅ OPAQUE CANVAS: removes “DOM background bleed” flashes.
     this.renderer = new THREE.WebGLRenderer({
@@ -175,12 +188,6 @@ export class Engine {
       camera: this.camera,
     });
 
-    this.harmony = new HarmonySystem(this.bus);
-    this.harmony.init();
-
-    // Scene manager
-    this.sceneManager = new SceneManager(this.save);
-
     // PostFX pipeline (Engine-owned, single instance for the whole app).
     // Seed with a placeholder scene; we’ll retarget to the real scene after switching.
     this.postFX = new PostFXSystem({
@@ -221,6 +228,23 @@ export class Engine {
     // Bus-only: emits a full snapshot; EnvironmentSystem performs overwrite apply.
     this.harmonyPresets = new HarmonyPresetsSystem(this.bus);
     this.harmonyPresets.init();
+
+    // ✅ Harmony Ambients (Phase 1.1)
+    // Listens to harmony:environment:* snapshots and commands Howler ambient loops.
+    this.harmonyAmbients = new HarmonyAmbientSystem(this.bus);
+    this.harmonyAmbients.init();
+
+    // ✅ Boot-sync handshake:
+    // Environment emitted "boot" before ambients subscribed; request a fresh snapshot now.
+    this.bus.emit("harmony:environment:requestState", { source: "engine:post-ambients-init" });
+
+    // ✅ Harmony UI/System should be created AFTER env systems are online,
+    // so it can immediately mirror canonical environment state.
+    this.harmony = new HarmonySystem(this.bus);
+    this.harmony.init();
+
+    // Scene manager
+    this.sceneManager = new SceneManager(this.save);
 
     // Attach shared context (includes postFX)
     const ctx: SceneContext = {
@@ -270,7 +294,7 @@ export class Engine {
 
       // Browser gesture unlock + (optional) dev autostart
       this.setupAudioUnlockGestures();
-      this.setupAutoStartMusicOnFirstUnlock("Lift");
+      //this.setupAutoStartMusicOnFirstUnlock("Lift");
 
       this.devTools = new DevTools({
         bus: this.bus,
@@ -287,7 +311,7 @@ export class Engine {
 
       // If you want Lift.mp3 to start for real users too, keep this enabled.
       // If you prefer “silent until UI exists”, comment it out.
-      this.setupAutoStartMusicOnFirstUnlock("Lift");
+      //this.setupAutoStartMusicOnFirstUnlock("Lift");
     }
 
     window.addEventListener("resize", this.handleResize);
@@ -494,6 +518,9 @@ export class Engine {
 
     this.interactionSystem.dispose();
     this.howlerAudioSystem.dispose();
+
+    this.harmonyAmbients?.dispose();
+    this.harmonyAmbients = null;
 
     this.harmony?.dispose();
     this.harmony = null;

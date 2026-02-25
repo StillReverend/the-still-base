@@ -106,6 +106,9 @@ export interface UserState {
   /** NEW: Canonical environment selections (color/filter/particles/ambients). */
   harmonyEnvironment: HarmonyEnvironmentState;
 
+  /** NEW: Persisted toggle for UI hover/click bleeps (keeps wiring but can be off by default). */
+  uiSfxEnabled: boolean;
+
   /** Canonical collection of tracks */
   tracks: Record<string, TrackState>;
 
@@ -227,6 +230,7 @@ const createDefaultState = (): UserState => {
       volume: 0.85,
     },
     harmonyEnvironment: { ...DEFAULT_ENV },
+    uiSfxEnabled: true,
     tracks: {},
     createdAtMs: t,
     updatedAtMs: t,
@@ -273,6 +277,7 @@ const sanitizeState = (state: UserState): UserState => {
       volume: clamp01(state.audio?.volume ?? 0),
     },
     harmonyEnvironment: normalizeEnv((state as unknown as { harmonyEnvironment?: unknown })?.harmonyEnvironment),
+    uiSfxEnabled: Boolean((state as unknown as { uiSfxEnabled?: unknown })?.uiSfxEnabled),
     tracks: {},
     createdAtMs: Number.isFinite(state.createdAtMs) ? state.createdAtMs : nowMs(),
     updatedAtMs: nowMs(),
@@ -331,6 +336,9 @@ export class PersistenceSystem {
   private state: UserState;
   private loadedFromSave: boolean;
 
+  // HMR-safe: stored handler refs for off() on dispose
+  private readonly onUiSfxUpdate: (p: { enabled?: boolean } | undefined) => void;
+
   constructor(deps: PersistenceSystemDeps) {
     this.bus = deps.bus;
     this.save = deps.save as SaveManagerAny;
@@ -339,6 +347,14 @@ export class PersistenceSystem {
     const loaded = this.loadFromSave();
     this.state = loaded.state;
     this.loadedFromSave = loaded.fromSave;
+
+    // ✅ Listen for UI SFX persistence updates (from HowlerAudioSystem or future UI)
+    this.onUiSfxUpdate = (p): void => {
+      const enabled = Boolean(p?.enabled);
+      if (this.state.uiSfxEnabled === enabled) return;
+      this.update({ uiSfxEnabled: enabled }, "ui-sfx:setEnabled");
+    };
+    this.bus.on("persistence:update-ui-sfx", this.onUiSfxUpdate);
 
     this.bus.emit<PersistenceLoadedPayload>("persistence:loaded", {
       state: this.getState(),
@@ -614,12 +630,18 @@ export class PersistenceSystem {
     const raw = this.save.get(SAVE_KEY as any) as unknown;
 
     if (isUserStateV1(raw)) {
-      // Back-compat: older saves may not have harmonyEnvironment.
-      const withEnv = raw as UserState;
-      if (!(withEnv as any).harmonyEnvironment) {
-        (withEnv as any).harmonyEnvironment = { ...DEFAULT_ENV };
+      // Back-compat: older saves may not have harmonyEnvironment or uiSfxEnabled.
+      const withExtras = raw as UserState;
+
+      if (!(withExtras as any).harmonyEnvironment) {
+        (withExtras as any).harmonyEnvironment = { ...DEFAULT_ENV };
       }
-      return { state: sanitizeState(withEnv), fromSave: true };
+
+      if (typeof (withExtras as any).uiSfxEnabled !== "boolean") {
+        (withExtras as any).uiSfxEnabled = false;
+      }
+
+      return { state: sanitizeState(withExtras), fromSave: true };
     }
 
     return { state: createDefaultState(), fromSave: false };
@@ -664,5 +686,6 @@ export class PersistenceSystem {
   /** Cleanup (Engine-owned). Cancels any pending debounced autosave. */
   dispose(): void {
     this.clearAutosave();
+    this.bus.off("persistence:update-ui-sfx", this.onUiSfxUpdate);
   }
 }

@@ -18,6 +18,8 @@ type UIHandlers = {
 
   onToggleShuffle(): void;
   onCycleRepeat(): void;
+
+  // Legacy / optional single volume hook (kept for compatibility, not used by lane sliders)
   onSetVolume(volume01: number): void;
 
   onToggleEnvironmentPanel(): void;
@@ -32,6 +34,9 @@ type UIHandlers = {
   onApplyPreset(presetId: string): void;
 
   onSetRitualDuration(durationSec: number): void;
+
+  // ✅ Howler lane sliders (Phase 1.5)
+  onSetHowlerLane?(lane: "master" | "music" | "sfx" | "ambient" | "ui", volume01: number): void;
 
   // ✅ Optional UI SFX hooks (HarmonySystem can wire these to EventBus)
   onUiHover?: () => void;
@@ -163,10 +168,16 @@ export class HarmonyUI {
 
   private btnShuffle: HTMLButtonElement;
   private btnRepeat: HTMLButtonElement;
-  private vol: HTMLInputElement;
 
   private btnEnvironment: HTMLButtonElement;
   private btnHide: HTMLButtonElement;
+
+  // Panel: audio sliders (Howler lanes)
+  private laneMaster!: HTMLInputElement;
+  private laneMusic!: HTMLInputElement;
+  private laneSfx!: HTMLInputElement;
+  private laneAmbient!: HTMLInputElement;
+  private laneUi!: HTMLInputElement;
 
   private handlers: UIHandlers;
 
@@ -178,8 +189,9 @@ export class HarmonyUI {
 
   private lastDurationSec = 0;
 
-  private volRaf = 0;
-  private volPending: number | null = null;
+  // Howler lane RAF batching (avoid spamming handlers)
+  private laneRaf = 0;
+  private lanePending: Partial<Record<"master" | "music" | "sfx" | "ambient" | "ui", number>> = {};
 
   constructor(handlers: UIHandlers) {
     this.handlers = handlers;
@@ -250,9 +262,10 @@ export class HarmonyUI {
         color: rgba(255,255,255,0.65);
       }
 
-      /* Safari-proof range fill (scrub + volume) */
+      /* Safari-proof range fill (scrub + volume + lane sliders) */
       .harmony-scrub,
-      .harmony-vol {
+      .harmony-vol,
+      .harmony-lane {
         -webkit-appearance: none;
         appearance: none;
         background: transparent;
@@ -278,15 +291,22 @@ export class HarmonyUI {
         height: 30px;
       }
 
+      .harmony-lane {
+        width: 100%;
+        height: 30px;
+      }
+
       .harmony-scrub::-webkit-slider-runnable-track,
-      .harmony-vol::-webkit-slider-runnable-track {
+      .harmony-vol::-webkit-slider-runnable-track,
+      .harmony-lane::-webkit-slider-runnable-track {
         height: 4px;
         background: transparent;
         border-radius: 999px;
       }
 
       .harmony-scrub::-webkit-slider-thumb,
-      .harmony-vol::-webkit-slider-thumb {
+      .harmony-vol::-webkit-slider-thumb,
+      .harmony-lane::-webkit-slider-thumb {
         -webkit-appearance: none;
         appearance: none;
         width: 14px;
@@ -298,14 +318,16 @@ export class HarmonyUI {
       }
 
       .harmony-scrub::-moz-range-track,
-      .harmony-vol::-moz-range-track {
+      .harmony-vol::-moz-range-track,
+      .harmony-lane::-moz-range-track {
         height: 4px;
         background: rgba(255, 255, 255, 0.18);
         border-radius: 999px;
       }
 
       .harmony-scrub::-moz-range-thumb,
-      .harmony-vol::-moz-range-thumb {
+      .harmony-vol::-moz-range-thumb,
+      .harmony-lane::-moz-range-thumb {
         width: 14px;
         height: 14px;
         border-radius: 50%;
@@ -335,7 +357,7 @@ export class HarmonyUI {
       .harmony-panel.open { transform: translateX(0); }
 
       .harmony-panel h3 {
-        margin: 6px 4px 10px;
+        margin: 10px 4px 10px;
         font-size: 12px;
         letter-spacing: 0.08em;
         text-transform: uppercase;
@@ -350,9 +372,11 @@ export class HarmonyUI {
         padding: 4px;
       }
 
+      /* Circle tiles (panel buttons) */
       .harmony-tile {
+        width: 56px;
         height: 56px;
-        border-radius: 14px;
+        border-radius: 999px;
         border: 1px solid rgba(255,255,255,0.12);
         background: rgba(255,255,255,0.06);
         color: rgba(255,255,255,0.92);
@@ -367,6 +391,35 @@ export class HarmonyUI {
       .harmony-tile.on {
         border-color: rgba(255,255,255,0.28);
         background: rgba(255,255,255,0.12);
+      }
+
+      /* Section helper for sliders */
+      .harmony-sliders {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 6px 4px 10px;
+      }
+
+      .harmony-sliderRow {
+        display: grid;
+        grid-template-columns: 60px 1fr 44px;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .harmony-sliderRow .k {
+        font-size: 12px;
+        color: rgba(255,255,255,0.70);
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+
+      .harmony-sliderRow .v {
+        font-size: 12px;
+        color: rgba(255,255,255,0.70);
+        text-align: right;
+        font-variant-numeric: tabular-nums;
       }
     `;
 
@@ -509,54 +562,6 @@ export class HarmonyUI {
     this.btnRepeat.textContent = "R0";
     this.unbinds.push(bindPress(this.btnRepeat, () => this.handlers.onCycleRepeat(), { onHover, onClick }));
 
-    // Volume
-    this.vol = document.createElement("input");
-    this.vol.className = "harmony-vol";
-    this.vol.type = "range";
-    this.vol.min = "0";
-    this.vol.max = "1";
-    this.vol.step = "0.01";
-    this.vol.value = "0.85";
-    setSliderPct(this.vol);
-
-    const volumeLive = () => {
-      const v = clamp01(Number(this.vol.value));
-      this.volPending = v;
-
-      setSliderPct(this.vol);
-
-      if (!this.volRaf) {
-        this.volRaf = requestAnimationFrame(() => {
-          this.volRaf = 0;
-          const pending = this.volPending;
-          this.volPending = null;
-          if (pending != null && Number.isFinite(pending)) {
-            this.handlers.onSetVolume(pending);
-          }
-        });
-      }
-    };
-
-    const volumeEnd = () => {
-      const v = clamp01(Number(this.vol.value));
-      this.volPending = null;
-      if (this.volRaf) {
-        cancelAnimationFrame(this.volRaf);
-        this.volRaf = 0;
-      }
-
-      setSliderPct(this.vol);
-
-      // Optional “tick” on volume release
-      this.handlers.onUiClick?.();
-      this.handlers.onSetVolume(v);
-    };
-
-    this.vol.addEventListener("pointerenter", () => this.handlers.onUiHover?.());
-    this.vol.addEventListener("input", volumeLive);
-    this.vol.addEventListener("change", volumeEnd);
-    this.vol.addEventListener("blur", volumeEnd);
-
     // Environment panel
     this.btnEnvironment = document.createElement("button");
     this.btnEnvironment.className = "harmony-btn";
@@ -581,7 +586,6 @@ export class HarmonyUI {
     this.bar.appendChild(this.scrub);
     this.bar.appendChild(this.btnShuffle);
     this.bar.appendChild(this.btnRepeat);
-    this.bar.appendChild(this.vol);
     this.bar.appendChild(this.btnEnvironment);
     this.bar.appendChild(this.btnHide);
 
@@ -589,7 +593,17 @@ export class HarmonyUI {
     this.panel = document.createElement("div");
     this.panel.className = "harmony-panel";
 
-    // Presets (overwrite snapshots)
+    // 1) Ritual Timer (top)
+    this.panel.appendChild(
+      this.makeRitualSection("Ritual", [
+        ["10", 10],
+        ["30", 30],
+        ["60", 60],
+        ["90", 90],
+      ]),
+    );
+
+    // 2) Presets
     this.panel.appendChild(
       this.makePresetSection("Presets", [
         ["Dusk", "dusk"],
@@ -598,40 +612,10 @@ export class HarmonyUI {
       ]),
     );
 
-    this.panel.appendChild(
-      this.makeSelectSection("Color", "color", [
-        ["C1", "c1", () => this.handlers.onSelectColor("c1")],
-        ["C2", "c2", () => this.handlers.onSelectColor("c2")],
-        ["C3", "c3", () => this.handlers.onSelectColor("c3")],
-        ["C4", "c4", () => this.handlers.onSelectColor("c4")],
-      ]),
-    );
-
-    this.panel.appendChild(
-      this.makeSelectSection("Filter", "filter", [
-        ["F1", "f1", () => this.handlers.onSelectFilter("f1")],
-        ["F2", "f2", () => this.handlers.onSelectFilter("f2")],
-        ["F3", "f3", () => this.handlers.onSelectFilter("f3")],
-        ["F4", "f4", () => this.handlers.onSelectFilter("f4")],
-      ]),
-    );
-
+    // 3) Ambient (circle buttons, icons later)
     this.panel.appendChild(
       this.makeToggleSection(
-        "Particles",
-        [
-          ["Rain", "rain"],
-          ["Snow", "snow"],
-          ["Dust", "dust"],
-          ["Embers", "embers"],
-        ],
-        (id, enabled) => this.handlers.onToggleParticle(id, enabled),
-      ),
-    );
-
-    this.panel.appendChild(
-      this.makeToggleSection(
-        "Ambients",
+        "Ambient",
         [
           ["Crickets", "crickets"],
           ["Waves", "waves"],
@@ -642,14 +626,42 @@ export class HarmonyUI {
       ),
     );
 
+    // 4) Filters
     this.panel.appendChild(
-      this.makeSection("Ritual", [
-        ["30", () => this.handlers.onSetRitualDuration(30)],
-        ["60", () => this.handlers.onSetRitualDuration(60)],
-        ["90", () => this.handlers.onSetRitualDuration(90)],
-        ["120", () => this.handlers.onSetRitualDuration(120)],
+      this.makeSelectSection("Filters", "filter", [
+        ["F1", "f1", () => this.handlers.onSelectFilter("f1")],
+        ["F2", "f2", () => this.handlers.onSelectFilter("f2")],
+        ["F3", "f3", () => this.handlers.onSelectFilter("f3")],
+        ["F4", "f4", () => this.handlers.onSelectFilter("f4")],
       ]),
     );
+
+    // 5) ParticleFX (rename later)
+    this.panel.appendChild(
+      this.makeToggleSection(
+        "ParticleFX",
+        [
+          ["Rain", "rain"],
+          ["Snow", "snow"],
+          ["Dust", "dust"],
+          ["Embers", "embers"],
+        ],
+        (id, enabled) => this.handlers.onToggleParticle(id, enabled),
+      ),
+    );
+
+    // 6) Spectrum placeholder
+    this.panel.appendChild(
+      this.makeSelectSection("Spectrum", "color", [
+        ["C1", "c1", () => this.handlers.onSelectColor("c1")],
+        ["C2", "c2", () => this.handlers.onSelectColor("c2")],
+        ["C3", "c3", () => this.handlers.onSelectColor("c3")],
+        ["C4", "c4", () => this.handlers.onSelectColor("c4")],
+      ]),
+    );
+
+    // 7) Audio sliders (Howler lanes)
+    this.panel.appendChild(this.makeAudioSlidersSection("Audio"));
 
     this.root.appendChild(style);
     this.root.appendChild(this.panel);
@@ -659,7 +671,7 @@ export class HarmonyUI {
   public mount(parent: HTMLElement): void {
     parent.appendChild(this.root);
     setSliderPct(this.scrub);
-    setSliderPct(this.vol);
+    this.syncLaneSliderFill();
   }
 
   public dispose(): void {
@@ -667,9 +679,9 @@ export class HarmonyUI {
     this.scrubSeekRaf = 0;
     this.scrubPendingSec = null;
 
-    if (this.volRaf) cancelAnimationFrame(this.volRaf);
-    this.volRaf = 0;
-    this.volPending = null;
+    if (this.laneRaf) cancelAnimationFrame(this.laneRaf);
+    this.laneRaf = 0;
+    this.lanePending = {};
 
     for (const u of this.unbinds) u();
     this.unbinds = [];
@@ -686,12 +698,6 @@ export class HarmonyUI {
 
     this.btnShuffle.classList.toggle("on", !!state.shuffle);
     this.btnRepeat.textContent = repeatLabel(state.repeat);
-
-    const v = clamp01(Number.isFinite(state.volume) ? state.volume : 0.85);
-    if (document.activeElement !== this.vol) {
-      this.vol.value = String(v);
-      setSliderPct(this.vol);
-    }
 
     const dur = Number.isFinite(state.durationSec) ? state.durationSec : 0;
     const pos = Number.isFinite(state.positionSec) ? state.positionSec : 0;
@@ -719,6 +725,36 @@ export class HarmonyUI {
     // Select visuals (single-choice)
     this.syncSelectVisual("color", String((state as any).colorId ?? ""));
     this.syncSelectVisual("filter", String((state as any).filterId ?? ""));
+
+    // Sync lane sliders from state.mix (authoritative)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mix = (state as any).mix as
+      | Partial<Record<"master" | "music" | "sfx" | "ambient" | "ui", number>>
+      | undefined;
+
+    if (mix && typeof mix === "object") {
+      this.syncLaneSliderValue(this.laneMaster, mix.master);
+      this.syncLaneSliderValue(this.laneMusic, mix.music);
+      this.syncLaneSliderValue(this.laneSfx, mix.sfx);
+      this.syncLaneSliderValue(this.laneAmbient, mix.ambient);
+      this.syncLaneSliderValue(this.laneUi, mix.ui);
+    }
+
+    this.syncLaneSliderFill();
+  }
+
+  private syncLaneSliderValue(el: HTMLInputElement, maybeV: unknown): void {
+    if (document.activeElement === el) return;
+    if (typeof maybeV !== "number" || !Number.isFinite(maybeV)) return;
+    el.value = String(clamp01(maybeV));
+  }
+
+  private syncLaneSliderFill(): void {
+    if (this.laneMaster) setSliderPct(this.laneMaster);
+    if (this.laneMusic) setSliderPct(this.laneMusic);
+    if (this.laneSfx) setSliderPct(this.laneSfx);
+    if (this.laneAmbient) setSliderPct(this.laneAmbient);
+    if (this.laneUi) setSliderPct(this.laneUi);
   }
 
   private syncToggleVisual(kind: string, map: Record<string, boolean>): void {
@@ -763,7 +799,6 @@ export class HarmonyUI {
         bindPress(
           tile,
           () => {
-            // Optimistic highlight (render() may later sync from canonical env if we add that)
             this.syncSelectVisual("preset", presetId);
             this.handlers.onApplyPreset(presetId);
           },
@@ -782,7 +817,7 @@ export class HarmonyUI {
     return wrap;
   }
 
-  private makeSection(label: string, buttons: Array<[string, () => void]>): HTMLElement {
+  private makeRitualSection(label: string, options: Array<[string, number]>): HTMLElement {
     const wrap = document.createElement("div");
     const h = document.createElement("h3");
     h.textContent = label;
@@ -790,22 +825,28 @@ export class HarmonyUI {
     const grid = document.createElement("div");
     grid.className = "harmony-grid";
 
-    for (const [text, fn] of buttons) {
-      const b = document.createElement("div");
-      b.className = "harmony-tile";
-      b.textContent = text;
+    for (const [text, sec] of options) {
+      const tile = document.createElement("div");
+      tile.className = "harmony-tile";
+      tile.textContent = text;
+      tile.dataset.kind = "ritual";
+      tile.dataset.id = String(sec);
 
-      b.setAttribute("role", "button");
-      b.tabIndex = 0;
+      tile.setAttribute("role", "button");
+      tile.tabIndex = 0;
 
       this.unbinds.push(
-        bindPress(b, fn, {
-          onHover: () => this.handlers.onUiHover?.(),
-          onClick: () => this.handlers.onUiClick?.(),
-        }),
+        bindPress(
+          tile,
+          () => this.handlers.onSetRitualDuration(sec),
+          {
+            onHover: () => this.handlers.onUiHover?.(),
+            onClick: () => this.handlers.onUiClick?.(),
+          },
+        ),
       );
 
-      grid.appendChild(b);
+      grid.appendChild(tile);
     }
 
     wrap.appendChild(h);
@@ -840,7 +881,6 @@ export class HarmonyUI {
         bindPress(
           tile,
           () => {
-            // Optimistic UI highlight (render() will re-sync from state)
             this.syncSelectVisual(kind, id);
             fn();
           },
@@ -904,5 +944,135 @@ export class HarmonyUI {
     wrap.appendChild(h);
     wrap.appendChild(grid);
     return wrap;
+  }
+
+  private makeAudioSlidersSection(label: string): HTMLElement {
+    const wrap = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = label;
+
+    const box = document.createElement("div");
+    box.className = "harmony-sliders";
+
+    const onHover = () => this.handlers.onUiHover?.();
+    const onClick = () => this.handlers.onUiClick?.();
+
+    const makeLane = (key: "master" | "music" | "sfx" | "ambient" | "ui", initial: number) => {
+      const row = document.createElement("div");
+      row.className = "harmony-sliderRow";
+
+      const k = document.createElement("div");
+      k.className = "k";
+      k.textContent = key.toUpperCase();
+
+      const input = document.createElement("input");
+      input.className = "harmony-lane";
+      input.type = "range";
+      input.min = "0";
+      input.max = "1";
+      input.step = "0.01";
+      input.value = String(clamp01(initial));
+      setSliderPct(input);
+
+      const v = document.createElement("div");
+      v.className = "v";
+      v.textContent = `${Math.round(clamp01(initial) * 100)}%`;
+
+      const emitLane = (value01: number) => {
+        const vv = clamp01(value01);
+        v.textContent = `${Math.round(vv * 100)}%`;
+        this.queueLaneEmit(key, vv);
+      };
+
+      input.addEventListener("pointerenter", onHover);
+      input.addEventListener("pointerdown", onClick);
+
+      input.addEventListener("input", () => {
+        const vv = clamp01(Number(input.value));
+        setSliderPct(input);
+        emitLane(vv);
+      });
+
+      input.addEventListener("change", () => {
+        const vv = clamp01(Number(input.value));
+        setSliderPct(input);
+        this.flushLaneEmit(key, vv);
+      });
+
+      input.addEventListener("blur", () => {
+        const vv = clamp01(Number(input.value));
+        setSliderPct(input);
+        this.flushLaneEmit(key, vv);
+      });
+
+      row.appendChild(k);
+      row.appendChild(input);
+      row.appendChild(v);
+
+      return { row, input };
+    };
+
+    const a = makeLane("master", 1.0);
+    const b = makeLane("music", 1.0);
+    const c = makeLane("sfx", 0.85);
+    const d = makeLane("ambient", 0.7);
+    const e = makeLane("ui", 0.6);
+
+    this.laneMaster = a.input;
+    this.laneMusic = b.input;
+    this.laneSfx = c.input;
+    this.laneAmbient = d.input;
+    this.laneUi = e.input;
+
+    box.appendChild(a.row);
+    box.appendChild(b.row);
+    box.appendChild(c.row);
+    box.appendChild(d.row);
+    box.appendChild(e.row);
+
+    wrap.appendChild(h);
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  private queueLaneEmit(lane: "master" | "music" | "sfx" | "ambient" | "ui", value01: number): void {
+    if (!this.handlers.onSetHowlerLane) return;
+
+    this.lanePending[lane] = clamp01(value01);
+
+    if (!this.laneRaf) {
+      this.laneRaf = requestAnimationFrame(() => {
+        this.laneRaf = 0;
+
+        const pending = this.lanePending;
+        this.lanePending = {};
+
+        for (const [k, v] of Object.entries(pending) as Array<[typeof lane, number]>) {
+          if (typeof v === "number" && Number.isFinite(v)) {
+            this.handlers.onSetHowlerLane?.(k, v);
+          }
+        }
+      });
+    }
+  }
+
+  private flushLaneEmit(lane: "master" | "music" | "sfx" | "ambient" | "ui", value01: number): void {
+    if (!this.handlers.onSetHowlerLane) return;
+
+    this.lanePending[lane] = clamp01(value01);
+
+    if (this.laneRaf) {
+      cancelAnimationFrame(this.laneRaf);
+      this.laneRaf = 0;
+    }
+
+    const pending = this.lanePending;
+    this.lanePending = {};
+
+    for (const [k, v] of Object.entries(pending) as Array<[typeof lane, number]>) {
+      if (typeof v === "number" && Number.isFinite(v)) {
+        this.handlers.onSetHowlerLane?.(k, v);
+      }
+    }
   }
 }
