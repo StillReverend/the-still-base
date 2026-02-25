@@ -77,6 +77,23 @@ function setSliderPct(el: HTMLInputElement): void {
   el.style.setProperty("--pct", `${pct}%`);
 }
 
+function isElementDisabled(el: HTMLElement): boolean {
+  // Prefer native disabled for form controls.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const anyEl = el as any;
+  if (typeof anyEl.disabled === "boolean" && anyEl.disabled) return true;
+
+  const aria = el.getAttribute("aria-disabled");
+  if (aria === "true") return true;
+
+  const ds = el.getAttribute("data-disabled");
+  if (ds === "true") return true;
+
+  if (el.classList.contains("is-disabled")) return true;
+
+  return false;
+}
+
 /**
  * Attach fast, reliable button interaction:
  * - pointerdown = instant response (Safari trackpad taps included)
@@ -107,6 +124,9 @@ function bindPress(
   };
 
   const fire = (e?: Event) => {
+    // Respect disabled state (visual + semantic)
+    if (isElementDisabled(el)) return;
+
     if (e) {
       try {
         e.preventDefault();
@@ -122,12 +142,22 @@ function bindPress(
   };
 
   const onPointerEnter = () => {
+    if (isElementDisabled(el)) return;
     safeCall(opts?.onHover);
   };
 
   const onPointerDown = (e: PointerEvent) => {
     // Only primary button/tap.
     if (typeof e.button === "number" && e.button !== 0) return;
+
+    if (isElementDisabled(el)) {
+      try {
+        e.preventDefault();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (e as any).stopPropagation?.();
+      } catch {}
+      return;
+    }
 
     // SFX click should happen on down (feels snappy + counts as gesture)
     safeCall(opts?.onClick);
@@ -136,6 +166,15 @@ function bindPress(
 
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key !== "Enter" && e.key !== " ") return;
+
+    if (isElementDisabled(el)) {
+      try {
+        e.preventDefault();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (e as any).stopPropagation?.();
+      } catch {}
+      return;
+    }
 
     // Match pointerdown behavior for keyboard users
     safeCall(opts?.onClick);
@@ -151,6 +190,93 @@ function bindPress(
     el.removeEventListener("pointerdown", onPointerDown);
     el.removeEventListener("keydown", onKeyDown);
   };
+}
+
+// ------------------------------------------------------------
+// Director vs Lumen policy + capability/unlock readers
+// ------------------------------------------------------------
+
+type HarmonyUiMode = "cinematic" | "minimal" | "full";
+type HarmonyOwner = "director" | "lumen" | string;
+
+// Matches types.ts (string capabilities)
+type HarmonyCapabilityKey =
+  | "playback.basic"
+  | "playback.transport"
+  | "playback.shuffle"
+  | "playback.repeat"
+  | "env.panel"
+  | "env.colors"
+  | "env.filters"
+  | "env.particles"
+  | "env.ambients"
+  | "env.presets"
+  | "mix.lanes"
+  | "ui.hide";
+
+type HarmonyCapabilitiesMap = Partial<Record<HarmonyCapabilityKey, boolean>>;
+
+type HarmonyUnlocksShape = Partial<{
+  colors: Record<string, boolean>;
+  filters: Record<string, boolean>;
+  particles: Record<string, boolean>;
+  ambients: Record<string, boolean>;
+  presets: Record<string, boolean>;
+}>;
+
+function readUiMode(state: HarmonyState): HarmonyUiMode {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = String((state as any)?.uiMode ?? "full").toLowerCase();
+  if (m === "cinematic" || m === "minimal" || m === "full") return m;
+  return "full";
+}
+
+function readOwner(state: HarmonyState): HarmonyOwner {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const o = (state as any)?.owner;
+  return typeof o === "string" && o.trim() ? o.trim() : "lumen";
+}
+
+function readCaps(state: HarmonyState): HarmonyCapabilitiesMap {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const raw = (state as any)?.capabilities;
+  if (!raw || typeof raw !== "object") return {};
+  return raw as HarmonyCapabilitiesMap;
+}
+
+function capEnabled(caps: HarmonyCapabilitiesMap, key: HarmonyCapabilityKey, fallback = true): boolean {
+  const v = caps[key];
+  return typeof v === "boolean" ? v : fallback;
+}
+
+function readUnlocks(state: HarmonyState): HarmonyUnlocksShape {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const u = (state as any)?.unlocks;
+  if (!u || typeof u !== "object") return {};
+  return u as HarmonyUnlocksShape;
+}
+
+function isUnlocked(owner: HarmonyOwner, unlocks: HarmonyUnlocksShape, kind: string, id: string): boolean {
+  // Director is “authoring” or “guided”; unlock gating is primarily for lumen.
+  if (String(owner).toLowerCase() === "director") return true;
+
+  const map =
+    kind === "color"
+      ? unlocks.colors
+      : kind === "filter"
+        ? unlocks.filters
+        : kind === "particle"
+          ? unlocks.particles
+          : kind === "ambient"
+            ? unlocks.ambients
+            : kind === "preset"
+              ? unlocks.presets
+              : undefined;
+
+  // If we have no map at all, default permissive (pre-unlock era).
+  if (!map) return true;
+
+  return Boolean(map[id]);
 }
 
 export class HarmonyUI {
@@ -242,6 +368,29 @@ export class HarmonyUI {
         background: rgba(255,255,255,0.14);
       }
 
+      .harmony-btn.is-disabled,
+      .harmony-tile.is-disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      .harmony-btn.is-disabled:active,
+      .harmony-tile.is-disabled:active {
+        transform: none;
+      }
+
+      /* Locked tiles: subtle "seal" */
+      .harmony-tile.is-locked::after {
+        content: "🔒";
+        position: absolute;
+        right: 6px;
+        top: 6px;
+        font-size: 12px;
+        opacity: 0.85;
+        pointer-events: none;
+        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.55));
+      }
+
       .harmony-title {
         display: flex;
         flex-direction: column;
@@ -278,6 +427,12 @@ export class HarmonyUI {
         background:
           linear-gradient(var(--fill), var(--fill)) 0 50% / var(--pct) 4px no-repeat,
           linear-gradient(var(--track), var(--track)) 0 50% / 100% 4px no-repeat;
+      }
+
+      .harmony-scrub[disabled],
+      .harmony-lane[disabled] {
+        opacity: 0.45;
+        cursor: not-allowed;
       }
 
       .harmony-scrub {
@@ -374,6 +529,7 @@ export class HarmonyUI {
 
       /* Circle tiles (panel buttons) */
       .harmony-tile {
+        position: relative;
         width: 56px;
         height: 56px;
         border-radius: 999px;
@@ -476,6 +632,8 @@ export class HarmonyUI {
     setSliderPct(this.scrub);
 
     const scrubStart = (e?: PointerEvent) => {
+      if (this.scrub.disabled) return;
+
       this.isScrubbing = true;
 
       // Capture pointer so we reliably get pointerup even if cursor leaves the control.
@@ -490,6 +648,7 @@ export class HarmonyUI {
     };
 
     const scrubEnd = (e?: PointerEvent) => {
+      if (this.scrub.disabled) return;
       if (!this.isScrubbing) return;
 
       if (e && typeof (this.scrub as any).releasePointerCapture === "function" && e.pointerId != null) {
@@ -512,6 +671,8 @@ export class HarmonyUI {
     };
 
     const scrubLive = () => {
+      if (this.scrub.disabled) return;
+
       this.isScrubbing = true;
 
       const timeSec = Number(this.scrub.value);
@@ -535,7 +696,10 @@ export class HarmonyUI {
       }
     };
 
-    this.scrub.addEventListener("pointerenter", () => this.handlers.onUiHover?.());
+    this.scrub.addEventListener("pointerenter", () => {
+      if (this.scrub.disabled) return;
+      this.handlers.onUiHover?.();
+    });
     this.scrub.addEventListener("pointerdown", (e) => scrubStart(e));
     this.scrub.addEventListener("pointerup", (e) => scrubEnd(e));
     this.scrub.addEventListener("pointercancel", (e) => scrubEnd(e));
@@ -690,14 +854,70 @@ export class HarmonyUI {
   }
 
   public render(state: HarmonyState): void {
-    this.root.style.display = state.uiVisible ? "block" : "none";
-    this.panel.classList.toggle("open", state.environmentPanelOpen);
+    const uiMode = readUiMode(state);
+    const owner = readOwner(state);
+    const caps = readCaps(state);
+    const unlocks = readUnlocks(state);
 
+    // Root visibility
+    this.root.style.display = state.uiVisible ? "block" : "none";
+
+    // Capabilities (authoritative)
+    const allowPlaybackBasic = capEnabled(caps, "playback.basic", true);
+    const allowTransport = capEnabled(caps, "playback.transport", true);
+    const allowShuffle = capEnabled(caps, "playback.shuffle", true);
+    const allowRepeat = capEnabled(caps, "playback.repeat", true);
+
+    const allowEnvPanel = capEnabled(caps, "env.panel", true);
+    const allowEnvColors = capEnabled(caps, "env.colors", true);
+    const allowEnvFilters = capEnabled(caps, "env.filters", true);
+    const allowEnvParticles = capEnabled(caps, "env.particles", true);
+    const allowEnvAmbients = capEnabled(caps, "env.ambients", true);
+    const allowEnvPresets = capEnabled(caps, "env.presets", true);
+
+    const allowMix = capEnabled(caps, "mix.lanes", true);
+    const allowHide = capEnabled(caps, "ui.hide", true);
+
+    // UI mode policy (visual layer)
+    // - cinematic: bar only, no panel
+    // - minimal: bar, panel allowed if env.panel
+    // - full: normal
+    const panelAllowedByMode = uiMode === "full" ? true : uiMode === "minimal" ? allowEnvPanel : false;
+    const panelOpen = Boolean(state.environmentPanelOpen) && panelAllowedByMode && allowEnvPanel;
+    this.panel.classList.toggle("open", panelOpen);
+
+    // If panel can't be open, force it visually closed (without calling handlers)
+    if (!panelOpen && this.panel.classList.contains("open")) {
+      this.panel.classList.remove("open");
+    }
+
+    // Bottom bar controls
     this.btnPlay.textContent = state.playing ? "Pause" : "Play";
     this.titleText.textContent = state.title || "No track";
 
     this.btnShuffle.classList.toggle("on", !!state.shuffle);
     this.btnRepeat.textContent = repeatLabel(state.repeat);
+
+    // Buttons
+    this.setButtonEnabled(this.btnPlay, allowPlaybackBasic);
+    this.setButtonEnabled(this.btnPrev, allowTransport);
+    this.setButtonEnabled(this.btnNext, allowTransport);
+    this.setButtonEnabled(this.btnShuffle, allowShuffle);
+    this.setButtonEnabled(this.btnRepeat, allowRepeat);
+
+    // Scrub enabled (playback.basic implies seek)
+    this.scrub.disabled = !allowPlaybackBasic;
+
+    // Environment button enabled + hidden in cinematic mode
+    if (uiMode === "cinematic") {
+      this.btnEnvironment.style.display = "none";
+    } else {
+      this.btnEnvironment.style.display = "";
+      this.setButtonEnabled(this.btnEnvironment, allowEnvPanel);
+    }
+
+    // Hide button capability
+    this.setButtonEnabled(this.btnHide, allowHide);
 
     const dur = Number.isFinite(state.durationSec) ? state.durationSec : 0;
     const pos = Number.isFinite(state.positionSec) ? state.positionSec : 0;
@@ -726,6 +946,22 @@ export class HarmonyUI {
     this.syncSelectVisual("color", String((state as any).colorId ?? ""));
     this.syncSelectVisual("filter", String((state as any).filterId ?? ""));
 
+    // Enable/disable sections via caps + owner/unlocks (lumen)
+    this.setTilesEnabledAndLocked(owner, unlocks, "preset", allowEnvPresets);
+    this.setTilesEnabled("ritual", true); // ritual currently always allowed (no capability key yet)
+
+    this.setTilesEnabledAndLocked(owner, unlocks, "ambient", allowEnvAmbients);
+    this.setTilesEnabledAndLocked(owner, unlocks, "particle", allowEnvParticles);
+    this.setTilesEnabledAndLocked(owner, unlocks, "color", allowEnvColors);
+    this.setTilesEnabledAndLocked(owner, unlocks, "filter", allowEnvFilters);
+
+    // Mixer lanes
+    this.setLaneEnabled(this.laneMaster, allowMix);
+    this.setLaneEnabled(this.laneMusic, allowMix);
+    this.setLaneEnabled(this.laneSfx, allowMix);
+    this.setLaneEnabled(this.laneAmbient, allowMix);
+    this.setLaneEnabled(this.laneUi, allowMix);
+
     // Sync lane sliders from state.mix (authoritative)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mix = (state as any).mix as
@@ -741,6 +977,57 @@ export class HarmonyUI {
     }
 
     this.syncLaneSliderFill();
+
+    // Helpful data hooks for debugging/QA
+    this.root.setAttribute("data-owner", String(owner));
+    this.root.setAttribute("data-ui-mode", String(uiMode));
+  }
+
+  private setButtonEnabled(btn: HTMLButtonElement, enabled: boolean): void {
+    btn.disabled = !enabled;
+    btn.classList.toggle("is-disabled", !enabled);
+    btn.setAttribute("aria-disabled", enabled ? "false" : "true");
+    btn.setAttribute("data-disabled", enabled ? "false" : "true");
+  }
+
+  private setLaneEnabled(el: HTMLInputElement, enabled: boolean): void {
+    if (!el) return;
+    el.disabled = !enabled;
+    el.setAttribute("aria-disabled", enabled ? "false" : "true");
+    el.setAttribute("data-disabled", enabled ? "false" : "true");
+  }
+
+  private setTilesEnabled(kind: string, enabled: boolean): void {
+    const tiles = this.root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="${kind}"]`);
+    tiles.forEach((tile) => {
+      tile.classList.toggle("is-disabled", !enabled);
+      tile.setAttribute("aria-disabled", enabled ? "false" : "true");
+      tile.setAttribute("data-disabled", enabled ? "false" : "true");
+    });
+  }
+
+  private setTilesEnabledAndLocked(
+    owner: HarmonyOwner,
+    unlocks: HarmonyUnlocksShape,
+    kind: string,
+    enabledByCaps: boolean,
+  ): void {
+    const tiles = this.root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="${kind}"]`);
+    tiles.forEach((tile) => {
+      const id = tile.dataset.id || "";
+      const unlocked = id ? isUnlocked(owner, unlocks, kind, id) : true;
+
+      const enabled = enabledByCaps && unlocked;
+
+      tile.classList.toggle("is-disabled", !enabled);
+      tile.setAttribute("aria-disabled", enabled ? "false" : "true");
+      tile.setAttribute("data-disabled", enabled ? "false" : "true");
+
+      // Lock badge for lumen when not unlocked (but only if section is otherwise allowed)
+      const showLock = enabledByCaps && !unlocked && String(owner).toLowerCase() === "lumen";
+      tile.classList.toggle("is-locked", showLock);
+      tile.setAttribute("data-locked", showLock ? "true" : "false");
+    });
   }
 
   private syncLaneSliderValue(el: HTMLInputElement, maybeV: unknown): void {
@@ -794,6 +1081,9 @@ export class HarmonyUI {
       tile.setAttribute("role", "button");
       tile.tabIndex = 0;
       tile.setAttribute("aria-pressed", "false");
+      tile.setAttribute("aria-disabled", "false");
+      tile.setAttribute("data-disabled", "false");
+      tile.setAttribute("data-locked", "false");
 
       this.unbinds.push(
         bindPress(
@@ -834,6 +1124,8 @@ export class HarmonyUI {
 
       tile.setAttribute("role", "button");
       tile.tabIndex = 0;
+      tile.setAttribute("aria-disabled", "false");
+      tile.setAttribute("data-disabled", "false");
 
       this.unbinds.push(
         bindPress(
@@ -876,6 +1168,9 @@ export class HarmonyUI {
       tile.setAttribute("role", "button");
       tile.tabIndex = 0;
       tile.setAttribute("aria-pressed", "false");
+      tile.setAttribute("aria-disabled", "false");
+      tile.setAttribute("data-disabled", "false");
+      tile.setAttribute("data-locked", "false");
 
       this.unbinds.push(
         bindPress(
@@ -923,6 +1218,9 @@ export class HarmonyUI {
       tile.setAttribute("role", "button");
       tile.tabIndex = 0;
       tile.setAttribute("aria-pressed", "false");
+      tile.setAttribute("aria-disabled", "false");
+      tile.setAttribute("data-disabled", "false");
+      tile.setAttribute("data-locked", "false");
 
       const press = () => {
         const next = !tile.classList.contains("on");
@@ -984,22 +1282,31 @@ export class HarmonyUI {
         this.queueLaneEmit(key, vv);
       };
 
-      input.addEventListener("pointerenter", onHover);
-      input.addEventListener("pointerdown", onClick);
+      input.addEventListener("pointerenter", () => {
+        if (input.disabled) return;
+        onHover();
+      });
+      input.addEventListener("pointerdown", () => {
+        if (input.disabled) return;
+        onClick();
+      });
 
       input.addEventListener("input", () => {
+        if (input.disabled) return;
         const vv = clamp01(Number(input.value));
         setSliderPct(input);
         emitLane(vv);
       });
 
       input.addEventListener("change", () => {
+        if (input.disabled) return;
         const vv = clamp01(Number(input.value));
         setSliderPct(input);
         this.flushLaneEmit(key, vv);
       });
 
       input.addEventListener("blur", () => {
+        if (input.disabled) return;
         const vv = clamp01(Number(input.value));
         setSliderPct(input);
         this.flushLaneEmit(key, vv);
@@ -1038,6 +1345,20 @@ export class HarmonyUI {
   private queueLaneEmit(lane: "master" | "music" | "sfx" | "ambient" | "ui", value01: number): void {
     if (!this.handlers.onSetHowlerLane) return;
 
+    // Don’t emit if lane control is disabled
+    const el =
+      lane === "master"
+        ? this.laneMaster
+        : lane === "music"
+          ? this.laneMusic
+          : lane === "sfx"
+            ? this.laneSfx
+            : lane === "ambient"
+              ? this.laneAmbient
+              : this.laneUi;
+
+    if (el?.disabled) return;
+
     this.lanePending[lane] = clamp01(value01);
 
     if (!this.laneRaf) {
@@ -1058,6 +1379,20 @@ export class HarmonyUI {
 
   private flushLaneEmit(lane: "master" | "music" | "sfx" | "ambient" | "ui", value01: number): void {
     if (!this.handlers.onSetHowlerLane) return;
+
+    // Don’t emit if lane control is disabled
+    const el =
+      lane === "master"
+        ? this.laneMaster
+        : lane === "music"
+          ? this.laneMusic
+          : lane === "sfx"
+            ? this.laneSfx
+            : lane === "ambient"
+              ? this.laneAmbient
+              : this.laneUi;
+
+    if (el?.disabled) return;
 
     this.lanePending[lane] = clamp01(value01);
 

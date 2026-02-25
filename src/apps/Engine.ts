@@ -130,6 +130,7 @@ export class Engine {
         sfx: 0.85,
         ambient: 0.7,
         music: 1.0,
+        ui: 0.6,
       },
     });
 
@@ -139,8 +140,12 @@ export class Engine {
     // Now that Harmony has sliders, we want UI sounds ON by default,
     // but still fully user-controllable and persisted.
     const userState = this.persistence.getState();
+
+    // Default ON unless the user explicitly turned it off.
+    const uiSfxEnabled = (userState as any)?.uiSfxEnabled !== false;
+
     this.bus.emit("howler:ui-sfx:set-enabled", {
-      enabled: Boolean(userState.uiSfxEnabled),
+      enabled: uiSfxEnabled,
       source: "engine:boot",
     });
 

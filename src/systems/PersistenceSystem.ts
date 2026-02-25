@@ -93,6 +93,33 @@ export interface HarmonyEnvironmentState {
   ambients: Record<string, boolean>;
 }
 
+// ------------------------------------------------------------
+// NEW: Director/Lumen + UI mode + unlocks/capabilities
+// ------------------------------------------------------------
+
+export type UserOwner = "director" | "lumen";
+export type UIMode = "cinematic" | "minimal" | "full";
+
+/**
+ * Generic boolean feature toggles.
+ * Examples: "canUploadAudio", "canCreateRemnant", "showDebug", etc.
+ * Keep this schema-flexible so we don't churn versions.
+ */
+export type CapabilityOverrides = Record<string, boolean>;
+
+/**
+ * Canonical unlock ledgers for Harmony.
+ * These are "collected / available" flags, not "currently enabled" flags
+ * (enabled is driven by HarmonyEnvironmentState).
+ */
+export interface HarmonyUnlocksState {
+  colors: Record<string, boolean>;
+  filters: Record<string, boolean>;
+  particles: Record<string, boolean>;
+  ambients: Record<string, boolean>;
+  presets: Record<string, boolean>;
+}
+
 export interface UserState {
   /** Schema version for migrations. */
   version: 1;
@@ -108,6 +135,18 @@ export interface UserState {
 
   /** NEW: Persisted toggle for UI hover/click bleeps (keeps wiring but can be off by default). */
   uiSfxEnabled: boolean;
+
+  /** NEW: Who "owns" the session (affects UI + permissions elsewhere). */
+  owner: UserOwner;
+
+  /** NEW: UI mode preference (cinematic/minimal/full). */
+  uiMode: UIMode;
+
+  /** NEW: Optional capability overrides (schema-flexible). */
+  capabilityOverrides: CapabilityOverrides;
+
+  /** NEW: Collected/unlocked Harmony content (colors/filters/particles/ambients/presets). */
+  harmonyUnlocks: HarmonyUnlocksState;
 
   /** Canonical collection of tracks */
   tracks: Record<string, TrackState>;
@@ -178,6 +217,14 @@ const DEFAULT_ENV: HarmonyEnvironmentState = {
   ambients: {},
 };
 
+const DEFAULT_UNLOCKS: HarmonyUnlocksState = {
+  colors: { c1: true },
+  filters: { f1: true },
+  particles: {},
+  ambients: {},
+  presets: {},
+};
+
 const safeString = (v: unknown, fallback: string): string => (typeof v === "string" && v.trim() ? v : fallback);
 
 const safeRecordBool = (v: unknown): Record<string, boolean> => {
@@ -198,6 +245,28 @@ const normalizeEnv = (raw: unknown): HarmonyEnvironmentState => {
     particles: safeRecordBool(r.particles),
     ambients: safeRecordBool(r.ambients),
   };
+};
+
+const normalizeUnlocks = (raw: unknown): HarmonyUnlocksState => {
+  const r = (raw ?? {}) as Partial<HarmonyUnlocksState>;
+  const colors = safeRecordBool((r as any).colors);
+  const filters = safeRecordBool((r as any).filters);
+  const particles = safeRecordBool((r as any).particles);
+  const ambients = safeRecordBool((r as any).ambients);
+  const presets = safeRecordBool((r as any).presets);
+
+  // Ensure base defaults exist (c1/f1)
+  colors.c1 = colors.c1 ?? true;
+  filters.f1 = filters.f1 ?? true;
+
+  return { colors, filters, particles, ambients, presets };
+};
+
+const normalizeOwner = (v: unknown): UserOwner => (v === "director" ? "director" : "lumen");
+
+const normalizeUiMode = (v: unknown): UIMode => {
+  if (v === "cinematic" || v === "minimal" || v === "full") return v;
+  return "full";
 };
 
 const createDefaultState = (): UserState => {
@@ -231,6 +300,13 @@ const createDefaultState = (): UserState => {
     },
     harmonyEnvironment: { ...DEFAULT_ENV },
     uiSfxEnabled: true,
+
+    // NEW defaults
+    owner: "lumen",
+    uiMode: "full",
+    capabilityOverrides: {},
+    harmonyUnlocks: { ...DEFAULT_UNLOCKS },
+
     tracks: {},
     createdAtMs: t,
     updatedAtMs: t,
@@ -278,6 +354,13 @@ const sanitizeState = (state: UserState): UserState => {
     },
     harmonyEnvironment: normalizeEnv((state as unknown as { harmonyEnvironment?: unknown })?.harmonyEnvironment),
     uiSfxEnabled: Boolean((state as unknown as { uiSfxEnabled?: unknown })?.uiSfxEnabled),
+
+    // NEW fields
+    owner: normalizeOwner((state as unknown as { owner?: unknown })?.owner),
+    uiMode: normalizeUiMode((state as unknown as { uiMode?: unknown })?.uiMode),
+    capabilityOverrides: safeRecordBool((state as unknown as { capabilityOverrides?: unknown })?.capabilityOverrides),
+    harmonyUnlocks: normalizeUnlocks((state as unknown as { harmonyUnlocks?: unknown })?.harmonyUnlocks),
+
     tracks: {},
     createdAtMs: Number.isFinite(state.createdAtMs) ? state.createdAtMs : nowMs(),
     updatedAtMs: nowMs(),
@@ -309,6 +392,10 @@ const sanitizeState = (state: UserState): UserState => {
     }
   }
 
+  // Ensure base unlock defaults are present
+  s.harmonyUnlocks.colors.c1 = s.harmonyUnlocks.colors.c1 ?? true;
+  s.harmonyUnlocks.filters.f1 = s.harmonyUnlocks.filters.f1 ?? true;
+
   return s;
 };
 
@@ -326,6 +413,55 @@ const safeClone = <T>(v: T): T => {
   return JSON.parse(JSON.stringify(v)) as T;
 };
 
+// ------------------------------------------------------------
+// NEW: Harmony policy + unlock intent payloads (bus contract)
+// ------------------------------------------------------------
+
+type HarmonyPolicyPayload = {
+  owner?: UserOwner | string;
+  uiMode?: UIMode | string;
+  capabilities?: Record<string, boolean>;
+  unlocks?: Partial<HarmonyUnlocksState>;
+  source?: string;
+  reason?: string;
+  [k: string]: unknown;
+};
+
+type HarmonyUnlockAddPayload = {
+  kind: "color" | "filter" | "particle" | "ambient" | "preset";
+  id: string;
+  unlocked?: boolean; // default true
+  source?: string;
+  reason?: string;
+  [k: string]: unknown;
+};
+
+type HarmonyDevUnlockAllPayload = {
+  enabled?: boolean; // default true
+  source?: string;
+  reason?: string;
+  [k: string]: unknown;
+};
+
+type HarmonyDevToggleOwnerPayload = {
+  owner?: UserOwner | "director" | "lumen";
+  source?: string;
+  reason?: string;
+  [k: string]: unknown;
+};
+
+const normalizeBoolMapPartial = (raw: unknown): Record<string, boolean> => safeRecordBool(raw);
+
+const mergeUnlocks = (prev: HarmonyUnlocksState, next: Partial<HarmonyUnlocksState>): HarmonyUnlocksState => {
+  return normalizeUnlocks({
+    colors: { ...(prev.colors ?? {}), ...normalizeBoolMapPartial(next.colors) },
+    filters: { ...(prev.filters ?? {}), ...normalizeBoolMapPartial(next.filters) },
+    particles: { ...(prev.particles ?? {}), ...normalizeBoolMapPartial(next.particles) },
+    ambients: { ...(prev.ambients ?? {}), ...normalizeBoolMapPartial(next.ambients) },
+    presets: { ...(prev.presets ?? {}), ...normalizeBoolMapPartial(next.presets) },
+  });
+};
+
 export class PersistenceSystem {
   private readonly bus: EventBus;
   private readonly save: SaveManagerAny;
@@ -338,6 +474,13 @@ export class PersistenceSystem {
 
   // HMR-safe: stored handler refs for off() on dispose
   private readonly onUiSfxUpdate: (p: { enabled?: boolean } | undefined) => void;
+
+  // NEW: Harmony policy/unlocks handlers (HMR-safe)
+  private readonly onHarmonyPolicyRequest: (p?: { source?: string } | undefined) => void;
+  private readonly onHarmonyPolicySet: (p: HarmonyPolicyPayload) => void;
+  private readonly onHarmonyUnlockAdd: (p: HarmonyUnlockAddPayload) => void;
+  private readonly onHarmonyDevUnlockAll: (p?: HarmonyDevUnlockAllPayload) => void;
+  private readonly onHarmonyDevToggleOwner: (p?: HarmonyDevToggleOwnerPayload) => void;
 
   constructor(deps: PersistenceSystemDeps) {
     this.bus = deps.bus;
@@ -356,10 +499,141 @@ export class PersistenceSystem {
     };
     this.bus.on("persistence:update-ui-sfx", this.onUiSfxUpdate);
 
+    // ------------------------------------------------------------
+    // NEW: Harmony policy + unlock persistence (authoritative)
+    // ------------------------------------------------------------
+
+    // Any system can request current policy (boot handshakes, late subscribers)
+    this.onHarmonyPolicyRequest = (p): void => {
+      this.emitHarmonyPolicy(`request:${safeString(p?.source, "unknown")}`);
+    };
+    this.bus.on("harmony:policy:request", this.onHarmonyPolicyRequest);
+
+    // Authoritative policy set (use sparingly; typically Engine/dev tools)
+    this.onHarmonyPolicySet = (p: HarmonyPolicyPayload): void => {
+      if (!p || typeof p !== "object") return;
+
+      const nextOwner = p.owner != null ? normalizeOwner(p.owner) : this.state.owner;
+      const nextUiMode = p.uiMode != null ? normalizeUiMode(p.uiMode) : this.state.uiMode;
+
+      const nextCaps =
+        p.capabilities && typeof p.capabilities === "object"
+          ? { ...(this.state.capabilityOverrides ?? {}), ...safeRecordBool(p.capabilities) }
+          : this.state.capabilityOverrides;
+
+      const nextUnlocks =
+        p.unlocks && typeof p.unlocks === "object"
+          ? mergeUnlocks(this.state.harmonyUnlocks ?? DEFAULT_UNLOCKS, p.unlocks)
+          : this.state.harmonyUnlocks;
+
+      const changed =
+        nextOwner !== this.state.owner ||
+        nextUiMode !== this.state.uiMode ||
+        JSON.stringify(nextCaps) !== JSON.stringify(this.state.capabilityOverrides) ||
+        JSON.stringify(nextUnlocks) !== JSON.stringify(this.state.harmonyUnlocks);
+
+      if (!changed) return;
+
+      this.update(
+        {
+          owner: nextOwner,
+          uiMode: nextUiMode,
+          capabilityOverrides: nextCaps,
+          harmonyUnlocks: nextUnlocks,
+        },
+        safeString(p.reason, "harmony:policy:set")
+      );
+
+      // Re-emit canonical policy after applying
+      this.emitHarmonyPolicy(`policy:set:${safeString(p.source, "unknown")}`);
+    };
+    this.bus.on("harmony:policy:set", this.onHarmonyPolicySet);
+
+    // Add or revoke a single unlock (the common gameplay hook)
+    this.onHarmonyUnlockAdd = (p: HarmonyUnlockAddPayload): void => {
+      const kind = safeString(p?.kind, "") as HarmonyUnlockAddPayload["kind"];
+      const id = safeString(p?.id, "").trim();
+      if (!id) return;
+
+      const unlocked = p?.unlocked === undefined ? true : Boolean(p.unlocked);
+
+      const prev = this.state.harmonyUnlocks ?? DEFAULT_UNLOCKS;
+      const next: HarmonyUnlocksState = safeClone(prev);
+
+      if (kind === "color") next.colors = { ...(prev.colors ?? {}), [id]: unlocked };
+      else if (kind === "filter") next.filters = { ...(prev.filters ?? {}), [id]: unlocked };
+      else if (kind === "particle") next.particles = { ...(prev.particles ?? {}), [id]: unlocked };
+      else if (kind === "ambient") next.ambients = { ...(prev.ambients ?? {}), [id]: unlocked };
+      else if (kind === "preset") next.presets = { ...(prev.presets ?? {}), [id]: unlocked };
+      else return;
+
+      // Normalize + ensure c1/f1 present
+      const normalized = normalizeUnlocks(next);
+
+      // No-op guard
+      if (JSON.stringify(normalized) === JSON.stringify(prev)) return;
+
+      this.update({ harmonyUnlocks: normalized }, safeString(p.reason, `harmony:unlock:${kind}:${id}`));
+      this.emitHarmonyPolicy(`unlock:add:${safeString(p.source, "unknown")}`);
+    };
+    this.bus.on("harmony:unlock:add", this.onHarmonyUnlockAdd);
+
+    // DEV hatch: unlock everything by switching to director (bypasses gating entirely)
+    this.onHarmonyDevUnlockAll = (p?: HarmonyDevUnlockAllPayload): void => {
+      const enabled = p?.enabled === undefined ? true : Boolean(p.enabled);
+      if (!enabled) return;
+
+      // “Director” bypass is the only reliable unlock-all without needing catalogs.
+      // We ALSO stamp a capability flag so we can detect this later if needed.
+      const caps = { ...(this.state.capabilityOverrides ?? {}) };
+      caps["dev.unlockAll"] = true;
+
+      const reason = safeString(p?.reason, "harmony:dev:unlockAll");
+      const source = safeString(p?.source, "unknown");
+
+      const changed = this.state.owner !== "director" || !this.state.capabilityOverrides?.["dev.unlockAll"];
+      if (!changed) {
+        this.emitHarmonyPolicy(`dev:unlockAll:${source}`);
+        return;
+      }
+
+      this.update(
+        {
+          owner: "director",
+          capabilityOverrides: caps,
+        },
+        reason
+      );
+
+      this.emitHarmonyPolicy(`dev:unlockAll:${source}`);
+    };
+    this.bus.on("harmony:dev:unlockAll", this.onHarmonyDevUnlockAll);
+
+    // DEV hatch: toggle owner (director <-> lumen) or explicitly set it
+    this.onHarmonyDevToggleOwner = (p?: HarmonyDevToggleOwnerPayload): void => {
+      const desired =
+        p?.owner === "director" || p?.owner === "lumen" ? (p.owner as UserOwner) : this.state.owner === "director" ? "lumen" : "director";
+
+      if (desired === this.state.owner) return;
+
+      const reason = safeString(p?.reason, "harmony:dev:toggleOwner");
+      const source = safeString(p?.source, "unknown");
+
+      this.update({ owner: desired }, reason);
+      this.emitHarmonyPolicy(`dev:owner:${source}`);
+    };
+    this.bus.on("harmony:dev:toggleOwner", this.onHarmonyDevToggleOwner);
+
+    // ------------------------------------------------------------
+    // Initial announce
+    // ------------------------------------------------------------
     this.bus.emit<PersistenceLoadedPayload>("persistence:loaded", {
       state: this.getState(),
       fromSave: this.loadedFromSave,
     });
+
+    // Also emit Harmony policy immediately so HarmonySystem can hydrate without Engine glue
+    this.emitHarmonyPolicy("boot");
   }
 
   /** Returns a deep-ish copy safe for consumers (no mutation). */
@@ -458,6 +732,9 @@ export class PersistenceSystem {
       state: this.getState(),
       reason,
     });
+
+    // Keep Harmony in sync any time persistence changes (cheap, and avoids “who emits first” issues)
+    this.emitHarmonyPolicy(`persistence:changed:${reason}`);
 
     this.scheduleAutosave(reason);
   }
@@ -625,12 +902,27 @@ export class PersistenceSystem {
   // Internals
   // ---------------------------------------------------------------------------
 
+  private emitHarmonyPolicy(reason: string): void {
+    const payload: HarmonyPolicyPayload = {
+      owner: this.state.owner,
+      uiMode: this.state.uiMode,
+      capabilities: safeClone(this.state.capabilityOverrides ?? {}),
+      unlocks: safeClone(this.state.harmonyUnlocks ?? DEFAULT_UNLOCKS),
+      source: "persistence",
+      reason,
+    };
+
+    // HarmonySystem listens to these aliases already
+    this.bus.emit("harmony:policy:set", payload);
+    this.bus.emit("harmony:ui:policy", payload);
+  }
+
   private loadFromSave(): { state: UserState; fromSave: boolean } {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = this.save.get(SAVE_KEY as any) as unknown;
 
     if (isUserStateV1(raw)) {
-      // Back-compat: older saves may not have harmonyEnvironment or uiSfxEnabled.
+      // Back-compat: older saves may not have newer fields.
       const withExtras = raw as UserState;
 
       if (!(withExtras as any).harmonyEnvironment) {
@@ -639,6 +931,22 @@ export class PersistenceSystem {
 
       if (typeof (withExtras as any).uiSfxEnabled !== "boolean") {
         (withExtras as any).uiSfxEnabled = false;
+      }
+
+      if ((withExtras as any).owner !== "director" && (withExtras as any).owner !== "lumen") {
+        (withExtras as any).owner = "lumen";
+      }
+
+      if ((withExtras as any).uiMode !== "cinematic" && (withExtras as any).uiMode !== "minimal" && (withExtras as any).uiMode !== "full") {
+        (withExtras as any).uiMode = "full";
+      }
+
+      if (!(withExtras as any).capabilityOverrides || typeof (withExtras as any).capabilityOverrides !== "object") {
+        (withExtras as any).capabilityOverrides = {};
+      }
+
+      if (!(withExtras as any).harmonyUnlocks) {
+        (withExtras as any).harmonyUnlocks = { ...DEFAULT_UNLOCKS };
       }
 
       return { state: sanitizeState(withExtras), fromSave: true };
@@ -687,5 +995,12 @@ export class PersistenceSystem {
   dispose(): void {
     this.clearAutosave();
     this.bus.off("persistence:update-ui-sfx", this.onUiSfxUpdate);
+
+    // NEW: Harmony contract offs
+    this.bus.off("harmony:policy:request", this.onHarmonyPolicyRequest);
+    this.bus.off("harmony:policy:set", this.onHarmonyPolicySet);
+    this.bus.off("harmony:unlock:add", this.onHarmonyUnlockAdd);
+    this.bus.off("harmony:dev:unlockAll", this.onHarmonyDevUnlockAll);
+    this.bus.off("harmony:dev:toggleOwner", this.onHarmonyDevToggleOwner);
   }
 }

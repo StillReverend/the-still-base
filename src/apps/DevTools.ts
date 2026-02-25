@@ -270,6 +270,103 @@ export class DevTools {
     });
 
     // --------------------------------------------------------
+    // Harmony / Persistence — DEV unlock helpers
+    // --------------------------------------------------------
+    // H: Force-unlock Harmony UI for testing (persisted)
+    // Shift+H: Revert to normal user mode (persisted)
+    // L: Toggle owner (Lumen ↔ Director), persisted
+    this.register("h", {
+      label: "Harmony DEV Unlock (H on, Shift+H off) — persisted",
+      action: (e) => {
+        const enable = !e.shiftKey;
+
+        // 1) Persist intent (sticky across reloads)
+        this.bus.emit("dev:persistence:patch", {
+          reason: enable ? "dev:harmony:unlock-on" : "dev:harmony:unlock-off",
+          commit: true,
+          partial: {
+            owner: enable ? "director" : "lumen",
+            uiMode: "full",
+            capabilityOverrides: {
+              devUnlockAllHarmony: enable,
+            },
+          },
+        });
+
+        // 2) Apply LIVE Harmony policy immediately (so UI changes now)
+        if (enable) {
+          const unlockAll = {
+            presets: { dusk: true, void: true, clear: true },
+            ambients: { crickets: true, waves: true, wind: true, chimes: true },
+            particles: { rain: true, snow: true, dust: true, embers: true },
+            filters: { f1: true, f2: true, f3: true, f4: true },
+            colors: { c1: true, c2: true, c3: true, c4: true },
+          };
+
+          this.bus.emit("harmony:state:patch", {
+            owner: "director",
+            uiMode: "full",
+            capabilities: {
+              "playback.basic": true,
+              "playback.transport": true,
+              "playback.shuffle": true,
+              "playback.repeat": true,
+              "env.panel": true,
+              "env.colors": true,
+              "env.filters": true,
+              "env.particles": true,
+              "env.ambients": true,
+              "env.presets": true,
+              "mix.lanes": true,
+              "ui.hide": true,
+            },
+            // Harmless for director, but good for robustness/QA visuals.
+            unlocks: unlockAll,
+          });
+
+          // eslint-disable-next-line no-console
+          console.log("[Dev] Harmony dev unlock ON (persisted + live)");
+          return;
+        }
+
+        // Shift+H: we cannot "clear" unlock maps due to merge semantics,
+        // so we force-lock by disabling env capabilities (authoritative in UI).
+        this.bus.emit("harmony:state:patch", {
+          owner: "lumen",
+          uiMode: "full",
+          capabilities: {
+            // Keep the panel itself available, but lock its contents:
+            "env.panel": true,
+
+            "env.colors": false,
+            "env.filters": false,
+            "env.particles": false,
+            "env.ambients": false,
+            "env.presets": false,
+
+            // Optional: keep mixer + playback usable while testing
+            "playback.basic": true,
+            "playback.transport": true,
+            "playback.shuffle": true,
+            "playback.repeat": true,
+            "mix.lanes": true,
+            "ui.hide": true,
+          },
+        });
+
+        // eslint-disable-next-line no-console
+        console.log("[Dev] Harmony dev unlock OFF (persisted + live)");
+      },
+    });
+
+    this.register("l", {
+      label: "Toggle Owner (Lumen ↔ Director) — persisted",
+      action: () => {
+        this.bus.emit("dev:persistence:toggle-owner", { commit: true });
+      },
+    });
+
+    // --------------------------------------------------------
     // Audio (Phase 1 skeleton) — DEV hotkeys
     // --------------------------------------------------------
 

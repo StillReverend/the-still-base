@@ -195,6 +195,9 @@ export class HowlerAudioSystem {
     this.bus.on<HowlerUiSfxEnabledPayload>("howler:ui-sfx:set-enabled", this.onUiSfxSetEnabled);
     this.bus.on<HowlerUiSfxVolumePayload>("howler:ui-sfx:set-volume", this.onUiSfxSetVolume);
 
+    // ✅ Boot/state sync: HarmonySystem calls this on init
+    this.bus.on("howler:requestState", this.onRequestState);
+
     // Optional: listen for global Howler changes IF supported (guarded).
     const H = Howler as HowlerGlobalWithEvents;
 
@@ -216,6 +219,9 @@ export class HowlerAudioSystem {
         // If a given build throws, we simply skip global sync.
       }
     }
+
+    // ✅ Emit an initial snapshot so UI has truth immediately (especially if it mounts after this system)
+    this.emitState("howler:init");
   }
 
   update(_dt: number): void {
@@ -307,6 +313,9 @@ export class HowlerAudioSystem {
     this.bus.off("howler:ui-sfx:set-enabled", this.onUiSfxSetEnabled);
     this.bus.off("howler:ui-sfx:set-volume", this.onUiSfxSetVolume);
 
+    // ✅ Request state off
+    this.bus.off("howler:requestState", this.onRequestState);
+
     // Stop any active ambients first (so they don't keep playing if cached)
     for (const id of Array.from(this.ambientActive.keys())) this.stopAmbient(id);
     this.ambientDesired.clear();
@@ -332,6 +341,14 @@ export class HowlerAudioSystem {
     }
     this.howls.clear();
   }
+
+  // ---------------------------------------------------------------------------
+  // ✅ State request (boot sync)
+  // ---------------------------------------------------------------------------
+
+  private onRequestState = (_p?: { source?: string } | undefined): void => {
+    this.emitState("howler:requestState");
+  };
 
   // ---------------------------------------------------------------------------
   // Unlock

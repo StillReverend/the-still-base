@@ -4,6 +4,7 @@
 //  - Owns Harmony UI state
 //  - Talks only through EventBus (no AudioSystem imports)
 //  - Mirrors canonical environment snapshots from HarmonyEnvironmentSystem
+//  - Enforces Director vs Lumen capability + unlock gating (authoritative)
 // ============================================================
 
 import type { EventBus } from "../../core/EventBus";
@@ -15,6 +16,13 @@ import { getTrackMeta } from "./TrackCatalog";
 type AnyFn = (...args: any[]) => void;
 
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+
+const toNum = (v: unknown, fallback: number): number => {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const to01 = (v: unknown, fallback: number): number => clamp01(toNum(v, fallback));
 
 type AudioSnapshot = {
   playing: boolean;
@@ -71,12 +79,104 @@ const shallowBoolMapEquals = (a: Record<string, boolean>, b: Record<string, bool
   return true;
 };
 
+// ------------------------------------------------------------
+// Director vs Lumen policy + capability/unlock helpers
+// ------------------------------------------------------------
+
+type HarmonyUiMode = "cinematic" | "minimal" | "full";
+type HarmonyOwner = "director" | "lumen" | string;
+
+type HarmonyCapabilityKey =
+  | "playback.basic"
+  | "playback.transport"
+  | "playback.shuffle"
+  | "playback.repeat"
+  | "env.panel"
+  | "env.colors"
+  | "env.filters"
+  | "env.particles"
+  | "env.ambients"
+  | "env.presets"
+  | "mix.lanes"
+  | "ui.hide";
+
+type HarmonyCapabilitiesMap = Partial<Record<HarmonyCapabilityKey, boolean>>;
+
+type HarmonyUnlocksShape = Partial<{
+  colors: Record<string, boolean>;
+  filters: Record<string, boolean>;
+  particles: Record<string, boolean>;
+  ambients: Record<string, boolean>;
+  presets: Record<string, boolean>;
+}>;
+
+const readOwner = (state: HarmonyState): HarmonyOwner => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const o = (state as any)?.owner;
+  return typeof o === "string" && o.trim() ? o.trim() : "lumen";
+};
+
+const readUiMode = (state: HarmonyState): HarmonyUiMode => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = String((state as any)?.uiMode ?? "full").toLowerCase();
+  return m === "cinematic" || m === "minimal" || m === "full" ? (m as HarmonyUiMode) : "full";
+};
+
+const readCaps = (state: HarmonyState): HarmonyCapabilitiesMap => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c = (state as any)?.capabilities;
+  return c && typeof c === "object" ? (c as HarmonyCapabilitiesMap) : {};
+};
+
+const capEnabled = (caps: HarmonyCapabilitiesMap, key: HarmonyCapabilityKey, fallback = true): boolean => {
+  const v = caps[key];
+  return typeof v === "boolean" ? v : fallback;
+};
+
+const readUnlocks = (state: HarmonyState): HarmonyUnlocksShape => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const u = (state as any)?.unlocks;
+  return u && typeof u === "object" ? (u as HarmonyUnlocksShape) : {};
+};
+
+const isUnlocked = (owner: HarmonyOwner, unlocks: HarmonyUnlocksShape, kind: string, id: string): boolean => {
+  // Director path is authored; unlock gating is a lumen rule.
+  if (String(owner).toLowerCase() === "director") return true;
+
+  const map =
+    kind === "color"
+      ? unlocks.colors
+      : kind === "filter"
+        ? unlocks.filters
+        : kind === "particle"
+          ? unlocks.particles
+          : kind === "ambient"
+            ? unlocks.ambients
+            : kind === "preset"
+              ? unlocks.presets
+              : undefined;
+
+  // If unlock maps are missing, default permissive.
+  if (!map) return true;
+  return Boolean(map[id]);
+};
+
 const makeDefaultState = (): HarmonyState => {
   // Important: avoid sharing nested object references if defaults are reused.
   return {
     ...HARMONY_DEFAULT_STATE,
     particles: { ...(HARMONY_DEFAULT_STATE.particles ?? {}) },
     ambients: { ...(HARMONY_DEFAULT_STATE.ambients ?? {}) },
+    mix: { ...(HARMONY_DEFAULT_STATE.mix ?? { master: 1, music: 1, sfx: 1, ambient: 1, ui: 1 }) },
+    capabilities: { ...(HARMONY_DEFAULT_STATE.capabilities ?? {}) },
+    unlocks: {
+      ...(HARMONY_DEFAULT_STATE.unlocks ?? { colors: {}, filters: {}, particles: {}, ambients: {}, presets: {} }),
+      colors: { ...(HARMONY_DEFAULT_STATE.unlocks?.colors ?? {}) },
+      filters: { ...(HARMONY_DEFAULT_STATE.unlocks?.filters ?? {}) },
+      particles: { ...(HARMONY_DEFAULT_STATE.unlocks?.particles ?? {}) },
+      ambients: { ...(HARMONY_DEFAULT_STATE.unlocks?.ambients ?? {}) },
+      presets: { ...(HARMONY_DEFAULT_STATE.unlocks?.presets ?? {}) },
+    },
   };
 };
 
@@ -120,45 +220,129 @@ class HarmonySystem {
 
     this.ui = new HarmonyUI({
       onTogglePlay: () => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "playback.basic", true)) return;
+
         this.emit("audio:unlock-request", { source: "harmony-ui" });
         this.emit("audio:toggle-request", { source: "harmony" });
       },
 
       onSeek: (timeSec) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "playback.basic", true)) return;
+
         this.emit("audio:seek-request", { timeSec, source: "harmony" });
       },
 
       onPrevTrack: () => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "playback.transport", true)) return;
+
         this.emit("audio:unlock-request", { source: "harmony-ui" });
         this.emit("audio:cmd:prevTrack", { source: "harmony" });
       },
 
       onNextTrack: () => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "playback.transport", true)) return;
+
         this.emit("audio:unlock-request", { source: "harmony-ui" });
         this.emit("audio:cmd:nextTrack", { source: "harmony" });
       },
 
-      onToggleShuffle: () => this.setShuffle(!this.state.shuffle),
-      onCycleRepeat: () => this.cycleRepeat(),
+      onToggleShuffle: () => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "playback.shuffle", true)) return;
+        this.setShuffle(!this.state.shuffle);
+      },
+
+      onCycleRepeat: () => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "playback.repeat", true)) return;
+        this.cycleRepeat();
+      },
 
       // Legacy hook: still supported if any UI calls it, but Harmony lanes are canonical now.
       onSetVolume: (volume01) => this.setVolume(volume01),
 
-      onToggleEnvironmentPanel: () => this.toggleEnvironmentPanel(),
-      onSetUIVisible: (visible) => this.setUIVisible(visible),
+      onToggleEnvironmentPanel: () => {
+        const caps = readCaps(this.state);
+        const uiMode = readUiMode(this.state);
+        if (uiMode === "cinematic") return;
+        if (!capEnabled(caps, "env.panel", true)) return;
+        this.toggleEnvironmentPanel();
+      },
 
-      onToggleParticle: (id, enabled) => this.toggleParticle(id, enabled),
-      onToggleAmbient: (id, enabled) => this.toggleAmbient(id, enabled),
-      onSelectColor: (id) => this.selectColor(id),
-      onSelectFilter: (id) => this.selectFilter(id),
+      onSetUIVisible: (visible) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "ui.hide", true)) return;
+        this.setUIVisible(visible);
+      },
+
+      onToggleParticle: (id, enabled) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "env.particles", true)) return;
+
+        const owner = readOwner(this.state);
+        const unlocks = readUnlocks(this.state);
+        if (!isUnlocked(owner, unlocks, "particle", String(id))) return;
+
+        this.toggleParticle(String(id), enabled);
+      },
+
+      onToggleAmbient: (id, enabled) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "env.ambients", true)) return;
+
+        const owner = readOwner(this.state);
+        const unlocks = readUnlocks(this.state);
+        if (!isUnlocked(owner, unlocks, "ambient", String(id))) return;
+
+        this.toggleAmbient(String(id), enabled);
+      },
+
+      onSelectColor: (id) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "env.colors", true)) return;
+
+        const owner = readOwner(this.state);
+        const unlocks = readUnlocks(this.state);
+        if (!isUnlocked(owner, unlocks, "color", String(id))) return;
+
+        this.selectColor(String(id));
+      },
+
+      onSelectFilter: (id) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "env.filters", true)) return;
+
+        const owner = readOwner(this.state);
+        const unlocks = readUnlocks(this.state);
+        if (!isUnlocked(owner, unlocks, "filter", String(id))) return;
+
+        this.selectFilter(String(id));
+      },
 
       // ✅ Presets: emit intent only; HarmonyPresetsSystem handles apply
-      onApplyPreset: (presetId) => this.applyPreset(presetId),
+      onApplyPreset: (presetId) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "env.presets", true)) return;
+
+        const owner = readOwner(this.state);
+        const unlocks = readUnlocks(this.state);
+        if (!isUnlocked(owner, unlocks, "preset", String(presetId))) return;
+
+        this.applyPreset(String(presetId));
+      },
 
       onSetRitualDuration: (durationSec) => this.setRitualDuration(durationSec),
 
       // ✅ Howler lane sliders (Phase 1.5)
-      onSetHowlerLane: (lane, volume01) => this.setHowlerLane(lane, volume01),
+      onSetHowlerLane: (lane, volume01) => {
+        const caps = readCaps(this.state);
+        if (!capEnabled(caps, "mix.lanes", true)) return;
+        this.setHowlerLane(lane, volume01);
+      },
 
       // ✅ UI SFX hooks (canonical)
       onUiHover: () => this.emitUiHover(),
@@ -182,11 +366,16 @@ class HarmonySystem {
     this.on("harmony:environmentPanel:setOpen", (p: { open: boolean }) => this.setEnvironmentPanelOpen(Boolean(p?.open)));
     this.on("harmony:environmentPanel:toggle", () => this.toggleEnvironmentPanel());
 
+    // ✅ Policy patches (Director/Lumen control surface)
+    this.on("harmony:ui:policy", (p: any) => this.applyPolicyPatch(p));
+    this.on("harmony:policy:set", (p: any) => this.applyPolicyPatch(p));
+    this.on("harmony:state:patch", (p: any) => this.applyPolicyPatch(p));
+
     // ✅ Canonical environment state mirroring (boot restore, presets, etc.)
     this.on("harmony:environment:state", (p: unknown) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
     this.on("harmony:environment:changed", (p: unknown) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
 
-    // ✅ Boot-sync handshake (covers “late subscriber” cases)
+    // ✅ Boot-sync handshake (covers late subscriber cases)
     // EnvironmentSystem may have emitted "boot" before Harmony UI subscribed.
     this.emit("harmony:environment:requestState", { source: "harmony-ui" });
 
@@ -237,6 +426,40 @@ class HarmonySystem {
   }
 
   // ------------------------------------------------------------
+  // Policy patching (Director vs Lumen control surface)
+  // ------------------------------------------------------------
+
+  private applyPolicyPatch(patch: any): void {
+    if (!patch || typeof patch !== "object") return;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const s: any = this.state as any;
+
+    if (typeof patch.owner === "string") s.owner = patch.owner;
+    if (typeof patch.uiMode === "string") s.uiMode = patch.uiMode;
+
+    if (patch.capabilities && typeof patch.capabilities === "object") {
+      s.capabilities = { ...(s.capabilities ?? {}), ...patch.capabilities };
+    }
+
+    if (patch.unlocks && typeof patch.unlocks === "object") {
+      const prev = (s.unlocks ?? {}) as HarmonyUnlocksShape;
+      const next = patch.unlocks as HarmonyUnlocksShape;
+
+      s.unlocks = {
+        ...prev,
+        colors: { ...(prev.colors ?? {}), ...(next.colors ?? {}) },
+        filters: { ...(prev.filters ?? {}), ...(next.filters ?? {}) },
+        particles: { ...(prev.particles ?? {}), ...(next.particles ?? {}) },
+        ambients: { ...(prev.ambients ?? {}), ...(next.ambients ?? {}) },
+        presets: { ...(prev.presets ?? {}), ...(next.presets ?? {}) },
+      };
+    }
+
+    this.requestRender();
+  }
+
+  // ------------------------------------------------------------
   // Presets (intent only)
   // ------------------------------------------------------------
 
@@ -253,8 +476,8 @@ class HarmonySystem {
   private onEnvironmentState(payload: HarmonyEnvironmentStateEvent): void {
     const env = payload?.environment ?? payload?.state ?? {};
 
-    const colorId = safeString(env.colorId ?? payload?.colorId, safeString((this.state as any).colorId, "c1"));
-    const filterId = safeString(env.filterId ?? payload?.filterId, safeString((this.state as any).filterId, "f1"));
+    const colorId = safeString(env.colorId ?? payload?.colorId, safeString(this.state.colorId, "c1"));
+    const filterId = safeString(env.filterId ?? payload?.filterId, safeString(this.state.filterId, "f1"));
 
     const particles = safeBoolMap(env.particles ?? payload?.particles);
     const ambients = safeBoolMap(env.ambients ?? payload?.ambients);
@@ -296,7 +519,7 @@ class HarmonySystem {
 
     const shuffle = Boolean(s.shuffle);
     const repeat: RepeatMode = isRepeatMode(s.repeat) ? s.repeat : "off";
-    const volume = clamp01(Number.isFinite(s.volume) ? Number(s.volume) : this.state.volume);
+    const volume = to01(s.volume, this.state.volume);
 
     // Title from TrackCatalog
     let title = "";
@@ -331,9 +554,9 @@ class HarmonySystem {
     this.state.repeat = repeat;
 
     // NOTE:
-    // AudioSystem reports its *current* volume. We mirror that as `state.volume`
-    // so any legacy UI reads stay correct. The Harmony mix lanes are still the
-    // authoritative controls, and we push desired volume via applyMusicMixToAudio().
+    // AudioSystem reports its current volume. We mirror that as state.volume
+    // so any legacy UI reads stay correct. Harmony mix lanes remain authoritative,
+    // and we push desired volume via applyMusicMixToAudio().
     this.state.volume = volume;
 
     this.requestRender();
@@ -348,16 +571,16 @@ class HarmonySystem {
     // We always accept these lanes from Howler (Howler owns them).
     const next = {
       ...cur,
-      sfx: clamp01(Number((s as any).sfx ?? cur.sfx)),
-      ambient: clamp01(Number((s as any).ambient ?? cur.ambient)),
-      ui: clamp01(Number((s as any).ui ?? cur.ui)),
+      sfx: to01((s as any).sfx, cur.sfx),
+      ambient: to01((s as any).ambient, cur.ambient),
+      ui: to01((s as any).ui, cur.ui),
     };
 
     // Boot sync: allow Howler to initialize master/music ONCE (first state payload),
     // but after that, Harmony is canonical for master/music to prevent coupling.
     if (!this.howlerMixBootSynced) {
-      next.master = clamp01(Number((s as any).master ?? cur.master));
-      next.music = clamp01(Number((s as any).music ?? cur.music));
+      next.master = to01((s as any).master, cur.master);
+      next.music = to01((s as any).music, cur.music);
       this.howlerMixBootSynced = true;
     }
 
@@ -393,13 +616,13 @@ class HarmonySystem {
   }
 
   // ------------------------------------------------------------
-  // Mix policy: Harmony lanes must control *everything*
+  // Mix policy: Harmony lanes must control everything
   // ------------------------------------------------------------
 
   private getMusicMixTarget(): number {
     const mix = this.state.mix ?? HARMONY_DEFAULT_STATE.mix;
-    const master = clamp01(Number.isFinite(mix.master) ? mix.master : 1);
-    const music = clamp01(Number.isFinite(mix.music) ? mix.music : 1);
+    const master = to01(mix.master, 1);
+    const music = to01(mix.music, 1);
     return clamp01(master * music);
   }
 
@@ -427,10 +650,12 @@ class HarmonySystem {
         if (this.lastMusicMixSent != null && Math.abs(this.lastMusicMixSent - v) < 0.0005) return;
         this.lastMusicMixSent = v;
 
-        // Push to AudioSystem
-        this.emit("audio:set-volume", { volume: v, source: "harmony-mix", reason });
+        // Push to AudioSystem (compat: emit both legacy + request names, and both key shapes)
+        const payload = { volume: v, volume01: v, value01: v, source: "harmony-mix", reason };
+        this.emit("audio:set-volume", payload);
+        this.emit("audio:set-volume-request", payload);
 
-        // Mirror immediately so UI (if any) stays responsive even before next audio:state
+        // Mirror immediately so UI stays responsive even before next audio:state
         this.state.volume = v;
         this.requestRender();
       });
@@ -444,7 +669,7 @@ class HarmonySystem {
   private setUIVisible(visible: boolean): void {
     this.state.uiVisible = visible;
 
-    // Nice UX: if you hide the UI, also close the panel so it doesn't "stick" open on show.
+    // Nice UX: if you hide the UI, also close the panel so it doesn't stick open on show.
     if (!visible && this.state.environmentPanelOpen) {
       this.state.environmentPanelOpen = false;
     }
@@ -476,36 +701,35 @@ class HarmonySystem {
   }
 
   /**
-   * Legacy setter: keep for compatibility (and for any future “single volume” UI),
-   * but treat Harmony lanes as canonical.
+   * Legacy setter: keep for compatibility, but treat Harmony lanes as canonical.
    *
    * This sets BOTH master & music to approximate the requested single volume,
    * without stomping other lanes (sfx/ambient/ui).
    */
   private setVolume(volume01: number): void {
-    const v = clamp01(Number.isFinite(volume01) ? volume01 : this.state.volume);
+    const v = to01(volume01, this.state.volume);
 
     // Map a single volume request into the master lane (and keep music at 1).
-    // This keeps behavior intuitive if anything still uses onSetVolume.
     this.state.mix = { ...(this.state.mix ?? HARMONY_DEFAULT_STATE.mix), master: v, music: 1.0 };
 
-    // Tell HowlerAudioSystem (master lane)
-    this.emit("howler:volume:set", { bus: "master", value01: v, source: "harmony" });
+    // Tell HowlerAudioSystem (compat: include both value01 + volume01)
+    this.emit("howler:volume:set", { bus: "master", value01: v, volume01: v, source: "harmony" });
 
-    // Tell AudioSystem (master*music)
+    // Tell AudioSystem (master*music) (compat events handled inside applyMusicMixToAudio)
     this.applyMusicMixToAudio("setVolume");
 
     this.requestRender();
   }
 
   private setHowlerLane(lane: "master" | "music" | "sfx" | "ambient" | "ui", volume01: number): void {
-    const v = clamp01(Number.isFinite(volume01) ? volume01 : (this.state.mix?.[lane] ?? 1.0));
+    const cur = this.state.mix ?? HARMONY_DEFAULT_STATE.mix;
+    const v = to01(volume01, to01(cur?.[lane], 1.0));
 
     // Update Harmony UI state immediately (so sliders feel responsive)
     this.state.mix = { ...(this.state.mix ?? HARMONY_DEFAULT_STATE.mix), [lane]: v };
 
-    // Tell HowlerAudioSystem
-    this.emit("howler:volume:set", { bus: lane, value01: v, source: "harmony" });
+    // Tell HowlerAudioSystem (compat: include both value01 + volume01)
+    this.emit("howler:volume:set", { bus: lane, value01: v, volume01: v, source: "harmony" });
 
     // ✅ Also ensure AudioSystem obeys Master+Music lanes.
     if (lane === "master" || lane === "music") {
@@ -517,30 +741,42 @@ class HarmonySystem {
 
   private selectColor(colorId: string): void {
     this.state.colorId = colorId;
-    // ✅ align with HarmonyEnvironmentSystem event names
+
+    // Emit both the "canonical" name and a compatibility alias so we don't get stuck on naming mismatches.
     this.emit("harmony:environment:selectColor", { colorId });
+    this.emit("harmony:env:selectColor", { colorId });
+
     this.requestRender();
   }
 
   private selectFilter(filterId: string): void {
     this.state.filterId = filterId;
-    // ✅ align with HarmonyEnvironmentSystem event names
+
+    // Emit both canonical + alias
     this.emit("harmony:environment:selectFilter", { filterId });
+    this.emit("harmony:env:selectFilter", { filterId });
+
     this.requestRender();
   }
 
   private toggleParticle(particleId: string, enabled: boolean): void {
     // Avoid in-place mutation in case state is ever frozen/serialized differently.
     this.state.particles = { ...(this.state.particles ?? {}), [particleId]: enabled };
-    // ✅ align with HarmonyEnvironmentSystem event names
+
+    // Emit both canonical + alias
     this.emit("harmony:environment:toggleParticle", { particleId, enabled });
+    this.emit("harmony:env:toggleParticle", { particleId, enabled });
+
     this.requestRender();
   }
 
   private toggleAmbient(ambientId: string, enabled: boolean): void {
     this.state.ambients = { ...(this.state.ambients ?? {}), [ambientId]: enabled };
-    // ✅ align with HarmonyEnvironmentSystem event names
+
+    // Emit both canonical + alias
     this.emit("harmony:environment:toggleAmbient", { ambientId, enabled });
+    this.emit("harmony:env:toggleAmbient", { ambientId, enabled });
+
     this.requestRender();
   }
 
