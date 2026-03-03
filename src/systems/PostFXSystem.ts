@@ -23,6 +23,14 @@
 //  - setHarmonyEnvironment({ filterId, colorId }) for HarmonyEnvironmentSystem
 //  - filterId maps to PostFX profiles (colorId stored for future tinting)
 //  - NEW: colorId now drives a subtle final color tint pass (real visual win)
+//
+// Patch (Mar 2026):
+//  - Add Harmony filter profile: "lumen" (for new Lumen filter group)
+//
+// Patch (Mar 2026 - Lumen Levels):
+//  - Support 4 Lumen bloom buttons via profiles:
+//      lumen1, lumen2, lumen3, lumen4
+//  - Map filterId: f5..f8 OR lumen1..4 OR l1..4
 // ============================================================
 
 import * as THREE from "three";
@@ -48,6 +56,11 @@ export type PostFXProfileName =
   | "luna"
   | "moon"
   | "sol"
+  | "lumen"
+  | "lumen1"
+  | "lumen2"
+  | "lumen3"
+  | "lumen4"
   | "off"
   | string;
 
@@ -187,16 +200,49 @@ const deepMergeSettings = (base: PostFXSettings, patch?: Partial<PostFXSettings>
 
 // Harmony filter mapping
 const mapHarmonyFilterToProfile = (filterId: string): PostFXProfileName => {
-  switch (String(filterId || "").toLowerCase()) {
+  const id = String(filterId || "").toLowerCase().trim();
+
+  switch (id) {
     case "f2":
       return "blackHole";
     case "f3":
       return "sol";
     case "f4":
       return "luna";
+
+    // ----------------------------------------------------------
+    // ✅ Lumen bloom levels (4 buttons)
+    // Accept multiple naming schemes so UI can evolve safely:
+    //  - f5..f8
+    //  - lumen1..lumen4
+    //  - l1..l4
+    //  - "lumen" maps to the middle-ish default (lumen2)
+    // ----------------------------------------------------------
+    case "f5":
+    case "l1":
+    case "lumen1":
+      return "lumen1";
+
+    case "f6":
+    case "l2":
+    case "lumen":
+    case "lumen2":
+      return "lumen2";
+
+    case "f7":
+    case "l3":
+    case "lumen3":
+      return "lumen3";
+
+    case "f8":
+    case "l4":
+    case "lumen4":
+      return "lumen4";
+
     case "f0":
     case "off":
       return "off";
+
     case "f1":
     default:
       return "default";
@@ -204,34 +250,53 @@ const mapHarmonyFilterToProfile = (filterId: string): PostFXProfileName => {
 };
 
 // Harmony color mapping (subtle, non-cheesy)
-// Returned amount is a *base* tint intensity; filterId can bias it.
 const mapHarmonyColorToTint = (colorId: string): { tint: THREE.Color; amount: number } => {
   switch (String(colorId || "").toLowerCase()) {
-    // c1: warm "lantern" gold (baseline)
     case "c1":
     default:
       return { tint: new THREE.Color(0xffe4b5), amount: 0.10 }; // warm wheat
-    // c2: cool cyan-blue
     case "c2":
       return { tint: new THREE.Color(0xa7d8ff), amount: 0.10 };
-    // c3: violet-magenta
     case "c3":
       return { tint: new THREE.Color(0xd3a7ff), amount: 0.10 };
-    // c4: ember red-orange
     case "c4":
       return { tint: new THREE.Color(0xffb08a), amount: 0.10 };
   }
 };
 
-// Slight filter bias for the tint amount (so presets feel distinct even pre-particles)
 const mapFilterToTintBias = (filterId: string): number => {
-  switch (String(filterId || "").toLowerCase()) {
-    case "f2": // blackHole
+  const id = String(filterId || "").toLowerCase().trim();
+
+  switch (id) {
+    case "f2":
       return 0.06;
-    case "f3": // sol
+    case "f3":
       return 0.12;
-    case "f4": // luna
+    case "f4":
       return 0.08;
+
+    // ✅ Lumen family: a touch more "alive", still tasteful
+    case "f5":
+    case "l1":
+    case "lumen1":
+      return 0.09;
+
+    case "f6":
+    case "l2":
+    case "lumen":
+    case "lumen2":
+      return 0.10;
+
+    case "f7":
+    case "l3":
+    case "lumen3":
+      return 0.11;
+
+    case "f8":
+    case "l4":
+    case "lumen4":
+      return 0.12;
+
     case "f1":
     default:
       return 0.08;
@@ -246,7 +311,7 @@ const DEFAULT_SETTINGS: PostFXSettings = {
   enabled: true,
   bloom: {
     enabled: true,
-    strength: 1.0,
+    strength: 0.5,
     radius: 1.0,
     threshold: 0,
   },
@@ -263,7 +328,6 @@ const DEFAULT_SETTINGS: PostFXSettings = {
 };
 
 const DEFAULT_PROFILES: PostFXProfile[] = [
-  // ✅ PATCH: Ensure "default" exists so Harmony can reliably revert to baseline.
   {
     name: "default",
     enabled: true,
@@ -279,6 +343,17 @@ const DEFAULT_PROFILES: PostFXProfile[] = [
   { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.5, radius: 0.3, threshold: 0.01 } },
   { name: "sol", enabled: true, bloom: { enabled: true, strength: 5.0, radius: 0.9, threshold: 0.01 } },
   { name: "luna", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.5, threshold: 0.01 } },
+
+  // ✅ Lumen bloom levels (4 buttons)
+  // Intent: increasingly "alive" without becoming Sol-level nuclear.
+  { name: "lumen1", enabled: true, bloom: { enabled: true, strength: 0.85, radius: 0.52, threshold: 0.01 } },
+  { name: "lumen2", enabled: true, bloom: { enabled: true, strength: 1.15, radius: 0.65, threshold: 0.01 } },
+  { name: "lumen3", enabled: true, bloom: { enabled: true, strength: 1.75, radius: 0.78, threshold: 0.01 } },
+  { name: "lumen4", enabled: true, bloom: { enabled: true, strength: 2.45, radius: 0.92, threshold: 0.005 } },
+
+  // Back-compat: if anything calls "lumen" as a profile directly
+  { name: "lumen", enabled: true, bloom: { enabled: true, strength: 1.15, radius: 0.65, threshold: 0.01 } },
+
   { name: "void", enabled: true, bloom: { enabled: true, strength: 0.0, radius: 0.1, threshold: 0.01 } },
 ];
 
@@ -293,7 +368,6 @@ export class PostFXSystem {
   private renderPass: RenderPass;
   private bloomPass: UnrealBloomPass;
 
-  // ✅ NEW: Harmony tint pass (final grade)
   private harmonyTintPass: ShaderPass;
 
   private outputPass: OutputPass;
@@ -321,36 +395,22 @@ export class PostFXSystem {
   private framesToStabilize = 0;
   private primeRendersRemaining = 0;
 
-  // Opaque baseline (black)
   private readonly opaqueClearColor = new THREE.Color(0x000000);
 
-  // ------------------------------------------------------------
-  // Harmony environment (stored for future tinting / palette work)
-  // ------------------------------------------------------------
   private harmonyColorId = "c1";
   private harmonyFilterId = "f1";
 
-  // ------------------------------------------------------------
-  // Audio-driven bloom (impact-first) + scripted inputs
-  // ------------------------------------------------------------
-  private audioEnergyCurrent = 0; // smoothed 0..1
-  private audioEnergyTarget = 0; // last input 0..1
+  private audioEnergyCurrent = 0;
+  private audioEnergyTarget = 0;
 
-  // Telemetry proof: did we actually receive any audio events?
   private audioEnergyRxCount = 0;
   private audioEnergyLastRxMs = -1;
 
-  // Impulse for gongs / scripted hits
-  private impulseCurrent = 0; // smoothed current
-  private impulseTarget = 0; // raw target accumulator (decays toward 0)
+  private impulseCurrent = 0;
+  private impulseTarget = 0;
 
-  // Ritual ramp (0..1)
   private ritualChargeCurrent = 0;
   private ritualChargeTarget = 0;
-
-  // ------------------------------------------------------------
-  // Core bloom behavior (strength + radius are driven by intensity)
-  // ------------------------------------------------------------
 
   private quietStrength = 0.4;
   private quietRadius = 0.1;
@@ -361,22 +421,11 @@ export class PostFXSystem {
   private swellToMaxStrength01 = 1.0;
   private swellToMaxRadius01 = 1.0;
 
-  // ------------------------------------------------------------
-  // New explicit knobs (requested)
-  // ------------------------------------------------------------
-
   private quietEnergyCutoff = 0.001;
-  private minBloomWhenPlaying01 = 0.31;
+  private minBloomWhenPlaying01 = 0.0;
 
-  // ------------------------------------------------------------
-  // Scripted contributors (strength lane)
-  // ------------------------------------------------------------
   private impulseGain = 1.35;
   private ritualGain = 1.85;
-
-  // ------------------------------------------------------------
-  // DEBUG: Max Bloom Mode + telemetry
-  // ------------------------------------------------------------
 
   private debugMaxBloomEnabled = false;
 
@@ -469,12 +518,11 @@ export class PostFXSystem {
     );
     this.bloomPass.enabled = true;
 
-    // ✅ NEW: simple final color tint pass (subtle grade)
     this.harmonyTintPass = new ShaderPass({
       uniforms: {
         tDiffuse: { value: null },
         uTint: { value: new THREE.Vector3(1, 1, 1) },
-        uAmount: { value: 0.0 }, // 0..~0.25 recommended
+        uAmount: { value: 0.0 },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -491,11 +539,8 @@ export class PostFXSystem {
 
         void main() {
           vec4 col = texture2D(tDiffuse, vUv);
-
-          // Soft "grade": blend toward tinted version, preserving luminance-ish feel.
           vec3 tinted = col.rgb * uTint;
           col.rgb = mix(col.rgb, tinted, clamp(uAmount, 0.0, 1.0));
-
           gl_FragColor = col;
         }
       `,
@@ -518,7 +563,6 @@ export class PostFXSystem {
     this.bloomRadiusTarget = this.bloomRadiusCurrent;
     this.bloomPass.radius = this.bloomRadiusCurrent;
 
-    // Start with a sane tint baseline (c1, f1)
     this.applyHarmonyTint(this.harmonyColorId, this.harmonyFilterId);
 
     this.resize(this.width, this.height, this.pixelRatio);
@@ -537,7 +581,6 @@ export class PostFXSystem {
     this.harmonyFilterId = filterId;
     this.harmonyColorId = colorId;
 
-    // ✅ Apply tint immediately regardless of profile choice
     this.applyHarmonyTint(this.harmonyColorId, this.harmonyFilterId);
 
     if (nextProfile === "off") {
@@ -1012,7 +1055,6 @@ export class PostFXSystem {
       this.bus = null;
     }
 
-    // Dispose tint material if present
     const anyTint = this.harmonyTintPass as unknown as { material?: { dispose?: () => void } };
     if (anyTint.material && typeof anyTint.material.dispose === "function") {
       anyTint.material.dispose();
@@ -1030,14 +1072,22 @@ export class PostFXSystem {
     const { tint, amount } = mapHarmonyColorToTint(colorId);
     const bias = mapFilterToTintBias(filterId);
 
-    const amt = clamp(amount + bias * 0.5, 0, 0.22); // keep it tasteful
+    const amt = clamp(amount + bias * 0.5, 0, 0.22);
+
+    const avg = Math.max(1e-6, (tint.r + tint.g + tint.b) / 3);
+    let scale = 1 / avg;
+    scale = clamp(scale, 0.85, 1.25);
+
+    const tr = clamp(tint.r * scale, 0, 2);
+    const tg = clamp(tint.g * scale, 0, 2);
+    const tb = clamp(tint.b * scale, 0, 2);
 
     const u = this.harmonyTintPass.uniforms as unknown as {
       uTint: { value: THREE.Vector3 };
       uAmount: { value: number };
     };
 
-    u.uTint.value.set(tint.r, tint.g, tint.b);
+    u.uTint.value.set(tr, tg, tb);
     u.uAmount.value = amt;
   }
 

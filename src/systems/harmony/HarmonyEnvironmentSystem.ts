@@ -1,7 +1,7 @@
 // src/systems/harmony/HarmonyEnvironmentSystem.ts
 // ============================================================
 // THE STILL — HarmonyEnvironmentSystem
-//  - Canonical Environment options (color/filter/particles/ambients)
+//  - Canonical Environment options (filter/particles/ambients)   ✅ MVP
 //  - Persists via PersistenceSystem
 //  - Applies world effects (PostFX now, ParticleFX later)
 //  - Broadcasts canonical state snapshots for HarmonySystem/UI
@@ -9,6 +9,14 @@
 // Notes (Feb 2026):
 //  - "Presets" should OVERWRITE the full environment state (A).
 //  - HarmonySystem/HarmonyUI emit intent via EventBus only.
+//  - Particles are a RADIO GROUP: one active global particle mode at a time.
+//
+// MVP (Mar 2026):
+//  - REMOVE: Colors plumbing
+//    - No selectColor listener
+//    - No colorId flattened in emitted payloads
+//    - We still tolerate/retain colorId in persisted state for backwards compat,
+//      but Harmony no longer drives it.
 // ============================================================
 
 import type { EventBus } from "../../core/EventBus";
@@ -25,13 +33,12 @@ export interface HarmonyEnvironmentSystemDeps {
 
 type HarmonyEnvironmentStateEvent = {
   // Provide multiple aliases so consumers can pick what they want:
-  // - HarmonySystem can read .state or flattened fields
+  // - HarmonySystem reads .state/.environment or flattened fields
   // - Legacy/debug tools may read .environment
   state: HarmonyEnvironmentState;
   environment: HarmonyEnvironmentState;
 
   // Flat fields (extra convenient)
-  colorId: string;
   filterId: string;
   particles: Record<string, boolean>;
   ambients: Record<string, boolean>;
@@ -39,7 +46,11 @@ type HarmonyEnvironmentStateEvent = {
   reason: string;
 };
 
+// NOTE: Persistence may still carry colorId in HarmonyEnvironmentState.
+// MVP: we keep a default for normalization/back-compat, but we do not expose
+// color as a first-class Harmony-driven control surface anymore.
 const DEFAULT_ENV: HarmonyEnvironmentState = {
+  // @ts-expect-error - if HarmonyEnvironmentState no longer includes colorId, this is harmless.
   colorId: "c1",
   filterId: "f1",
   particles: {},
@@ -59,14 +70,110 @@ const safeRecordBool = (v: unknown): Record<string, boolean> => {
   return out;
 };
 
+// ------------------------------------------------------------
+// ✅ Particle radio-group enforcement (global: one active at a time)
+// ------------------------------------------------------------
+
+const KNOWN_PARTICLE_IDS = ["embers", "dust", "rain", "snow", "fireflies", "leaves"] as const;
+type KnownParticleId = (typeof KNOWN_PARTICLE_IDS)[number];
+
+// Priority order when multiple are true (e.g., preset mistakes).
+// You can reorder this later to match your “vibe ladder”.
+const PARTICLE_PRIORITY: ReadonlyArray<string> = [...KNOWN_PARTICLE_IDS];
+
+/**
+ * Returns a copy of the particles map with at most ONE true value.
+ * Deterministic selection:
+ *  1) first true in PARTICLE_PRIORITY
+ *  2) else first true among other keys (sorted)
+ *  3) else all false
+ */
+const enforceSingleParticleActive = (particlesIn: Record<string, boolean>): Record<string, boolean> => {
+  const particles = { ...(particlesIn ?? {}) };
+
+  // Find winner (priority first)
+  let winner: string | null = null;
+
+  for (const k of PARTICLE_PRIORITY) {
+    if (particles[k] === true) {
+      winner = k;
+      break;
+    }
+  }
+
+  if (!winner) {
+    const otherTrueKeys = Object.keys(particles)
+      .filter((k) => particles[k] === true && !PARTICLE_PRIORITY.includes(k))
+      .sort();
+    winner = otherTrueKeys.length ? otherTrueKeys[0] : null;
+  }
+
+  // If no winner, clear everything to false (but keep keys for UI stability)
+  if (!winner) {
+    const out: Record<string, boolean> = {};
+    for (const k of Object.keys(particles)) out[k] = false;
+    // Also include known keys so UI always sees them
+    for (const k of KNOWN_PARTICLE_IDS) out[k] = false;
+    return out;
+  }
+
+  // Winner exists: set winner true, all others false (including known keys)
+  const out: Record<string, boolean> = {};
+  const keys = new Set<string>([...Object.keys(particles), ...KNOWN_PARTICLE_IDS]);
+  for (const k of keys) out[k] = k === winner;
+  return out;
+};
+
+/**
+ * Toggle behavior for radio group:
+ * - enabled=true: winner becomes id, all others false
+ * - enabled=false: id becomes false, all others false too (since only one can be active)
+ */
+const applyParticleToggleRadio = (prev: Record<string, boolean>, id: string, enabled: boolean): Record<string, boolean> => {
+  const base: Record<string, boolean> = { ...(prev ?? {}) };
+
+  if (enabled) {
+    // Set id true, everything else false
+    const out: Record<string, boolean> = {};
+    const keys = new Set<string>([...Object.keys(base), ...KNOWN_PARTICLE_IDS, id]);
+    for (const k of keys) out[k] = k === id;
+    return out;
+  }
+
+  // enabled=false: clear all (since only one state allowed)
+  const out: Record<string, boolean> = {};
+  const keys = new Set<string>([...Object.keys(base), ...KNOWN_PARTICLE_IDS, id]);
+  for (const k of keys) out[k] = false;
+  return out;
+};
+
+// ------------------------------------------------------------
+
 const normalizeEnv = (raw: unknown): HarmonyEnvironmentState => {
   const r = (raw ?? {}) as Partial<HarmonyEnvironmentState>;
-  return {
-    colorId: safeString(r.colorId, DEFAULT_ENV.colorId),
-    filterId: safeString(r.filterId, DEFAULT_ENV.filterId),
-    particles: safeRecordBool(r.particles),
-    ambients: safeRecordBool(r.ambients),
+  const particles = safeRecordBool(r.particles);
+  const ambients = safeRecordBool(r.ambients);
+
+  // ✅ Normalize particles into a single-active radio group state.
+  const particlesSingle = enforceSingleParticleActive(particles);
+
+  // Keep filter/particles/ambients canonical for MVP.
+  // Retain colorId in the returned object if the persistence type carries it,
+  // but Harmony is no longer responsible for changing it.
+  const base: any = {
+    filterId: safeString((r as any).filterId, (DEFAULT_ENV as any).filterId),
+    particles: particlesSingle,
+    ambients,
   };
+
+  // If a colorId exists in persistence shape, preserve it; else ignore.
+  if (typeof (r as any).colorId === "string" && (r as any).colorId.trim()) {
+    base.colorId = (r as any).colorId.trim();
+  } else if (typeof (DEFAULT_ENV as any).colorId === "string") {
+    base.colorId = (DEFAULT_ENV as any).colorId;
+  }
+
+  return base as HarmonyEnvironmentState;
 };
 
 // Payload accepted for full overwrite apply.
@@ -118,23 +225,21 @@ export class HarmonyEnvironmentSystem {
     });
 
     // Listen to Harmony intent events (canonical names)
-    this.on("harmony:environment:selectColor", (p: { colorId: string }) => {
-      const colorId = safeString(p?.colorId, DEFAULT_ENV.colorId);
-      this.set({ colorId }, "harmonyEnvironment:selectColor");
-    });
+    // ✅ MVP: NO color selection listener anymore.
 
     this.on("harmony:environment:selectFilter", (p: { filterId: string }) => {
-      const filterId = safeString(p?.filterId, DEFAULT_ENV.filterId);
+      const filterId = safeString(p?.filterId, (DEFAULT_ENV as any).filterId ?? "f1");
       this.set({ filterId }, "harmonyEnvironment:selectFilter");
     });
 
+    // ✅ Particles are a radio group (one active global mode)
     this.on("harmony:environment:toggleParticle", (p: { particleId: string; enabled: boolean }) => {
       const id = safeString(p?.particleId, "");
       if (!id) return;
 
       const prev = this.readPersisted();
-      const particles = { ...prev.particles, [id]: safeBool(p?.enabled) };
 
+      const particles = applyParticleToggleRadio(prev.particles ?? {}, id, safeBool(p?.enabled));
       this.set({ particles }, "harmonyEnvironment:toggleParticle");
     });
 
@@ -218,6 +323,11 @@ export class HarmonyEnvironmentSystem {
   }
 
   private set(partial: Partial<HarmonyEnvironmentState>, reason: string): void {
+    // ✅ Safety: if particles are present, enforce radio group even for partial writes.
+    if (partial.particles) {
+      partial = { ...partial, particles: enforceSingleParticleActive(partial.particles) };
+    }
+
     this.writePersisted(partial, reason);
 
     const next = this.readPersisted();
@@ -234,10 +344,9 @@ export class HarmonyEnvironmentSystem {
     const payload: HarmonyEnvironmentStateEvent = {
       state: environment,
       environment,
-      colorId: environment.colorId,
-      filterId: environment.filterId,
-      particles: environment.particles,
-      ambients: environment.ambients,
+      filterId: (environment as any).filterId,
+      particles: (environment as any).particles,
+      ambients: (environment as any).ambients,
       reason,
     };
 
@@ -248,10 +357,9 @@ export class HarmonyEnvironmentSystem {
     const payload: HarmonyEnvironmentStateEvent = {
       state: environment,
       environment,
-      colorId: environment.colorId,
-      filterId: environment.filterId,
-      particles: environment.particles,
-      ambients: environment.ambients,
+      filterId: (environment as any).filterId,
+      particles: (environment as any).particles,
+      ambients: (environment as any).ambients,
       reason,
     };
 
@@ -259,10 +367,13 @@ export class HarmonyEnvironmentSystem {
   }
 
   private apply(environment: HarmonyEnvironmentState): void {
-    // PostFX gets filter + color now (visible win).
+    // MVP: Harmony drives FILTERS only.
+    // We still *tolerate* a colorId in the persisted shape for backwards compat,
+    // but Harmony is no longer responsible for controlling it.
     this.postFX.setHarmonyEnvironment({
-      filterId: environment.filterId,
-      colorId: environment.colorId,
+      filterId: (environment as any).filterId,
+      // Keep colorId stable if PostFX expects it; otherwise this is ignored.
+      colorId: (environment as any).colorId ?? (DEFAULT_ENV as any).colorId ?? "c1",
     });
 
     // ParticleFX + Ambient listen via bus snapshots.

@@ -11,6 +11,11 @@
 // Notes:
 //  - Additive system: does NOT modify existing SaveManager typings.
 //  - Other systems should treat PersistenceSystem as the single source of truth.
+//
+// MVP (Mar 2026):
+//  - Harmony unlocks: KEEP filters/particles/ambients/presets
+//  - REMOVE unlock ledger for colors (colors are no longer part of Harmony MVP unlocks)
+//  - IMPORTANT: do NOT emit "harmony:policy:set" from Persistence (would self-trigger).
 // ============================================================
 
 import type { EventBus } from "../core/EventBus";
@@ -87,6 +92,8 @@ export interface AudioPlayerState {
 // ------------------------------------------------------------
 
 export interface HarmonyEnvironmentState {
+  // NOTE: Kept for now because PostFX may still use it,
+  // but Harmony MVP no longer "unlocks" or actively "selects" colors.
   colorId: string;
   filterId: string;
   particles: Record<string, boolean>;
@@ -111,9 +118,10 @@ export type CapabilityOverrides = Record<string, boolean>;
  * Canonical unlock ledgers for Harmony.
  * These are "collected / available" flags, not "currently enabled" flags
  * (enabled is driven by HarmonyEnvironmentState).
+ *
+ * MVP: colors removed from the unlock ledger.
  */
 export interface HarmonyUnlocksState {
-  colors: Record<string, boolean>;
   filters: Record<string, boolean>;
   particles: Record<string, boolean>;
   ambients: Record<string, boolean>;
@@ -145,7 +153,7 @@ export interface UserState {
   /** NEW: Optional capability overrides (schema-flexible). */
   capabilityOverrides: CapabilityOverrides;
 
-  /** NEW: Collected/unlocked Harmony content (colors/filters/particles/ambients/presets). */
+  /** NEW: Collected/unlocked Harmony content (filters/particles/ambients/presets). */
   harmonyUnlocks: HarmonyUnlocksState;
 
   /** Canonical collection of tracks */
@@ -218,7 +226,6 @@ const DEFAULT_ENV: HarmonyEnvironmentState = {
 };
 
 const DEFAULT_UNLOCKS: HarmonyUnlocksState = {
-  colors: { c1: true },
   filters: { f1: true },
   particles: {},
   ambients: {},
@@ -240,6 +247,7 @@ const safeRecordBool = (v: unknown): Record<string, boolean> => {
 const normalizeEnv = (raw: unknown): HarmonyEnvironmentState => {
   const r = (raw ?? {}) as Partial<HarmonyEnvironmentState>;
   return {
+    // Keep stable for PostFX even if Harmony MVP doesn't drive it.
     colorId: safeString(r.colorId, DEFAULT_ENV.colorId),
     filterId: safeString(r.filterId, DEFAULT_ENV.filterId),
     particles: safeRecordBool(r.particles),
@@ -248,18 +256,16 @@ const normalizeEnv = (raw: unknown): HarmonyEnvironmentState => {
 };
 
 const normalizeUnlocks = (raw: unknown): HarmonyUnlocksState => {
-  const r = (raw ?? {}) as Partial<HarmonyUnlocksState>;
-  const colors = safeRecordBool((r as any).colors);
+  const r = (raw ?? {}) as Partial<HarmonyUnlocksState> & { colors?: unknown }; // tolerate legacy saves
   const filters = safeRecordBool((r as any).filters);
   const particles = safeRecordBool((r as any).particles);
   const ambients = safeRecordBool((r as any).ambients);
   const presets = safeRecordBool((r as any).presets);
 
-  // Ensure base defaults exist (c1/f1)
-  colors.c1 = colors.c1 ?? true;
+  // Ensure base defaults exist (f1)
   filters.f1 = filters.f1 ?? true;
 
-  return { colors, filters, particles, ambients, presets };
+  return { filters, particles, ambients, presets };
 };
 
 const normalizeOwner = (v: unknown): UserOwner => (v === "director" ? "director" : "lumen");
@@ -393,7 +399,6 @@ const sanitizeState = (state: UserState): UserState => {
   }
 
   // Ensure base unlock defaults are present
-  s.harmonyUnlocks.colors.c1 = s.harmonyUnlocks.colors.c1 ?? true;
   s.harmonyUnlocks.filters.f1 = s.harmonyUnlocks.filters.f1 ?? true;
 
   return s;
@@ -428,7 +433,7 @@ type HarmonyPolicyPayload = {
 };
 
 type HarmonyUnlockAddPayload = {
-  kind: "color" | "filter" | "particle" | "ambient" | "preset";
+  kind: "filter" | "particle" | "ambient" | "preset";
   id: string;
   unlocked?: boolean; // default true
   source?: string;
@@ -454,7 +459,6 @@ const normalizeBoolMapPartial = (raw: unknown): Record<string, boolean> => safeR
 
 const mergeUnlocks = (prev: HarmonyUnlocksState, next: Partial<HarmonyUnlocksState>): HarmonyUnlocksState => {
   return normalizeUnlocks({
-    colors: { ...(prev.colors ?? {}), ...normalizeBoolMapPartial(next.colors) },
     filters: { ...(prev.filters ?? {}), ...normalizeBoolMapPartial(next.filters) },
     particles: { ...(prev.particles ?? {}), ...normalizeBoolMapPartial(next.particles) },
     ambients: { ...(prev.ambients ?? {}), ...normalizeBoolMapPartial(next.ambients) },
@@ -541,7 +545,7 @@ export class PersistenceSystem {
           capabilityOverrides: nextCaps,
           harmonyUnlocks: nextUnlocks,
         },
-        safeString(p.reason, "harmony:policy:set")
+        safeString(p.reason, "harmony:policy:set"),
       );
 
       // Re-emit canonical policy after applying
@@ -560,14 +564,13 @@ export class PersistenceSystem {
       const prev = this.state.harmonyUnlocks ?? DEFAULT_UNLOCKS;
       const next: HarmonyUnlocksState = safeClone(prev);
 
-      if (kind === "color") next.colors = { ...(prev.colors ?? {}), [id]: unlocked };
-      else if (kind === "filter") next.filters = { ...(prev.filters ?? {}), [id]: unlocked };
+      if (kind === "filter") next.filters = { ...(prev.filters ?? {}), [id]: unlocked };
       else if (kind === "particle") next.particles = { ...(prev.particles ?? {}), [id]: unlocked };
       else if (kind === "ambient") next.ambients = { ...(prev.ambients ?? {}), [id]: unlocked };
       else if (kind === "preset") next.presets = { ...(prev.presets ?? {}), [id]: unlocked };
       else return;
 
-      // Normalize + ensure c1/f1 present
+      // Normalize + ensure f1 present
       const normalized = normalizeUnlocks(next);
 
       // No-op guard
@@ -602,7 +605,7 @@ export class PersistenceSystem {
           owner: "director",
           capabilityOverrides: caps,
         },
-        reason
+        reason,
       );
 
       this.emitHarmonyPolicy(`dev:unlockAll:${source}`);
@@ -612,7 +615,11 @@ export class PersistenceSystem {
     // DEV hatch: toggle owner (director <-> lumen) or explicitly set it
     this.onHarmonyDevToggleOwner = (p?: HarmonyDevToggleOwnerPayload): void => {
       const desired =
-        p?.owner === "director" || p?.owner === "lumen" ? (p.owner as UserOwner) : this.state.owner === "director" ? "lumen" : "director";
+        p?.owner === "director" || p?.owner === "lumen"
+          ? (p.owner as UserOwner)
+          : this.state.owner === "director"
+            ? "lumen"
+            : "director";
 
       if (desired === this.state.owner) return;
 
@@ -912,8 +919,10 @@ export class PersistenceSystem {
       reason,
     };
 
-    // HarmonySystem listens to these aliases already
-    this.bus.emit("harmony:policy:set", payload);
+    // IMPORTANT:
+    //  - DO NOT emit "harmony:policy:set" here (Persistence listens to it).
+    //  - Emit state/announce events only.
+    this.bus.emit("harmony:policy:state", payload);
     this.bus.emit("harmony:ui:policy", payload);
   }
 
@@ -937,7 +946,11 @@ export class PersistenceSystem {
         (withExtras as any).owner = "lumen";
       }
 
-      if ((withExtras as any).uiMode !== "cinematic" && (withExtras as any).uiMode !== "minimal" && (withExtras as any).uiMode !== "full") {
+      if (
+        (withExtras as any).uiMode !== "cinematic" &&
+        (withExtras as any).uiMode !== "minimal" &&
+        (withExtras as any).uiMode !== "full"
+      ) {
         (withExtras as any).uiMode = "full";
       }
 
@@ -945,6 +958,7 @@ export class PersistenceSystem {
         (withExtras as any).capabilityOverrides = {};
       }
 
+      // Legacy migration: harmonyUnlocks may include colors. We normalize it away.
       if (!(withExtras as any).harmonyUnlocks) {
         (withExtras as any).harmonyUnlocks = { ...DEFAULT_UNLOCKS };
       }

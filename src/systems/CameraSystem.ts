@@ -63,7 +63,7 @@ const DEFAULT_OPTIONS: CameraRigOptions = {
 
   autoOrbitEnabled: true,
   autoOrbitDelaySeconds: 0.0,
-  autoOrbitSpeedRadPerSec: 0.031,
+  autoOrbitSpeedRadPerSec: 0.020,
 
   autoDollyEnabled: true,
   autoDollyDelaySeconds: 30,

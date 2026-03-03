@@ -61,6 +61,24 @@ const PRESETS: HarmonyPreset[] = [
       ambients: {},
     },
   },
+
+  // ✅ New preset: Lumen
+  // - Uses new filter id "lumen" (added in HarmonyUI)
+  // - A little “alive” and bright: stars on + gentle chimes
+  {
+    id: "lumen",
+    label: "Lumen",
+    environment: {
+      colorId: "c1",
+      filterId: "lumen",
+      particles: {
+        stars: true,
+      },
+      ambients: {
+        chimes: true,
+      },
+    },
+  },
 ];
 
 export class HarmonyPresetsSystem {

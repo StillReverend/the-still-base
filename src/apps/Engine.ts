@@ -11,7 +11,6 @@ import type { SceneContext, SceneController, SceneName } from "./SceneTypes";
 
 import { DebugOverlay } from "./DebugOverlay";
 import { DevTools } from "./DevTools";
-
 import { CameraSystem } from "../systems/CameraSystem";
 import { CameraDirectorSystem } from "../systems/CameraDirectorSystem";
 import { ControlSystem } from "../systems/ControlSystem";
@@ -25,8 +24,8 @@ import { HarmonySystem } from "../systems/harmony/HarmonySystem";
 import { HarmonyEnvironmentSystem } from "../systems/harmony/HarmonyEnvironmentSystem";
 import { HarmonyPresetsSystem } from "../systems/harmony/HarmonyPresetsSystem";
 import { HarmonyAmbientSystem } from "../systems/harmony/HarmonyAmbientSystem";
-
 import { MediaResolverSystem } from "../systems/MediaResolverSystem";
+import { ParticleFXSystem } from "../systems/ParticleFXSystem";
 
 interface SceneSwitchPayload {
   name: SceneName;
@@ -68,6 +67,8 @@ export class Engine {
   private harmonyEnvironment: HarmonyEnvironmentSystem | null = null;
   private harmonyPresets: HarmonyPresetsSystem | null = null;
   private harmonyAmbients: HarmonyAmbientSystem | null = null;
+
+  private readonly particleFX: ParticleFXSystem;
 
   private readonly sceneManager: SceneManager;
   private readonly resolveScene: (name: SceneName) => SceneController | null;
@@ -162,6 +163,13 @@ export class Engine {
     // ✅ Stable clear baseline
     this.renderer.setClearColor(0x000000, 1.0);
 
+    // ✅ Lock renderer color pipeline (stable)
+    // Keep this.
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    // ✅ Punchy legacy baseline (more dynamic pop than ACES)
+    this.renderer.toneMapping = THREE.NoToneMapping;
+
     this.renderer.setPixelRatio(this.config.pixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
 
@@ -213,12 +221,21 @@ export class Engine {
         enabled: true,
         bloom: {
           enabled: true,
-          strength: 1.05,
-          radius: 0.55,
-          threshold: 0.12,
+
+          // ✅ Starfield presence restore:
+          // Lower threshold so small bright points actually contribute to bloom.
+          threshold: 0.02,
+
+          // Slightly hotter baseline. We can tune after A/B.
+          strength: 1.25,
+          radius: 0.65,
         },
       },
     });
+
+    // ✅ NEW: ParticleFX (Engine-owned, bus-driven, scene-retargeted)
+    this.particleFX = new ParticleFXSystem({ bus: this.bus });
+    this.particleFX.init();
 
     // ✅ Harmony Environment (canonical vibe/persistence + PostFX apply)
     // Must be created AFTER PostFX and Persistence exist.
@@ -266,11 +283,15 @@ export class Engine {
     const initialScene = deps.initialSceneFactory();
     this.sceneManager.switchSceneImmediately(initialScene);
 
-    // Ensure PostFX targets the active scene immediately
+    // Ensure PostFX + ParticleFX target the active scene immediately
     const current = this.sceneManager.getCurrentScene();
     if (current) {
       this.postFX.setTargets(current.scene, this.camera);
       this.lastRenderScene = current.scene;
+
+      // ✅ ParticleFX retarget on scene switch
+      this.particleFX.setTargets(current.scene, this.camera);
+
     }
 
     // ✅ Scene switch handler (stored for cleanup)
@@ -300,6 +321,9 @@ export class Engine {
       // Browser gesture unlock + (optional) dev autostart
       this.setupAudioUnlockGestures();
       //this.setupAutoStartMusicOnFirstUnlock("Lift");
+
+      // DEV: expose bus for quick console testing
+      (window as any).__STILL_BUS__ = this.bus;
 
       this.devTools = new DevTools({
         bus: this.bus,
@@ -378,6 +402,9 @@ export class Engine {
     // Scene update
     this.sceneManager.update(dt);
 
+    // ✅ ParticleFX update
+    this.particleFX.update(dt);
+
     // Debug overlay (dev only)
     if (this.debugOverlay) {
       this.debugOverlay.update(dt);
@@ -395,6 +422,10 @@ export class Engine {
       if (this.lastRenderScene !== current.scene) {
         this.postFX.setTargets(current.scene, this.camera);
         this.lastRenderScene = current.scene;
+
+        // ✅ ParticleFX retarget
+        this.particleFX.setTargets(current.scene, this.camera);
+
       }
 
       this.postFX.update(dt);
@@ -535,6 +566,8 @@ export class Engine {
 
     this.harmonyEnvironment?.dispose();
     this.harmonyEnvironment = null;
+
+    this.particleFX.dispose();
 
     // Audio: detach bus handlers
     this.audioSystem.dispose();

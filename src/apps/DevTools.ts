@@ -279,6 +279,15 @@ export class DevTools {
       label: "Harmony DEV Unlock (H on, Shift+H off) — persisted",
       action: (e) => {
         const enable = !e.shiftKey;
+        const unlockAll = enable
+          ? {
+              presets: { dusk: true, void: true, clear: true },
+              ambients: { crickets: true, waves: true, wind: true, chimes: true },
+              particles: { stars: true, fireflies: true, leaves: true, rain: true, snow: true, dust: true, embers: true },
+              filters: { f1: true, f2: true, f3: true, f4: true },
+              colors: { c1: true, c2: true, c3: true, c4: true },
+            }
+          : null;
 
         // 1) Persist intent (sticky across reloads)
         this.bus.emit("dev:persistence:patch", {
@@ -290,6 +299,7 @@ export class DevTools {
             capabilityOverrides: {
               devUnlockAllHarmony: enable,
             },
+            ...(enable ? { unlocks: unlockAll } : {}),
           },
         });
 
@@ -298,8 +308,9 @@ export class DevTools {
           const unlockAll = {
             presets: { dusk: true, void: true, clear: true },
             ambients: { crickets: true, waves: true, wind: true, chimes: true },
-            particles: { rain: true, snow: true, dust: true, embers: true },
+            particles: { stars: true, fireflies: true, leaves: true, rain: true, snow: true, dust: true, embers: true },
             filters: { f1: true, f2: true, f3: true, f4: true },
+            lumen: { b1: true, b2: true, b3: true, b4: true },
             colors: { c1: true, c2: true, c3: true, c4: true },
           };
 
@@ -320,7 +331,6 @@ export class DevTools {
               "mix.lanes": true,
               "ui.hide": true,
             },
-            // Harmless for director, but good for robustness/QA visuals.
             unlocks: unlockAll,
           });
 

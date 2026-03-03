@@ -295,7 +295,7 @@ export class DemoScene implements SceneController {
 
       farCount: 31,
       farRadius: 8000,
-      farSize: 1.5,
+      farSize: 3.1,
 
       nearCount: 500,
       nearInnerRadius: 5000,

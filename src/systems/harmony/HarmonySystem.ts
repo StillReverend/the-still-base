@@ -5,6 +5,11 @@
 //  - Talks only through EventBus (no AudioSystem imports)
 //  - Mirrors canonical environment snapshots from HarmonyEnvironmentSystem
 //  - Enforces Director vs Lumen capability + unlock gating (authoritative)
+//
+// MVP (Mar 2026):
+//  - KEEP: Ritual, Presets, Filters, Particles, Ambient, Audio Sliders
+//  - REMOVE: Spectrum/Colors + Lumen settings group plumbing
+//    (no env.colors capability, no unlocks.colors, no selectColor UI handler)
 // ============================================================
 
 import type { EventBus } from "../../core/EventBus";
@@ -39,7 +44,6 @@ const isRepeatMode = (v: unknown): v is RepeatMode => v === "off" || v === "one"
 
 // Canonical environment snapshot shape (kept local to avoid importing Persistence types here)
 type HarmonyEnvironmentSnapshot = {
-  colorId?: string;
   filterId?: string;
   particles?: Record<string, boolean>;
   ambients?: Record<string, boolean>;
@@ -49,10 +53,13 @@ type HarmonyEnvironmentSnapshot = {
 type HarmonyEnvironmentStateEvent = {
   environment?: HarmonyEnvironmentSnapshot;
   state?: HarmonyEnvironmentSnapshot;
+
+  // allow optional aliases (we ignore colorId in MVP)
   colorId?: string;
   filterId?: string;
   particles?: Record<string, boolean>;
   ambients?: Record<string, boolean>;
+
   reason?: string;
 };
 
@@ -92,7 +99,6 @@ type HarmonyCapabilityKey =
   | "playback.shuffle"
   | "playback.repeat"
   | "env.panel"
-  | "env.colors"
   | "env.filters"
   | "env.particles"
   | "env.ambients"
@@ -103,7 +109,6 @@ type HarmonyCapabilityKey =
 type HarmonyCapabilitiesMap = Partial<Record<HarmonyCapabilityKey, boolean>>;
 
 type HarmonyUnlocksShape = Partial<{
-  colors: Record<string, boolean>;
   filters: Record<string, boolean>;
   particles: Record<string, boolean>;
   ambients: Record<string, boolean>;
@@ -144,21 +149,39 @@ const isUnlocked = (owner: HarmonyOwner, unlocks: HarmonyUnlocksShape, kind: str
   if (String(owner).toLowerCase() === "director") return true;
 
   const map =
-    kind === "color"
-      ? unlocks.colors
-      : kind === "filter"
-        ? unlocks.filters
-        : kind === "particle"
-          ? unlocks.particles
-          : kind === "ambient"
-            ? unlocks.ambients
-            : kind === "preset"
-              ? unlocks.presets
-              : undefined;
+    kind === "filter"
+      ? unlocks.filters
+      : kind === "particle"
+        ? unlocks.particles
+        : kind === "ambient"
+          ? unlocks.ambients
+          : kind === "preset"
+            ? unlocks.presets
+            : undefined;
 
   // If unlock maps are missing, default permissive.
   if (!map) return true;
   return Boolean(map[id]);
+};
+
+// ------------------------------------------------------------
+// ✅ Keep UI responsive: mirror the particle radio-group immediately
+// (EnvironmentSystem is authoritative; this prevents multi-on flashes.)
+// ------------------------------------------------------------
+const applyParticleRadioLocal = (prev: Record<string, boolean>, id: string, enabled: boolean): Record<string, boolean> => {
+  const base = { ...(prev ?? {}) };
+
+  const keys = new Set<string>([...Object.keys(base), id]);
+
+  if (!enabled) {
+    const out: Record<string, boolean> = {};
+    for (const k of keys) out[k] = false;
+    return out;
+  }
+
+  const out: Record<string, boolean> = {};
+  for (const k of keys) out[k] = k === id;
+  return out;
 };
 
 const makeDefaultState = (): HarmonyState => {
@@ -170,14 +193,13 @@ const makeDefaultState = (): HarmonyState => {
     mix: { ...(HARMONY_DEFAULT_STATE.mix ?? { master: 1, music: 1, sfx: 1, ambient: 1, ui: 1 }) },
     capabilities: { ...(HARMONY_DEFAULT_STATE.capabilities ?? {}) },
     unlocks: {
-      ...(HARMONY_DEFAULT_STATE.unlocks ?? { colors: {}, filters: {}, particles: {}, ambients: {}, presets: {} }),
-      colors: { ...(HARMONY_DEFAULT_STATE.unlocks?.colors ?? {}) },
+      ...(HARMONY_DEFAULT_STATE.unlocks ?? { filters: {}, particles: {}, ambients: {}, presets: {} }),
       filters: { ...(HARMONY_DEFAULT_STATE.unlocks?.filters ?? {}) },
       particles: { ...(HARMONY_DEFAULT_STATE.unlocks?.particles ?? {}) },
       ambients: { ...(HARMONY_DEFAULT_STATE.unlocks?.ambients ?? {}) },
       presets: { ...(HARMONY_DEFAULT_STATE.unlocks?.presets ?? {}) },
     },
-  };
+  } as HarmonyState;
 };
 
 class HarmonySystem {
@@ -193,7 +215,6 @@ class HarmonySystem {
 
   // Track last environment snapshot applied to avoid redundant renders
   private lastEnvApplied: {
-    colorId: string;
     filterId: string;
     particles: Record<string, boolean>;
     ambients: Record<string, boolean>;
@@ -301,17 +322,6 @@ class HarmonySystem {
         this.toggleAmbient(String(id), enabled);
       },
 
-      onSelectColor: (id) => {
-        const caps = readCaps(this.state);
-        if (!capEnabled(caps, "env.colors", true)) return;
-
-        const owner = readOwner(this.state);
-        const unlocks = readUnlocks(this.state);
-        if (!isUnlocked(owner, unlocks, "color", String(id))) return;
-
-        this.selectColor(String(id));
-      },
-
       onSelectFilter: (id) => {
         const caps = readCaps(this.state);
         if (!capEnabled(caps, "env.filters", true)) return;
@@ -376,14 +386,12 @@ class HarmonySystem {
     this.on("harmony:environment:changed", (p: unknown) => this.onEnvironmentState(p as HarmonyEnvironmentStateEvent));
 
     // ✅ Boot-sync handshake (covers late subscriber cases)
-    // EnvironmentSystem may have emitted "boot" before Harmony UI subscribed.
     this.emit("harmony:environment:requestState", { source: "harmony-ui" });
 
     // Also request current Howler mix so UI sliders can sync immediately.
     this.emit("howler:requestState", { source: "harmony-ui" });
 
     // Ensure AudioSystem starts aligned with current master/music lanes (if any).
-    // (If state.mix is still defaults, this is a no-op-ish but safe.)
     this.applyMusicMixToAudio("init");
 
     window.addEventListener("keydown", this.onKeyDown, { passive: true });
@@ -448,7 +456,6 @@ class HarmonySystem {
 
       s.unlocks = {
         ...prev,
-        colors: { ...(prev.colors ?? {}), ...(next.colors ?? {}) },
         filters: { ...(prev.filters ?? {}), ...(next.filters ?? {}) },
         particles: { ...(prev.particles ?? {}), ...(next.particles ?? {}) },
         ambients: { ...(prev.ambients ?? {}), ...(next.ambients ?? {}) },
@@ -470,13 +477,12 @@ class HarmonySystem {
   }
 
   // ------------------------------------------------------------
-  // Canonical environment mirroring
+  // Canonical environment mirroring (MVP: filter/particles/ambients only)
   // ------------------------------------------------------------
 
   private onEnvironmentState(payload: HarmonyEnvironmentStateEvent): void {
     const env = payload?.environment ?? payload?.state ?? {};
 
-    const colorId = safeString(env.colorId ?? payload?.colorId, safeString(this.state.colorId, "c1"));
     const filterId = safeString(env.filterId ?? payload?.filterId, safeString(this.state.filterId, "f1"));
 
     const particles = safeBoolMap(env.particles ?? payload?.particles);
@@ -486,16 +492,14 @@ class HarmonySystem {
 
     const same =
       prev &&
-      prev.colorId === colorId &&
       prev.filterId === filterId &&
       shallowBoolMapEquals(prev.particles, particles) &&
       shallowBoolMapEquals(prev.ambients, ambients);
 
     if (same) return;
 
-    this.lastEnvApplied = { colorId, filterId, particles, ambients };
+    this.lastEnvApplied = { filterId, particles, ambients };
 
-    this.state.colorId = colorId;
     this.state.filterId = filterId;
     this.state.particles = { ...particles };
     this.state.ambients = { ...ambients };
@@ -595,8 +599,7 @@ class HarmonySystem {
 
     this.state.mix = next;
 
-    // ✅ Critical: keep AudioSystem (music playback) obeying Master + Music lanes too.
-    // (Howler already applies its own master internally, but AudioSystem is separate.)
+    // ✅ Keep AudioSystem obeying Master + Music lanes too.
     this.applyMusicMixToAudio("howler:state");
 
     this.requestRender();
@@ -715,7 +718,7 @@ class HarmonySystem {
     // Tell HowlerAudioSystem (compat: include both value01 + volume01)
     this.emit("howler:volume:set", { bus: "master", value01: v, volume01: v, source: "harmony" });
 
-    // Tell AudioSystem (master*music) (compat events handled inside applyMusicMixToAudio)
+    // Tell AudioSystem (master*music)
     this.applyMusicMixToAudio("setVolume");
 
     this.requestRender();
@@ -739,16 +742,6 @@ class HarmonySystem {
     this.requestRender();
   }
 
-  private selectColor(colorId: string): void {
-    this.state.colorId = colorId;
-
-    // Emit both the "canonical" name and a compatibility alias so we don't get stuck on naming mismatches.
-    this.emit("harmony:environment:selectColor", { colorId });
-    this.emit("harmony:env:selectColor", { colorId });
-
-    this.requestRender();
-  }
-
   private selectFilter(filterId: string): void {
     this.state.filterId = filterId;
 
@@ -760,8 +753,8 @@ class HarmonySystem {
   }
 
   private toggleParticle(particleId: string, enabled: boolean): void {
-    // Avoid in-place mutation in case state is ever frozen/serialized differently.
-    this.state.particles = { ...(this.state.particles ?? {}), [particleId]: enabled };
+    // ✅ Mirror radio-group locally to keep UI from showing multiple "on" states.
+    this.state.particles = applyParticleRadioLocal(this.state.particles ?? {}, particleId, enabled);
 
     // Emit both canonical + alias
     this.emit("harmony:environment:toggleParticle", { particleId, enabled });

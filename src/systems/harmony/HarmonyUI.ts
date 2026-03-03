@@ -3,6 +3,10 @@
 // THE STILL — Harmony UI (DOM only)
 //  - Renders bottom player bar + harmony slide-out panel
 //  - Calls handlers only (no EventBus imports)
+//
+// MVP (Mar 2026):
+//  - KEEP: Ritual, Presets, Filters, Particles, Ambient, Audio Sliders
+//  - REMOVE: Lumen + Spectrum (and all related UI/capability/unlock plumbing)
 // ============================================================
 
 import type { HarmonyState } from "./types";
@@ -27,7 +31,8 @@ type UIHandlers = {
 
   onToggleParticle(id: string, enabled: boolean): void;
   onToggleAmbient(id: string, enabled: boolean): void;
-  onSelectColor(id: string): void;
+
+  // MVP keeps Filters only (no Spectrum/Colors UI)
   onSelectFilter(id: string): void;
 
   // ✅ Presets (Phase 1)
@@ -194,6 +199,7 @@ function bindPress(
 
 // ------------------------------------------------------------
 // Director vs Lumen policy + capability/unlock readers
+// (MVP keeps unlock gating for: presets, filters, particles, ambients)
 // ------------------------------------------------------------
 
 type HarmonyUiMode = "cinematic" | "minimal" | "full";
@@ -206,7 +212,6 @@ type HarmonyCapabilityKey =
   | "playback.shuffle"
   | "playback.repeat"
   | "env.panel"
-  | "env.colors"
   | "env.filters"
   | "env.particles"
   | "env.ambients"
@@ -217,7 +222,6 @@ type HarmonyCapabilityKey =
 type HarmonyCapabilitiesMap = Partial<Record<HarmonyCapabilityKey, boolean>>;
 
 type HarmonyUnlocksShape = Partial<{
-  colors: Record<string, boolean>;
   filters: Record<string, boolean>;
   particles: Record<string, boolean>;
   ambients: Record<string, boolean>;
@@ -261,22 +265,34 @@ function isUnlocked(owner: HarmonyOwner, unlocks: HarmonyUnlocksShape, kind: str
   if (String(owner).toLowerCase() === "director") return true;
 
   const map =
-    kind === "color"
-      ? unlocks.colors
-      : kind === "filter"
-        ? unlocks.filters
-        : kind === "particle"
-          ? unlocks.particles
-          : kind === "ambient"
-            ? unlocks.ambients
-            : kind === "preset"
-              ? unlocks.presets
-              : undefined;
+    kind === "filter"
+      ? unlocks.filters
+      : kind === "particle"
+        ? unlocks.particles
+        : kind === "ambient"
+          ? unlocks.ambients
+          : kind === "preset"
+            ? unlocks.presets
+            : undefined;
 
   // If we have no map at all, default permissive (pre-unlock era).
   if (!map) return true;
 
   return Boolean(map[id]);
+}
+
+// ------------------------------------------------------------
+// ✅ UI-only helper: enforce particle radio-group visuals immediately
+// (HarmonyEnvironmentSystem is authoritative; this prevents "multi-on" flashes.)
+// ------------------------------------------------------------
+function setParticleRadioVisual(root: HTMLElement, winnerId: string | null): void {
+  const tiles = root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="particle"]`);
+  tiles.forEach((t) => {
+    const id = t.dataset.id || "";
+    const on = Boolean(winnerId && id && id === winnerId);
+    t.classList.toggle("on", on);
+    t.setAttribute("aria-pressed", on ? "true" : "false");
+  });
 }
 
 export class HarmonyUI {
@@ -800,31 +816,24 @@ export class HarmonyUI {
       ]),
     );
 
-    // 5) ParticleFX (rename later)
+    // 5) Particles (radio group: one active, or none)
     this.panel.appendChild(
       this.makeToggleSection(
-        "ParticleFX",
+        "Particles",
         [
-          ["Rain", "rain"],
-          ["Snow", "snow"],
+          ["Stars", "stars"],
+          ["Fireflies", "fireflies"],
+          ["Leaves", "leaves"],
           ["Dust", "dust"],
           ["Embers", "embers"],
+          ["Rain", "rain"],
+          ["Snow", "snow"],
         ],
         (id, enabled) => this.handlers.onToggleParticle(id, enabled),
       ),
     );
 
-    // 6) Spectrum placeholder
-    this.panel.appendChild(
-      this.makeSelectSection("Spectrum", "color", [
-        ["C1", "c1", () => this.handlers.onSelectColor("c1")],
-        ["C2", "c2", () => this.handlers.onSelectColor("c2")],
-        ["C3", "c3", () => this.handlers.onSelectColor("c3")],
-        ["C4", "c4", () => this.handlers.onSelectColor("c4")],
-      ]),
-    );
-
-    // 7) Audio sliders (Howler lanes)
+    // 6) Audio sliders (Howler lanes)
     this.panel.appendChild(this.makeAudioSlidersSection("Audio"));
 
     this.root.appendChild(style);
@@ -869,7 +878,6 @@ export class HarmonyUI {
     const allowRepeat = capEnabled(caps, "playback.repeat", true);
 
     const allowEnvPanel = capEnabled(caps, "env.panel", true);
-    const allowEnvColors = capEnabled(caps, "env.colors", true);
     const allowEnvFilters = capEnabled(caps, "env.filters", true);
     const allowEnvParticles = capEnabled(caps, "env.particles", true);
     const allowEnvAmbients = capEnabled(caps, "env.ambients", true);
@@ -939,20 +947,28 @@ export class HarmonyUI {
     }
 
     // Toggle visuals
-    this.syncToggleVisual("particle", (state.particles ?? {}) as Record<string, boolean>);
     this.syncToggleVisual("ambient", (state.ambients ?? {}) as Record<string, boolean>);
 
+    // ✅ Particle visuals: radio group (single active)
+    const particleMap = (state.particles ?? {}) as Record<string, boolean>;
+    let particleWinner: string | null = null;
+    for (const [k, v] of Object.entries(particleMap)) {
+      if (v === true) {
+        particleWinner = k;
+        break;
+      }
+    }
+    setParticleRadioVisual(this.root, particleWinner);
+
     // Select visuals (single-choice)
-    this.syncSelectVisual("color", String((state as any).colorId ?? ""));
     this.syncSelectVisual("filter", String((state as any).filterId ?? ""));
 
-    // Enable/disable sections via caps + owner/unlocks (lumen)
+    // Enable/disable sections via caps + owner/unlocks
     this.setTilesEnabledAndLocked(owner, unlocks, "preset", allowEnvPresets);
     this.setTilesEnabled("ritual", true); // ritual currently always allowed (no capability key yet)
 
     this.setTilesEnabledAndLocked(owner, unlocks, "ambient", allowEnvAmbients);
     this.setTilesEnabledAndLocked(owner, unlocks, "particle", allowEnvParticles);
-    this.setTilesEnabledAndLocked(owner, unlocks, "color", allowEnvColors);
     this.setTilesEnabledAndLocked(owner, unlocks, "filter", allowEnvFilters);
 
     // Mixer lanes
@@ -1023,7 +1039,7 @@ export class HarmonyUI {
       tile.setAttribute("aria-disabled", enabled ? "false" : "true");
       tile.setAttribute("data-disabled", enabled ? "false" : "true");
 
-      // Lock badge for lumen when not unlocked (but only if section is otherwise allowed)
+      // Lock badge when not unlocked (but only if section is otherwise allowed)
       const showLock = enabledByCaps && !unlocked && String(owner).toLowerCase() === "lumen";
       tile.classList.toggle("is-locked", showLock);
       tile.setAttribute("data-locked", showLock ? "true" : "false");
@@ -1148,7 +1164,7 @@ export class HarmonyUI {
 
   private makeSelectSection(
     label: string,
-    kind: "color" | "filter",
+    kind: "filter",
     buttons: Array<[string, string, () => void]>,
   ): HTMLElement {
     const wrap = document.createElement("div");
@@ -1223,7 +1239,27 @@ export class HarmonyUI {
       tile.setAttribute("data-locked", "false");
 
       const press = () => {
-        const next = !tile.classList.contains("on");
+        const currentlyOn = tile.classList.contains("on");
+
+        // ✅ Particles are a RADIO GROUP:
+        // - clicking an OFF tile turns it ON and turns all others OFF immediately
+        // - clicking an ON tile clears the group (all OFF)
+        if (kind === "particle") {
+          if (currentlyOn) {
+            // Clear all
+            setParticleRadioVisual(this.root, null);
+            onToggle(id, false);
+            return;
+          }
+
+          // Turn this on, all others off
+          setParticleRadioVisual(this.root, id);
+          onToggle(id, true);
+          return;
+        }
+
+        // Ambient remains multi-toggle
+        const next = !currentlyOn;
         tile.classList.toggle("on", next);
         tile.setAttribute("aria-pressed", next ? "true" : "false");
         onToggle(id, next);

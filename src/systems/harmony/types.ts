@@ -98,7 +98,6 @@ export type HarmonyCapability =
   | "playback.repeat"
   // Environment
   | "env.panel" // can open the environment panel
-  | "env.colors"
   | "env.filters"
   | "env.particles"
   | "env.ambients"
@@ -115,7 +114,6 @@ export type HarmonyCapabilities = Partial<Record<HarmonyCapability, boolean>>;
  * Kept as simple ID maps for easy merging + serialization.
  */
 export type HarmonyUnlocks = {
-  colors: Record<string, boolean>;
   filters: Record<string, boolean>;
   particles: Record<string, boolean>;
   ambients: Record<string, boolean>;
@@ -130,7 +128,6 @@ export const HARMONY_DEFAULT_CAPABILITIES: HarmonyCapabilities = {
   "playback.repeat": true,
 
   "env.panel": true,
-  "env.colors": true,
   "env.filters": true,
   "env.particles": true,
   "env.ambients": true,
@@ -141,7 +138,6 @@ export const HARMONY_DEFAULT_CAPABILITIES: HarmonyCapabilities = {
 };
 
 export const HARMONY_DEFAULT_UNLOCKS: HarmonyUnlocks = {
-  colors: {},
   filters: {},
   particles: {},
   ambients: {},
@@ -185,7 +181,6 @@ export type HarmonyState = {
 
   // environment (Phase 1 canonical placeholders)
   // These mirror HarmonyEnvironmentSystem snapshots.
-  colorId: string | null;
   filterId: string | null;
   particles: Record<string, boolean>;
   ambients: Record<string, boolean>;
@@ -217,8 +212,7 @@ export const HARMONY_DEFAULT_STATE: HarmonyState = {
   repeat: "off",
   volume: 0.85,
 
-  // Match HarmonyEnvironmentSystem defaults (c1 / f1)
-  colorId: "c1",
+  // Match HarmonyEnvironmentSystem defaults (f1)
   filterId: "f1",
   particles: {},
   ambients: {},
@@ -254,7 +248,7 @@ export type HarmonyPolicyPatchEvent = {
 };
 
 export type HarmonyUnlockEvent = {
-  kind: keyof HarmonyUnlocks;
+  kind: keyof HarmonyUnlocks; // filters | particles | ambients | presets
   id: string;
   enabled?: boolean; // default true
   reason?: string;

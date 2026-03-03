@@ -1,0 +1,84 @@
+.
+├── docs
+│   └── BUILD_PLAN.md
+├── folder-structure.txt
+├── index.html
+├── package-lock.json
+├── package.json
+├── public
+│   ├── assets
+│   │   └── audio
+│   │       ├── Carpet.mp3
+│   │       ├── Crooked.mp3
+│   │       ├── FinalShow.mp3
+│   │       ├── Graystar.mp3
+│   │       ├── Legacy.mp3
+│   │       ├── Lift.mp3
+│   │       ├── Luna.mp3
+│   │       ├── ambient
+│   │       │   ├── chimes.mp3
+│   │       │   ├── crickets.mp3
+│   │       │   ├── waves.mp3
+│   │       │   └── wind.mp3
+│   │       └── ui
+│   │           ├── click.mp3
+│   │           ├── gong.mp3
+│   │           └── hover.mp3
+│   └── vite.svg
+├── src
+│   ├── apps
+│   │   ├── DebugOverlay.ts
+│   │   ├── DevTools.ts
+│   │   ├── Engine.ts
+│   │   ├── SceneManager.ts
+│   │   └── SceneTypes.ts
+│   ├── core
+│   │   ├── Config.ts
+│   │   ├── EventBus.ts
+│   │   ├── Motion.ts
+│   │   └── SaveManager.ts
+│   ├── counter.ts
+│   ├── entry.ts
+│   ├── scenes
+│   │   ├── BootScene.ts
+│   │   └── DemoScene.ts
+│   ├── style.css
+│   ├── systems
+│   │   ├── AudioSystem.ts
+│   │   ├── CameraDirectorSystem.ts
+│   │   ├── CameraSystem.ts
+│   │   ├── ClockSystem.ts
+│   │   ├── ConstellationSystem.ts
+│   │   ├── ControlSystem.ts
+│   │   ├── CoreStates.ts
+│   │   ├── CoreSystem.ts
+│   │   ├── GateSystem.ts
+│   │   ├── HowlerAudioSystem.ts
+│   │   ├── InteractionSystem.ts
+│   │   ├── MediaResolverSystem.ts
+│   │   ├── ParticleFXSystem.ts
+│   │   ├── PersistenceSystem.ts
+│   │   ├── PlasmaRingSystem.ts
+│   │   ├── PostFXSystem.ts
+│   │   ├── RegionSystem.ts
+│   │   ├── RitualSystem.ts
+│   │   ├── StarSystem.ts
+│   │   ├── TimeSystem.ts
+│   │   ├── fieldfx
+│   │   │   ├── FieldFXSystem.ts
+│   │   │   └── emitters
+│   │   │       ├── DustEmitter.ts
+│   │   │       └── EmbersEmitter.ts
+│   │   └── harmony
+│   │       ├── HarmonyAmbientSystem.ts
+│   │       ├── HarmonyEnvironmentSystem.ts
+│   │       ├── HarmonyPresetsSystem.ts
+│   │       ├── HarmonySystem.ts
+│   │       ├── HarmonyUI.ts
+│   │       ├── TrackCatalog.ts
+│   │       └── types.ts
+│   └── typescript.svg
+├── still-file-structure.txt
+└── tsconfig.json
+
+15 directories, 67 files

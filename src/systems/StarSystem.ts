@@ -561,6 +561,18 @@ export class StarSystem {
     this.bandLastWriteKey = -1;
   }
 
+  // --- BAND export hook (FIELD mode substrate) -----------------
+
+  /** Canonical FIELD substrate. Do not dispose from outside StarSystem. */
+  public getBandPoints(): THREE.Points {
+    return this.bandPoints;
+  }
+
+  /** Convenience, if FieldFX wants direct attribute access. */
+  public getBandGeometry(): THREE.BufferGeometry {
+    return this.bandGeom;
+  }
+
   public triggerRadialPulse(
     opts?: Partial<{
       speed: number;
