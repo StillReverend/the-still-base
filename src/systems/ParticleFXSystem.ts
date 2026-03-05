@@ -10,13 +10,15 @@
 // What remains here:
 //  - Engine-owned singleton (one instance per app)
 //  - Owns debug mounts (camera/field/local roots) for visualization + future expansion
-//  - Listens to Harmony environment snapshots + toggle intents
+//  - Listens to Harmony environment snapshots (canonical truth)
 //  - (Optional) local volume API is kept for compatibility, but currently not implemented
 //    because your current vision is a global BAND morph, not per-anchor emitters.
 //
-// Notes:
-//  - We do NOT import HarmonySystem or HarmonyUI.
-//  - FieldFXSystem owns the actual BAND morph + behaviors.
+// IMPORTANT (Mar 2026 fix):
+//  - We DO NOT apply mode changes on toggle *intent* events.
+//  - We ONLY apply mode changes on canonical snapshots:
+//      harmony:environment:state / harmony:environment:changed
+//    This prevents 1-frame "flash" transitions from intermediate intent states.
 // ============================================================
 
 import * as THREE from "three";
@@ -46,13 +48,12 @@ type ParticleMode = "camera" | "field";
 const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
 
 const safeString = (v: unknown, fallback = ""): string => (typeof v === "string" ? v : fallback);
-const safeBool = (v: unknown): boolean => Boolean(v);
 
 // Preferred priority when multiple toggles are true.
 // (Harmony may allow multiple toggles; we choose one “active mode” deterministically.)
 //
 // IMPORTANT: We do NOT default to "stars" when nothing is selected.
-// Stars is an explicit selection (particles.stars === true) to prevent mode-flash.
+// Stars is an explicit selection (particles.stars === true).
 const FIELD_MODE_PRIORITY: Array<Exclude<FieldFXMode, "stars">> = [
   "embers",
   "dust",
@@ -64,7 +65,7 @@ const FIELD_MODE_PRIORITY: Array<Exclude<FieldFXMode, "stars">> = [
 
 // Returns:
 //  - a concrete FieldFXMode when we have an explicit selection
-//  - null when nothing is selected (hold previous mode; prevents stars flashing between toggles)
+//  - null when nothing is selected (TRUE OFF state; disable FieldFX / BAND morph)
 function pickFieldModeFromParticles(raw: unknown): FieldFXMode | null {
   if (!raw || typeof raw !== "object") return null;
   const m = raw as Record<string, unknown>;
@@ -77,7 +78,7 @@ function pickFieldModeFromParticles(raw: unknown): FieldFXMode | null {
   // Stars is explicit, not a fallback
   if (m.stars === true) return "stars";
 
-  // No selection: do NOT force "stars"
+  // No selection: true OFF
   return null;
 }
 
@@ -156,13 +157,6 @@ export class ParticleFXSystem {
   private lastAppliedMode: FieldFXMode | null = null;
 
   // ------------------------------------------------------------
-  // ✅ Coalesced toggle batching
-  // ------------------------------------------------------------
-
-  private pendingParticles: Record<string, boolean> | null = null;
-  private flushScheduled = false;
-
-  // ------------------------------------------------------------
   // Camera-mount behavior tuning (debug mount positioning)
   // ------------------------------------------------------------
 
@@ -193,13 +187,17 @@ export class ParticleFXSystem {
     if (this.initialized) return;
     this.initialized = true;
 
+    // ✅ Canonical truth only (prevents intermediate flash states)
     this.on<HarmonyEnvironmentSnapshot>("harmony:environment:state", (p) => this.onEnvironmentSnapshot(p, "state"));
     this.on<HarmonyEnvironmentSnapshot>("harmony:environment:changed", (p) =>
       this.onEnvironmentSnapshot(p, "changed"),
     );
 
-    this.on<ToggleParticleIntent>("harmony:environment:toggleParticle", (p) => this.onToggleIntent(p));
-    this.on<ToggleParticleIntent>("harmony:env:toggleParticle", (p) => this.onToggleIntent(p));
+    // NOTE: We intentionally ignore toggle intent events for applying FieldFX mode.
+    // They can arrive before persistence normalization/snapshot and cause 1-frame flashes.
+    // We keep listeners only for optional debug logging.
+    this.on<ToggleParticleIntent>("harmony:environment:toggleParticle", (p) => this.onToggleIntentDebug(p));
+    this.on<ToggleParticleIntent>("harmony:env:toggleParticle", (p) => this.onToggleIntentDebug(p));
 
     this.on<{ enabled: boolean }>("particlefx:debug:set", (p) => this.setDebug(Boolean(p?.enabled)));
     this.on<{ enabled: boolean }>("particlefx:debug-bounds:set", (p) => this.setDebugBounds(Boolean(p?.enabled)));
@@ -255,11 +253,6 @@ export class ParticleFXSystem {
 
     this.attachActiveMount();
     this.refreshDebugAttachments();
-
-    // ✅ If we have a pending flush, allow it to apply once targets exist
-    if (this.pendingParticles && !this.flushScheduled) {
-      this.scheduleFlush("retarget");
-    }
   }
 
   public update(dt: number): void {
@@ -346,8 +339,6 @@ export class ParticleFXSystem {
     }
 
     this.lastParticles = {};
-    this.pendingParticles = null;
-    this.flushScheduled = false;
     this.lastAppliedMode = null;
 
     this.scene = null;
@@ -384,20 +375,14 @@ export class ParticleFXSystem {
       }
     }
 
-    // ✅ Snapshot is authoritative: cancel any pending toggle batching
-    this.pendingParticles = null;
-    this.flushScheduled = false;
-
     this.lastParticles = nextCache;
 
     const nextMode = pickFieldModeFromParticles(this.lastParticles);
 
-    // IMPORTANT:
-    // If nothing is selected, DO NOT force stars (prevents inter-toggle flashing).
-    if (nextMode) {
-      this.fieldFX.setMode(nextMode);
-      this.lastAppliedMode = nextMode;
-    }
+    // ✅ IMPORTANT: "none selected" is TRUE OFF.
+    // Always apply (including null) so effects don't "stick" after UI deselect.
+    this.fieldFX.setMode(nextMode);
+    this.lastAppliedMode = nextMode;
 
     if (import.meta.env.DEV) {
       // eslint-disable-next-line no-console
@@ -405,76 +390,25 @@ export class ParticleFXSystem {
         `[ParticleFX] env snapshot (${kind}) -> FieldFX`,
         raw,
         "=>",
-        nextMode ?? "(no change)",
+        nextMode ?? "(OFF)",
         "reason=",
         (p as any)?.reason,
       );
     }
   }
 
-  private onToggleIntent(p: ToggleParticleIntent | undefined): void {
+  /**
+   * Intent debug only. We do NOT apply visual mode changes here.
+   * This prevents intermediate states from flashing before the canonical snapshot arrives.
+   */
+  private onToggleIntentDebug(p: ToggleParticleIntent | undefined): void {
+    if (!import.meta.env.DEV) return;
+
     const id = safeString(p?.particleId, "");
     if (!id) return;
 
-    const enabled = safeBool(p?.enabled);
-
-    // ✅ Update cache, but DO NOT immediately setMode() (this is what caused stars flashes).
-    if (!this.pendingParticles) {
-      this.pendingParticles = { ...this.lastParticles };
-    }
-    this.pendingParticles[id] = enabled;
-
-    this.scheduleFlush(`toggle:${id}`);
-  }
-
-  private scheduleFlush(source: string): void {
-    if (this.flushScheduled) return;
-    this.flushScheduled = true;
-
-    const run = (): void => {
-      this.flushScheduled = false;
-      this.flushPending(source);
-    };
-
-    // Microtask batching is ideal: coalesces multiple toggles in same tick
-    if (typeof queueMicrotask === "function") {
-      queueMicrotask(run);
-      return;
-    }
-
-    Promise.resolve()
-      .then(run)
-      .catch(() => {
-        // fallback if Promise microtask fails for some reason
-        setTimeout(run, 0);
-      });
-  }
-
-  private flushPending(source: string): void {
-    if (!this.pendingParticles) return;
-
-    // Commit batched state
-    this.lastParticles = this.pendingParticles;
-    this.pendingParticles = null;
-
-    const nextMode = pickFieldModeFromParticles(this.lastParticles);
-
-    // IMPORTANT:
-    // If none selected, do not force a mode (no stars blink).
-    if (nextMode) {
-      this.fieldFX.setMode(nextMode);
-      this.lastAppliedMode = nextMode;
-    }
-
-    if (import.meta.env.DEV) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[ParticleFX] flush (${source}) -> FieldFX mode`,
-        nextMode ?? "(no change)",
-        "cache=",
-        this.lastParticles,
-      );
-    }
+    // eslint-disable-next-line no-console
+    console.log(`[ParticleFX] toggle intent (ignored for apply) id='${id}' enabled=${Boolean(p?.enabled)}`);
   }
 
   // ------------------------------------------------------------

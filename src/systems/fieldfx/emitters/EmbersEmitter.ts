@@ -48,8 +48,8 @@ export const DEFAULT_EMBERS: EmbersParams = {
   respawnKick: 1.25,
 
   size: 3.0,
-  opacity: 0.95,
-  color: 0x8b0000,
+  opacity: 1.31,
+  color: 0xff0000,
   blending: THREE.AdditiveBlending,
 };
 

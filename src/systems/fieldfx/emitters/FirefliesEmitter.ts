@@ -1,3 +1,4 @@
+// src/systems/fieldfx/emitters/FirefliesEmitter.ts
 import * as THREE from "three";
 
 const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
@@ -28,6 +29,13 @@ class LcgRng {
     return this.next01() * 2 - 1;
   }
 }
+
+type FirefliesShaderUniforms = {
+  uTime?: { value: number };
+  uEnergy?: { value: number };
+  uDensity?: { value: number };
+  uSpeedMul?: { value: number };
+};
 
 export class FirefliesEmitter {
   public readonly id = "fireflies";
@@ -60,10 +68,26 @@ export class FirefliesEmitter {
   private baseColor = new THREE.Color(0xffffff);
 
   private flySize = 0.06;
-  private flyOpacity = 0.85;
+  private flyOpacity = 1.0;
   private flyColor = new THREE.Color(0xcfffb0);
 
   private tmpColor = new THREE.Color();
+
+  // ------------------------------------------------------------
+  // Fireflies twinkle (per-point fade) via shader patching
+  // ------------------------------------------------------------
+  private twinkleTime = 0;
+  private shaderUniforms: FirefliesShaderUniforms | null = null;
+
+  private prevOnBeforeCompile:
+    | ((shader: THREE.Shader, renderer: THREE.WebGLRenderer) => void)
+    | undefined
+    | null = null;
+
+  // IMPORTANT: must be called with material bound as `this`
+  private prevCustomProgramCacheKey: ((this: unknown) => string) | undefined | null = null;
+
+  private readonly shaderKey = "fireflies_twinkle_v1";
 
   public attach(points: THREE.Points): void {
     if (this.points === points) return;
@@ -109,12 +133,19 @@ export class FirefliesEmitter {
     this.cacheMaterialBase();
     this.setFireflyTargetsFromBase();
 
+    // Create per-point twinkle attributes + patch shader on the shared PointsMaterial.
+    this.ensureTwinkleAttributes();
+    this.ensureTwinkleShader();
+
     this.restorePositionsBase();
     this.restoreMaterialBase();
     this.resetSimToBase();
   }
 
   public detach(): void {
+    // Restore material hooks if we modified them.
+    this.restoreTwinkleShader();
+
     this.points = null;
     this.geometry = null;
     this.posAttr = null;
@@ -126,6 +157,9 @@ export class FirefliesEmitter {
     this.count = 0;
 
     this.burstTimer = 0;
+
+    this.twinkleTime = 0;
+    this.shaderUniforms = null;
   }
 
   public getSimPositions(): Float32Array | null {
@@ -152,13 +186,19 @@ export class FirefliesEmitter {
   }
 
   public simulate(dt: number, strength: number): void {
-    if (!this.simPositions || !this.velocities) return;
+    // We still update twinkle uniforms even if strength is tiny,
+    // so transitions OUT of fireflies fade cleanly.
     if (!isFiniteNumber(dt) || dt <= 0) return;
 
-    const s = clamp01(strength);
-    if (s <= 0.00001) return;
-
     const dts = clamp(dt, 0, 1 / 15);
+
+    // Drive twinkle density/speed from "strength" (which already includes audio & blend weights).
+    const e = clamp01(strength);
+    this.updateTwinkleUniforms(dts, e);
+
+    // If essentially off, skip physics sim to save perf.
+    if (!this.simPositions || !this.velocities) return;
+    if (e <= 0.00001) return;
 
     const sim = this.simPositions;
     const vel = this.velocities;
@@ -172,7 +212,7 @@ export class FirefliesEmitter {
     const jitterMul = (inBurst ? this.burstJitterMul : 1) * this.jitter * this.drift;
     const velMul = (inBurst ? this.burstVelMul : 1) * this.drift;
 
-    const swirl = 0.08 * s;
+    const swirl = 0.08 * e;
 
     for (let i = 0; i < this.count; i++) {
       const ix = i * 3;
@@ -297,5 +337,208 @@ export class FirefliesEmitter {
     this.flySize = Math.max(this.baseSize, 0.05);
     this.flyOpacity = Math.min(1, Math.max(0.65, this.baseOpacity));
     this.flyColor = this.baseColor.clone().lerp(new THREE.Color(0xcfffb0), 0.6);
+  }
+
+  // ------------------------------------------------------------
+  // Twinkle attributes (per-point)
+  // ------------------------------------------------------------
+
+  private ensureTwinkleAttributes(): void {
+    if (!this.geometry || this.count <= 0) return;
+
+    // If already present (hot reload), don't recreate.
+    const hasPhase = this.geometry.getAttribute("aPhase");
+    const hasSpeed = this.geometry.getAttribute("aSpeed");
+    const hasDuty = this.geometry.getAttribute("aDuty");
+    const hasAmp = this.geometry.getAttribute("aAmp");
+
+    if (hasPhase && hasSpeed && hasDuty && hasAmp) return;
+
+    const phase = new Float32Array(this.count);
+    const speed = new Float32Array(this.count);
+    const duty = new Float32Array(this.count);
+    const amp = new Float32Array(this.count);
+
+    for (let i = 0; i < this.count; i++) {
+      const r0 = this.rng.next01();
+      const r1 = this.rng.next01();
+      const r2 = this.rng.next01();
+      const r3 = this.rng.next01();
+
+      phase[i] = r0 * Math.PI * 2;
+      speed[i] = lerp(0.35, 1.60, Math.pow(r1, 0.75));
+      duty[i] = clamp01(Math.pow(r2, 2.2));
+      amp[i] = lerp(0.65, 1.15, Math.pow(r3, 0.6));
+    }
+
+    this.geometry.setAttribute("aPhase", new THREE.BufferAttribute(phase, 1));
+    this.geometry.setAttribute("aSpeed", new THREE.BufferAttribute(speed, 1));
+    this.geometry.setAttribute("aDuty", new THREE.BufferAttribute(duty, 1));
+    this.geometry.setAttribute("aAmp", new THREE.BufferAttribute(amp, 1));
+  }
+
+  // ------------------------------------------------------------
+  // Shader patching (PointsMaterial preserved)
+  // ------------------------------------------------------------
+
+  private ensureTwinkleShader(): void {
+    if (!this.material) return;
+
+    const mat = this.material as unknown as THREE.PointsMaterial;
+    if (!(mat as any).isPointsMaterial) return;
+
+    const anyMat = mat as any;
+    if (anyMat.__firefliesTwinklePatched === this.shaderKey) return;
+
+    // IMPORTANT: store originals
+    this.prevOnBeforeCompile = mat.onBeforeCompile;
+    this.prevCustomProgramCacheKey = (mat as any).customProgramCacheKey;
+
+    mat.onBeforeCompile = (shader: THREE.Shader, renderer: THREE.WebGLRenderer) => {
+      // keep any prior mods
+      if (this.prevOnBeforeCompile) this.prevOnBeforeCompile(shader, renderer);
+
+      shader.uniforms.uTime = { value: 0 };
+      shader.uniforms.uEnergy = { value: 0 };
+      shader.uniforms.uDensity = { value: 0.15 };
+      shader.uniforms.uSpeedMul = { value: 1.0 };
+
+      this.shaderUniforms = shader.uniforms as unknown as FirefliesShaderUniforms;
+
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          "void main() {",
+          `
+attribute float aPhase;
+attribute float aSpeed;
+attribute float aDuty;
+attribute float aAmp;
+
+uniform float uTime;
+uniform float uEnergy;
+uniform float uDensity;
+uniform float uSpeedMul;
+
+varying float vTwinkle;
+
+void main() {
+`,
+        )
+        .replace(
+          "#include <begin_vertex>",
+          `
+#include <begin_vertex>
+
+float tA = uTime * aSpeed * uSpeedMul + aPhase;
+float tB = uTime * (aSpeed * 0.37 + 0.11) * uSpeedMul + aPhase * 1.73;
+
+float pA = 0.5 + 0.5 * sin(tA);
+float pB = 0.5 + 0.5 * sin(tB);
+
+float raw = clamp(pA * (0.55 + 0.45 * pB), 0.0, 1.0);
+
+float d = clamp(uDensity, 0.0, 1.0);
+float gate = step(aDuty, d);
+
+float edge = 1.0 - (0.30 + 0.55 * d);
+float tw = smoothstep(edge, 1.0, raw);
+
+float e = clamp(uEnergy, 0.0, 1.0);
+float energyMul = mix(0.35, 1.0, e);
+
+vTwinkle = clamp(tw * gate * aAmp * energyMul, 0.0, 1.25);
+`,
+        );
+
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          "void main() {",
+          `
+varying float vTwinkle;
+
+void main() {
+`,
+        )
+        .replace(
+          "vec4 diffuseColor = vec4( diffuse, opacity );",
+          `
+vec4 diffuseColor = vec4( diffuse, opacity );
+
+diffuseColor.a *= clamp(vTwinkle, 0.0, 1.0);
+diffuseColor.rgb *= mix(0.85, 1.12, clamp(vTwinkle, 0.0, 1.0));
+`,
+        );
+    };
+
+    // ✅ FIX: if original cacheKey relies on `this`, we must call it with `this=mat`
+    (mat as any).customProgramCacheKey = function (this: unknown): string {
+      let base = "base";
+      if (typeof (anyMat as any).__firefliesPrevCacheKey === "function") {
+        try {
+          base = String((anyMat as any).__firefliesPrevCacheKey.call(this));
+        } catch {
+          base = "base";
+        }
+      } else if (typeof (anyMat as any).__firefliesPrevCacheKey === "string") {
+        base = String((anyMat as any).__firefliesPrevCacheKey);
+      }
+      return `${base}|${(anyMat as any).__firefliesShaderKey}`;
+    };
+
+    // store prev on the material for the wrapper above
+    anyMat.__firefliesPrevCacheKey = this.prevCustomProgramCacheKey;
+    anyMat.__firefliesShaderKey = this.shaderKey;
+
+    anyMat.__firefliesTwinklePatched = this.shaderKey;
+    mat.needsUpdate = true;
+  }
+
+  private restoreTwinkleShader(): void {
+    if (!this.material) return;
+
+    const mat = this.material as unknown as THREE.PointsMaterial;
+    if (!(mat as any).isPointsMaterial) return;
+
+    const anyMat = mat as any;
+    if (anyMat.__firefliesTwinklePatched !== this.shaderKey) return;
+
+    // Restore onBeforeCompile
+    if (this.prevOnBeforeCompile === undefined) {
+      (mat as any).onBeforeCompile = undefined;
+    } else {
+      mat.onBeforeCompile = this.prevOnBeforeCompile ?? undefined;
+    }
+
+    // Restore customProgramCacheKey
+    if (this.prevCustomProgramCacheKey == null) {
+      delete (mat as any).customProgramCacheKey;
+    } else {
+      (mat as any).customProgramCacheKey = this.prevCustomProgramCacheKey;
+    }
+
+    delete anyMat.__firefliesTwinklePatched;
+    delete anyMat.__firefliesPrevCacheKey;
+    delete anyMat.__firefliesShaderKey;
+
+    mat.needsUpdate = true;
+
+    this.prevOnBeforeCompile = null;
+    this.prevCustomProgramCacheKey = null;
+    this.shaderUniforms = null;
+  }
+
+  private updateTwinkleUniforms(dt: number, energy01: number): void {
+    this.twinkleTime += Math.max(0, dt);
+
+    const u = this.shaderUniforms;
+    if (!u) return;
+
+    const density = clamp01(lerp(0.12, 0.92, Math.pow(energy01, 0.85)));
+    const speedMul = lerp(0.30, 2.10, Math.pow(energy01, 0.95));
+
+    if (u.uTime) u.uTime.value = this.twinkleTime;
+    if (u.uEnergy) u.uEnergy.value = energy01;
+    if (u.uDensity) u.uDensity.value = density;
+    if (u.uSpeedMul) u.uSpeedMul.value = speedMul;
   }
 }

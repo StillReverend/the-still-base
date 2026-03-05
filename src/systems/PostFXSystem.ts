@@ -22,15 +22,11 @@
 // Harmony integration (Feb 2026):
 //  - setHarmonyEnvironment({ filterId, colorId }) for HarmonyEnvironmentSystem
 //  - filterId maps to PostFX profiles (colorId stored for future tinting)
-//  - NEW: colorId now drives a subtle final color tint pass (real visual win)
+//  - colorId drives a subtle final color tint pass
 //
 // Patch (Mar 2026):
-//  - Add Harmony filter profile: "lumen" (for new Lumen filter group)
-//
-// Patch (Mar 2026 - Lumen Levels):
-//  - Support 4 Lumen bloom buttons via profiles:
-//      lumen1, lumen2, lumen3, lumen4
-//  - Map filterId: f5..f8 OR lumen1..4 OR l1..4
+//  - Removed all LUMEN profile support (lumen, lumen1..4) per project direction.
+//    Any legacy filterIds for those profiles now fall back to "default".
 // ============================================================
 
 import * as THREE from "three";
@@ -56,11 +52,6 @@ export type PostFXProfileName =
   | "luna"
   | "moon"
   | "sol"
-  | "lumen"
-  | "lumen1"
-  | "lumen2"
-  | "lumen3"
-  | "lumen4"
   | "off"
   | string;
 
@@ -134,7 +125,7 @@ export interface PostFXRitualPayload {
   charge01: number;
 }
 
-// NEW: Debug controls via bus (optional)
+// Debug controls via bus (optional)
 export interface PostFXDebugMaxBloomPayload {
   enabled: boolean;
   /** If provided, overrides internal default. */
@@ -199,6 +190,7 @@ const deepMergeSettings = (base: PostFXSettings, patch?: Partial<PostFXSettings>
 };
 
 // Harmony filter mapping
+// Note: legacy "lumen*" filters are intentionally collapsed to "default" now.
 const mapHarmonyFilterToProfile = (filterId: string): PostFXProfileName => {
   const id = String(filterId || "").toLowerCase().trim();
 
@@ -210,34 +202,21 @@ const mapHarmonyFilterToProfile = (filterId: string): PostFXProfileName => {
     case "f4":
       return "luna";
 
-    // ----------------------------------------------------------
-    // ✅ Lumen bloom levels (4 buttons)
-    // Accept multiple naming schemes so UI can evolve safely:
-    //  - f5..f8
-    //  - lumen1..lumen4
-    //  - l1..l4
-    //  - "lumen" maps to the middle-ish default (lumen2)
-    // ----------------------------------------------------------
+    // Legacy LUMEN ids (removed): safe fallback
     case "f5":
-    case "l1":
-    case "lumen1":
-      return "lumen1";
-
     case "f6":
-    case "l2":
-    case "lumen":
-    case "lumen2":
-      return "lumen2";
-
     case "f7":
-    case "l3":
-    case "lumen3":
-      return "lumen3";
-
     case "f8":
+    case "l1":
+    case "l2":
+    case "l3":
     case "l4":
+    case "lumen":
+    case "lumen1":
+    case "lumen2":
+    case "lumen3":
     case "lumen4":
-      return "lumen4";
+      return "default";
 
     case "f0":
     case "off":
@@ -275,27 +254,21 @@ const mapFilterToTintBias = (filterId: string): number => {
     case "f4":
       return 0.08;
 
-    // ✅ Lumen family: a touch more "alive", still tasteful
+    // Legacy LUMEN family (removed): treat as default
     case "f5":
-    case "l1":
-    case "lumen1":
-      return 0.09;
-
     case "f6":
-    case "l2":
-    case "lumen":
-    case "lumen2":
-      return 0.10;
-
     case "f7":
-    case "l3":
-    case "lumen3":
-      return 0.11;
-
     case "f8":
+    case "l1":
+    case "l2":
+    case "l3":
     case "l4":
+    case "lumen":
+    case "lumen1":
+    case "lumen2":
+    case "lumen3":
     case "lumen4":
-      return 0.12;
+      return 0.08;
 
     case "f1":
     default:
@@ -313,7 +286,7 @@ const DEFAULT_SETTINGS: PostFXSettings = {
     enabled: true,
     strength: 0.5,
     radius: 1.0,
-    threshold: 0,
+    threshold: 0.01,
   },
   stability: {
     dtClampSeconds: 1 / 30,
@@ -340,19 +313,9 @@ const DEFAULT_PROFILES: PostFXProfile[] = [
     stability: { ...DEFAULT_SETTINGS.stability },
   },
 
-  { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.5, radius: 0.3, threshold: 0.01 } },
-  { name: "sol", enabled: true, bloom: { enabled: true, strength: 5.0, radius: 0.9, threshold: 0.01 } },
-  { name: "luna", enabled: true, bloom: { enabled: true, strength: 1.0, radius: 0.5, threshold: 0.01 } },
-
-  // ✅ Lumen bloom levels (4 buttons)
-  // Intent: increasingly "alive" without becoming Sol-level nuclear.
-  { name: "lumen1", enabled: true, bloom: { enabled: true, strength: 0.85, radius: 0.52, threshold: 0.01 } },
-  { name: "lumen2", enabled: true, bloom: { enabled: true, strength: 1.15, radius: 0.65, threshold: 0.01 } },
-  { name: "lumen3", enabled: true, bloom: { enabled: true, strength: 1.75, radius: 0.78, threshold: 0.01 } },
-  { name: "lumen4", enabled: true, bloom: { enabled: true, strength: 2.45, radius: 0.92, threshold: 0.005 } },
-
-  // Back-compat: if anything calls "lumen" as a profile directly
-  { name: "lumen", enabled: true, bloom: { enabled: true, strength: 1.15, radius: 0.65, threshold: 0.01 } },
+  { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.2, radius: 0.31, threshold: 0.79 } },
+  { name: "sol", enabled: true, bloom: { enabled: true, strength: 5.0, radius: 0.1, threshold: 0.01 } },
+  { name: "luna", enabled: true, bloom: { enabled: true, strength: 3.0, radius: 0.5, threshold: 0.01 } },
 
   { name: "void", enabled: true, bloom: { enabled: true, strength: 0.0, radius: 0.1, threshold: 0.01 } },
 ];

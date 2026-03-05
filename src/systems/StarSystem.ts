@@ -150,6 +150,10 @@ export class StarSystem {
   // State
   private readonly exclusionRadius: number;
 
+  // BAND enable/disable (Harmony particle "none" state)
+  private bandEnabled = true;
+  private bandWroteBlackWhileDisabled = false;
+
   // Breathing field intensity (0..1)
   private nearIntensity01 = 0.0;
   private nearTargetIntensity01 = 0.0;
@@ -351,7 +355,7 @@ export class StarSystem {
     const nearInnerRadius = Math.max(this.exclusionRadius, options.nearInnerRadius ?? 5000);
     const nearOuterRadius = Math.max(nearInnerRadius + 1, options.nearOuterRadius ?? 10000);
     const nearSize = Math.max(0.1, options.nearSize ?? 1.65);
-    const nearBaseColor = options.nearBaseColor ?? 0xffdd70;
+    const nearBaseColor = options.nearBaseColor ?? 0xffffed;
 
     this.nearMaxRadius = nearOuterRadius;
 
@@ -411,7 +415,7 @@ export class StarSystem {
     // ----------------------------
     // BAND (new): true 3D shell driven by low/mid/high
     // ----------------------------
-    const bandCount = Math.max(0, options.bandCount ?? 1337);
+    const bandCount = Math.max(0, options.bandCount ?? 777);
     const bandInnerRadius = Math.max(this.exclusionRadius, options.bandInnerRadius ?? 1300);
     const bandOuterRadius = Math.max(bandInnerRadius + 1, options.bandOuterRadius ?? 2600);
     const bandSize = Math.max(0.1, options.bandSize ?? 1.45);
@@ -444,6 +448,9 @@ export class StarSystem {
     this.bandPoints = new THREE.Points(this.bandGeom, this.bandMat);
     this.bandPoints.name = "Stars_BAND";
     scene.add(this.bandPoints);
+
+    // Ensure initial visibility reflects enabled state
+    this.bandPoints.visible = this.bandEnabled;
 
     // Per-star caches
     this.bandRadii = new Float32Array(bandCount);
@@ -531,6 +538,26 @@ export class StarSystem {
   // ----------------------------
   // BAND public API (Harmony-ready)
   // ----------------------------
+
+  /**
+   * True enable/disable gate for BAND rendering.
+   * When disabled, Stars_BAND is not rendered (quiet Still).
+   */
+  public setBandEnabled(enabled: boolean): void {
+    const next = Boolean(enabled);
+    if (this.bandEnabled === next) return;
+
+    this.bandEnabled = next;
+
+    // Hard visibility gate (true "quiet Still")
+    this.bandPoints.visible = next;
+
+    // When turning off, force a black write once (defensive)
+    if (!next) {
+      this.bandWroteBlackWhileDisabled = false;
+      this.bandLastWriteKey = -1;
+    }
+  }
 
   public setBandColors(colors: { low: number; mid: number; high: number }): void {
     if (typeof colors.low === "number") this.bandColorLow = hexToRgb01(colors.low);
@@ -689,7 +716,27 @@ export class StarSystem {
     // ----------------------------------------------------------
     // BAND update (low/mid/high, attack/release, shimmer)
     // ----------------------------------------------------------
-    this.updateBand(d);
+    if (this.bandEnabled) {
+      this.bandWroteBlackWhileDisabled = false;
+      this.bandPoints.visible = true;
+      this.updateBand(d);
+    } else {
+      // True OFF: hide and stop work.
+      this.bandPoints.visible = false;
+
+      // Ensure GPU buffer is black once (belt + suspenders).
+      if (!this.bandWroteBlackWhileDisabled) {
+        this.bandLevelLow = 0;
+        this.bandLevelMid = 0;
+        this.bandLevelHigh = 0;
+
+        this.writeBandColors(0, 0, 0);
+        (this.bandGeom.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+
+        this.bandLastWriteKey = 0;
+        this.bandWroteBlackWhileDisabled = true;
+      }
+    }
   }
 
   public dispose(scene: THREE.Scene): void {

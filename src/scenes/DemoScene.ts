@@ -193,6 +193,13 @@ export class DemoScene implements SceneController {
   public init(ctx: SceneContext): void {
     this.ctx = ctx;
 
+    // DEV: expose scene + ctx for console inspection
+    if (import.meta.env.DEV) {
+      (window as any).__scene = this.scene;
+      (window as any).__ctx = ctx;
+      (window as any).__demoScene = this;
+    }
+
     if (import.meta.env.DEV) {
       // eslint-disable-next-line no-console
       console.log("[DemoScene] init");
@@ -602,7 +609,7 @@ export class DemoScene implements SceneController {
 
     this.core?.update(delta);
     this.starSystem?.update(delta);
-    this.constellationSystem?.update(delta);
+    //Zthis.constellationSystem?.update(delta);
     this.ritual?.update();
 
     // DEV-only: if no audio frames are coming in, emit a gentle pulse so PostFX telemetry proves wiring.

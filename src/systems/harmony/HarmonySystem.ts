@@ -752,13 +752,27 @@ class HarmonySystem {
     this.requestRender();
   }
 
-  private toggleParticle(particleId: string, enabled: boolean): void {
-    // ✅ Mirror radio-group locally to keep UI from showing multiple "on" states.
-    this.state.particles = applyParticleRadioLocal(this.state.particles ?? {}, particleId, enabled);
-
+  private emitToggleParticleIntent(particleId: string, enabled: boolean): void {
     // Emit both canonical + alias
     this.emit("harmony:environment:toggleParticle", { particleId, enabled });
     this.emit("harmony:env:toggleParticle", { particleId, enabled });
+  }
+
+  private toggleParticle(particleId: string, enabled: boolean): void {
+    // ✅ Make particles behave as a true radio group at the SYSTEM level.
+    // Reason: if we only emit {id:false} on deselect, EnvironmentSystem may keep some other id true,
+    // and ParticleFX will “stick” to the last canonical true entry.
+    const prev = this.state.particles ?? {};
+    const next = applyParticleRadioLocal(prev, particleId, enabled);
+
+    // Emit intents for every changed key so the environment becomes canonical-radio too.
+    for (const [k, v] of Object.entries(next)) {
+      if (prev[k] === v) continue;
+      this.emitToggleParticleIntent(k, v);
+    }
+
+    // Mirror locally immediately for responsive UI
+    this.state.particles = next;
 
     this.requestRender();
   }

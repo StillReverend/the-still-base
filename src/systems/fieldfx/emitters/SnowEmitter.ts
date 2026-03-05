@@ -1,0 +1,661 @@
+// src/systems/fieldfx/emitters/SnowEmitter.ts
+// ============================================================
+// THE STILL — SnowEmitter (BAND morph controller)
+// ------------------------------------------------------------
+// Uses existing BAND points. No new point clouds.
+//
+// Goals (MVP+):
+// - Smooth snow at any framerate, including tab-switch return.
+// - Deterministic drift/swirl (no per-frame RNG jitter).
+// - Y-wrap respawn (top->bottom), stable per-flake parameters.
+// - World-scale motion (BAND radii are large) so it reads from mid camera distance.
+//
+// Fixes (Mar 2026):
+// - Y-wrap bounds from base positions.
+// - Deterministic motion + fixed-step accumulator.
+// - Large-dt reset to avoid “catch-up jitter” after tab switching.
+//
+// NEW (Mar 2026 - Option B "True Density"):
+// - Adds a stable per-point random attribute (aRand) to BAND geometry.
+// - Patches the PointsMaterial shader (onBeforeCompile) with a uDensity uniform.
+// - When uDensity < 1, only a subset of points render (true sparse snow at low energy).
+// - Defaults to uDensity = 1 (no change) unless setDensity01() is called.
+// ============================================================
+
+import * as THREE from "three";
+
+const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
+const clamp01 = (v: number): number => clamp(v, 0, 1);
+const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
+
+type MaterialState = {
+  size: number;
+  opacity: number;
+  color: THREE.Color;
+  blending: THREE.Blending;
+  transparent: boolean;
+  depthWrite: boolean;
+  sizeAttenuation: boolean;
+};
+
+class LcgRng {
+  private s: number;
+  constructor(seed = 20240303) {
+    this.s = seed >>> 0;
+  }
+  next01(): number {
+    this.s = (1664525 * this.s + 1013904223) >>> 0;
+    return (this.s >>> 0) / 4294967296;
+  }
+  nextSigned(): number {
+    return this.next01() * 2 - 1;
+  }
+}
+
+// Small sin LUT so we avoid Math.sin in tight loops.
+const SIN_LUT_SIZE = 1024;
+const SIN_LUT_MASK = SIN_LUT_SIZE - 1;
+const SIN_LUT = (() => {
+  const arr = new Float32Array(SIN_LUT_SIZE);
+  for (let i = 0; i < SIN_LUT_SIZE; i++) {
+    arr[i] = Math.sin((i / SIN_LUT_SIZE) * Math.PI * 2);
+  }
+  return arr;
+})();
+
+const lutSin = (phase: number): number => SIN_LUT[phase & SIN_LUT_MASK];
+const lutCos = (phase: number): number => SIN_LUT[(phase + (SIN_LUT_SIZE >> 2)) & SIN_LUT_MASK];
+
+export class SnowEmitter {
+  public readonly id = "snow";
+
+  private points: THREE.Points | null = null;
+  private geometry: THREE.BufferGeometry | null = null;
+  private posAttr: THREE.BufferAttribute | null = null;
+  private material: THREE.Material | null = null;
+
+  private basePositions: Float32Array | null = null;
+  private simPositions: Float32Array | null = null;
+
+  // Kept for compatibility (not required for motion anymore).
+  private velocities: Float32Array | null = null;
+
+  // Per-flake deterministic parameters
+  private phase: Int32Array | null = null; // 0..SIN_LUT_SIZE-1
+  private phaseSpeed: Float32Array | null = null; // cycles/sec (in LUT space)
+  private driftBias: Float32Array | null = null; // -1..1
+  private swirlAmt: Float32Array | null = null; // 0..1
+  private fallVar: Float32Array | null = null; // 0..1
+  private jitterAmt: Float32Array | null = null; // 0..1
+
+  private count = 0;
+  private boundsRadius = 22;
+
+  // ✅ Y-wrap bounds (computed from base positions)
+  private yMin = -22;
+  private yMax = 22;
+  private ySpan = 44;
+
+  private rng = new LcgRng(5050);
+
+  // ----------------------------------------------------------
+  // WORLD-SCALE MOTION TUNING (units/sec)
+  // ----------------------------------------------------------
+  // Snow should be slower than rain, with more lateral drift.
+  private fallSpeed = 520; // units/sec downward baseline
+  private windSpeed = 180; // units/sec lateral baseline
+  private swirlSpeed = 220; // units/sec circular drift baseline
+  private microJitterSpeed = 35; // units/sec micro variation (deterministic)
+
+  // “Sheeting” / spatial sanity at large x values
+  private shearSpeed = 85; // units/sec
+  private shearFactor = 0.00012; // keep x->z shear sane at large x
+
+  // Burst (soft “flakes appear” arrival)
+  private burstTimer = 0;
+  private burstDuration = 0.45;
+  private burstSpeedMul = 1.25;
+  private burstJitterMul = 1.15;
+
+  // ----------------------------------------------------------
+  // Fixed-step accumulator (tab-switch jitter killer)
+  // ----------------------------------------------------------
+  private accumulator = 0;
+  private fixedStep = 1 / 60;
+  private maxSubSteps = 5;
+
+  // If we see a huge dt (tab switch), we reset the sim clock/accumulator.
+  private largeDtResetSec = 0.25;
+
+  // ----------------------------------------------------------
+  // True density (Option B)
+  // ----------------------------------------------------------
+  private density01 = 1.0; // 0..1, defaults to fully visible
+  private densitySoftness = 0.03; // soft edge so density ramps don’t flicker
+
+  private baseSize = 0;
+  private baseOpacity = 1;
+  private baseColor = new THREE.Color(0xffffff);
+
+  private snowSize = 0.07;
+  private snowOpacity = 0.99;
+  private snowColor = new THREE.Color(0xffffed);
+
+  private tmpColor = new THREE.Color();
+
+  public attach(points: THREE.Points): void {
+    if (this.points === points) return;
+
+    this.detach();
+
+    this.points = points;
+    this.geometry = points.geometry as THREE.BufferGeometry;
+    this.material = points.material as THREE.Material;
+
+    const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute | undefined;
+    if (!attr || attr.itemSize !== 3) {
+      // eslint-disable-next-line no-console
+      console.warn("[SnowEmitter] BAND points has no valid position attribute.");
+      this.detach();
+      return;
+    }
+
+    this.posAttr = attr;
+
+    const arr = attr.array as Float32Array | ArrayLike<number>;
+    const len = arr.length | 0;
+    this.count = (len / 3) | 0;
+
+    const base = new Float32Array(len);
+    for (let i = 0; i < len; i++) base[i] = Number(arr[i]);
+    this.basePositions = base;
+
+    this.simPositions = new Float32Array(len);
+    this.velocities = new Float32Array(len);
+
+    // Deterministic per-flake state
+    this.phase = new Int32Array(this.count);
+    this.phaseSpeed = new Float32Array(this.count);
+    this.driftBias = new Float32Array(this.count);
+    this.swirlAmt = new Float32Array(this.count);
+    this.fallVar = new Float32Array(this.count);
+    this.jitterAmt = new Float32Array(this.count);
+
+    let r2Max = 0;
+    let yMin = Number.POSITIVE_INFINITY;
+    let yMax = Number.NEGATIVE_INFINITY;
+
+    for (let i = 0; i < this.count; i++) {
+      const ix = i * 3;
+      const x = base[ix + 0];
+      const y = base[ix + 1];
+      const z = base[ix + 2];
+
+      const d2 = x * x + y * y + z * z;
+      if (d2 > r2Max) r2Max = d2;
+
+      if (y < yMin) yMin = y;
+      if (y > yMax) yMax = y;
+    }
+
+    this.boundsRadius = Math.max(1, Math.sqrt(r2Max));
+
+    // ✅ Compute Y wrap bounds from base distribution (robust on non-perfect spheres)
+    this.yMin = Number.isFinite(yMin) ? yMin : -this.boundsRadius;
+    this.yMax = Number.isFinite(yMax) ? yMax : this.boundsRadius;
+    this.ySpan = Math.max(1e-3, this.yMax - this.yMin);
+
+    // ✅ Ensure stable per-point random attribute exists for density gating
+    this.ensureDensityAttribute();
+
+    // ✅ Patch material shader once (idempotent)
+    this.patchMaterialForDensity();
+
+    // ✅ Apply current density to shader uniforms (defaults to 1)
+    this.applyDensityToMaterial();
+
+    this.cacheMaterialBase();
+    this.setSnowTargetsFromBase();
+
+    this.restorePositionsBase();
+    this.restoreMaterialBase();
+
+    // Reset integrator state
+    this.accumulator = 0;
+
+    this.resetSimToBase();
+  }
+
+  public detach(): void {
+    this.points = null;
+    this.geometry = null;
+    this.posAttr = null;
+    this.material = null;
+
+    this.basePositions = null;
+    this.simPositions = null;
+    this.velocities = null;
+
+    this.phase = null;
+    this.phaseSpeed = null;
+    this.driftBias = null;
+    this.swirlAmt = null;
+    this.fallVar = null;
+    this.jitterAmt = null;
+
+    this.count = 0;
+    this.burstTimer = 0;
+
+    this.accumulator = 0;
+
+    this.yMin = -22;
+    this.yMax = 22;
+    this.ySpan = 44;
+  }
+
+  public getSimPositions(): Float32Array | null {
+    return this.simPositions;
+  }
+
+  /**
+   * True density control (Option B)
+   * - 1.0 = all points visible (default)
+   * - 0.05 = ~5% of points visible (sparse flakes)
+   */
+  public setDensity01(density01: number, softness01?: number): void {
+    const d = clamp01(density01);
+    this.density01 = d;
+
+    if (typeof softness01 === "number" && Number.isFinite(softness01)) {
+      // Keep softness in a sane range. Too small can look “steppy”; too big looks foggy.
+      this.densitySoftness = clamp(softness01, 0.005, 0.10);
+    }
+
+    this.applyDensityToMaterial();
+  }
+
+  public resetSimToBase(): void {
+    if (
+      !this.basePositions ||
+      !this.simPositions ||
+      !this.velocities ||
+      !this.phase ||
+      !this.phaseSpeed ||
+      !this.driftBias ||
+      !this.swirlAmt ||
+      !this.fallVar ||
+      !this.jitterAmt
+    )
+      return;
+
+    const base = this.basePositions;
+    const sim = this.simPositions;
+    const vel = this.velocities;
+
+    for (let i = 0; i < base.length; i++) sim[i] = base[i];
+
+    for (let i = 0; i < this.count; i++) {
+      const ix = i * 3;
+
+      // Legacy vel init (kept for compatibility / future use)
+      vel[ix + 0] = this.rng.nextSigned() * 0.02;
+      vel[ix + 1] = -Math.abs(this.rng.next01()) * 0.02;
+      vel[ix + 2] = this.rng.nextSigned() * 0.02;
+
+      // Stable drift bias + swirl params (no popping)
+      this.driftBias[i] = this.rng.nextSigned();
+      this.swirlAmt[i] = this.rng.next01(); // 0..1
+      this.fallVar[i] = this.rng.next01(); // 0..1
+      this.jitterAmt[i] = this.rng.next01(); // 0..1
+
+      // Phase in LUT space + speed (cycles/sec mapped into LUT increments)
+      this.phase[i] = (this.rng.next01() * SIN_LUT_SIZE) | 0;
+      this.phaseSpeed[i] = 0.18 + this.rng.next01() * 0.55; // slow, floaty
+
+      // Start some flakes slightly above their base Y for immediate read
+      const lift = this.rng.next01() * (this.ySpan * 0.06);
+      sim[ix + 1] = base[ix + 1] + lift;
+    }
+
+    this.burstTimer = this.burstDuration;
+    this.accumulator = 0;
+  }
+
+  public simulate(dt: number, strength: number): void {
+    if (
+      !this.simPositions ||
+      !this.basePositions ||
+      !this.phase ||
+      !this.phaseSpeed ||
+      !this.driftBias ||
+      !this.swirlAmt ||
+      !this.fallVar ||
+      !this.jitterAmt
+    )
+      return;
+
+    if (!isFiniteNumber(dt) || dt <= 0) return;
+
+    const s = clamp01(strength);
+    if (s <= 0.00001) return;
+
+    // Large-dt reset (tab switch / throttled timers)
+    if (dt >= this.largeDtResetSec) {
+      this.accumulator = 0;
+      // Also end burst so we don't re-trigger weirdness on return.
+      this.burstTimer = 0;
+      return;
+    }
+
+    // Accumulate and step at fixed rate for smooth visuals
+    this.accumulator += clamp(dt, 0, 0.1);
+
+    let steps = 0;
+    while (this.accumulator >= this.fixedStep && steps < this.maxSubSteps) {
+      this.step(this.fixedStep, s);
+      this.accumulator -= this.fixedStep;
+      steps++;
+    }
+
+    // If we fell behind badly, drop remainder (prevents spirals)
+    if (steps >= this.maxSubSteps) {
+      this.accumulator = 0;
+    }
+  }
+
+  private step(dts: number, strength01: number): void {
+    if (
+      !this.simPositions ||
+      !this.basePositions ||
+      !this.phase ||
+      !this.phaseSpeed ||
+      !this.driftBias ||
+      !this.swirlAmt ||
+      !this.fallVar ||
+      !this.jitterAmt
+    )
+      return;
+
+    const sim = this.simPositions;
+    const base = this.basePositions;
+
+    // Burst (soft arrival)
+    const inBurst = this.burstTimer > 0;
+    if (inBurst) this.burstTimer = Math.max(0, this.burstTimer - dts);
+
+    const speedMul = inBurst ? this.burstSpeedMul : 1;
+    const jitterMul = inBurst ? this.burstJitterMul : 1;
+
+    // Y-wrap thresholding
+    const yMin = this.yMin;
+    const yMax = this.yMax;
+    const yMargin = this.ySpan * 0.10;
+
+    const s = clamp01(strength01);
+
+    for (let i = 0; i < this.count; i++) {
+      const ix = i * 3;
+
+      // Advance phase deterministically in LUT space
+      const inc = this.phaseSpeed[i] * SIN_LUT_SIZE * dts;
+      let ph = (this.phase[i] + (inc | 0)) & SIN_LUT_MASK;
+      this.phase[i] = ph;
+
+      const si = lutSin(ph);
+      const ci = lutCos(ph);
+
+      const bias = this.driftBias[i];
+      const swirlAmt = this.swirlAmt[i];
+      const fallVar = this.fallVar[i];
+      const jitAmt = this.jitterAmt[i];
+
+      const fall = this.fallSpeed * (0.72 + fallVar * 0.55) * s * speedMul;
+      const wind = this.windSpeed * (0.55 + swirlAmt * 0.80) * s * speedMul;
+      const swirl = this.swirlSpeed * (0.35 + swirlAmt * 0.95) * s * speedMul;
+
+      // Deterministic “micro jitter” from a second phase offset (no RNG)
+      const ph2 = (ph + 173) & SIN_LUT_MASK;
+      const jx = lutSin(ph2) * (this.microJitterSpeed * (0.25 + jitAmt) * s * jitterMul);
+      const jz = lutCos(ph2) * (this.microJitterSpeed * (0.25 + jitAmt) * s * jitterMul);
+
+      // Lateral drift: wind bias + swirl
+      sim[ix + 0] += (bias * wind + ci * swirl + jx) * dts;
+      sim[ix + 2] += (bias * (wind * 0.65) + si * swirl + jz) * dts;
+
+      // Gentle shear: gives snow a faint “curtain” angle
+      const x = sim[ix + 0];
+      sim[ix + 2] += x * this.shearSpeed * s * speedMul * dts * this.shearFactor;
+
+      // Fall
+      sim[ix + 1] -= fall * dts;
+
+      // Wrap bottom -> top
+      if (sim[ix + 1] < yMin - yMargin) {
+        const bx = base[ix + 0];
+        const bz = base[ix + 2];
+
+        const spread = this.boundsRadius * 0.04;
+
+        sim[ix + 0] = bx + this.rng.nextSigned() * spread;
+        sim[ix + 1] = yMax + this.rng.next01() * yMargin;
+        sim[ix + 2] = bz + this.rng.nextSigned() * spread;
+
+        // Keep drift params stable, but re-randomize phase a touch so clumps don't sync
+        this.phase[i] = (this.phase[i] + ((this.rng.next01() * 97) | 0)) & SIN_LUT_MASK;
+      }
+    }
+  }
+
+  // NEW: compositor sampling
+  public sampleMaterial(morph01: number, out: MaterialState): void {
+    const t = clamp01(morph01);
+
+    out.size = lerp(this.baseSize, this.snowSize, t);
+    out.opacity = lerp(this.baseOpacity, this.snowOpacity, t);
+
+    this.tmpColor.lerpColors(this.baseColor, this.snowColor, t);
+    out.color.copy(this.tmpColor);
+
+    out.blending = THREE.NormalBlending;
+    out.transparent = true;
+    out.depthWrite = false;
+
+    out.sizeAttenuation = false;
+  }
+
+  // Legacy remains
+  public applyPositionMorph(morph01: number): void {
+    if (!this.posAttr || !this.basePositions || !this.simPositions) return;
+
+    const t = clamp01(morph01);
+    const live = this.posAttr.array as Float32Array;
+    const base = this.basePositions;
+    const sim = this.simPositions;
+
+    for (let i = 0; i < live.length; i++) live[i] = lerp(base[i], sim[i], t);
+    this.posAttr.needsUpdate = true;
+  }
+
+  public applyMaterialMorph(morph01: number): void {
+    if (!this.material) return;
+
+    const t = clamp01(morph01);
+    const mat = this.material as THREE.PointsMaterial;
+    if (!(mat as any).isPointsMaterial) return;
+
+    mat.size = lerp(this.baseSize, this.snowSize, t);
+    mat.opacity = lerp(this.baseOpacity, this.snowOpacity, t);
+
+    this.tmpColor.lerpColors(this.baseColor, this.snowColor, t);
+    mat.color.copy(this.tmpColor);
+
+    mat.transparent = true;
+    mat.depthWrite = false;
+
+    mat.sizeAttenuation = false;
+
+    // Keep density uniforms in sync during morphs too
+    this.applyDensityToMaterial();
+
+    mat.needsUpdate = true;
+  }
+
+  public restorePositionsBase(): void {
+    if (!this.posAttr || !this.basePositions) return;
+
+    const live = this.posAttr.array as Float32Array;
+    const base = this.basePositions;
+
+    for (let i = 0; i < live.length; i++) live[i] = base[i];
+    this.posAttr.needsUpdate = true;
+  }
+
+  public restoreMaterialBase(): void {
+    if (!this.material) return;
+
+    const mat = this.material as THREE.PointsMaterial;
+    if (!(mat as any).isPointsMaterial) return;
+
+    mat.size = this.baseSize;
+    mat.opacity = this.baseOpacity;
+    mat.color.copy(this.baseColor);
+
+    mat.transparent = true;
+    mat.depthWrite = false;
+
+    mat.sizeAttenuation = false;
+
+    // Keep density uniforms in sync even when restoring material state
+    this.applyDensityToMaterial();
+
+    mat.needsUpdate = true;
+  }
+
+  private cacheMaterialBase(): void {
+    if (!this.material) return;
+
+    const mat = this.material as THREE.PointsMaterial;
+    if (!(mat as any).isPointsMaterial) return;
+
+    this.baseSize = typeof mat.size === "number" ? mat.size : 0.04;
+    this.baseOpacity = typeof mat.opacity === "number" ? mat.opacity : 1;
+    this.baseColor = (mat.color ? mat.color.clone() : new THREE.Color(0xffffff)) as THREE.Color;
+  }
+
+  private setSnowTargetsFromBase(): void {
+    this.snowSize = Math.max(this.baseSize * 1.35, 0.065);
+    this.snowOpacity = Math.min(0.5, Math.max(0.24, this.baseOpacity * 0.99));
+    this.snowColor = this.baseColor.clone().lerp(new THREE.Color(0xffffed), 0.58);
+  }
+
+  // ==========================================================
+  // Option B internals: stable per-point random + shader gating
+  // ==========================================================
+
+  private ensureDensityAttribute(): void {
+    if (!this.geometry) return;
+    if (this.count <= 0) return;
+
+    const name = "aRand";
+
+    const existing = this.geometry.getAttribute(name) as THREE.BufferAttribute | undefined;
+    if (existing && existing.itemSize === 1 && (existing.array as any)?.length === this.count) {
+      return;
+    }
+
+    const arr = new Float32Array(this.count);
+
+    // Use a deterministic seed separate from motion RNG
+    const seedRng = new LcgRng(9002);
+
+    for (let i = 0; i < this.count; i++) {
+      arr[i] = seedRng.next01();
+    }
+
+    const attr = new THREE.BufferAttribute(arr, 1);
+    attr.setUsage(THREE.StaticDrawUsage);
+
+    this.geometry.setAttribute(name, attr);
+  }
+
+  private patchMaterialForDensity(): void {
+    if (!this.material) return;
+
+    const mat = this.material as THREE.PointsMaterial;
+    if (!(mat as any).isPointsMaterial) return;
+
+    const ud = mat.userData as any;
+    if (ud.__stillDensityPatched) return;
+    ud.__stillDensityPatched = true;
+
+    const prevOnBeforeCompile = mat.onBeforeCompile?.bind(mat);
+
+    mat.onBeforeCompile = (shader: THREE.Shader) => {
+      if (prevOnBeforeCompile) prevOnBeforeCompile(shader);
+
+      shader.uniforms.uDensity = { value: 1.0 };
+      shader.uniforms.uDensitySoft = { value: 0.03 };
+
+      ud.__stillDensityShader = shader;
+
+      shader.vertexShader =
+        `attribute float aRand;\nvarying float vRand;\n` +
+        shader.vertexShader.replace(
+          "#include <begin_vertex>",
+          `#include <begin_vertex>\n  vRand = aRand;`,
+        );
+
+      if (!shader.vertexShader.includes("vRand = aRand")) {
+        shader.vertexShader = shader.vertexShader.replace("void main() {", "void main() {\n  vRand = aRand;");
+      }
+
+      shader.fragmentShader =
+        `uniform float uDensity;\nuniform float uDensitySoft;\nvarying float vRand;\n` +
+        shader.fragmentShader;
+
+      const needle = "gl_FragColor = vec4( diffuse, opacity );";
+      if (shader.fragmentShader.includes(needle)) {
+        shader.fragmentShader = shader.fragmentShader.replace(
+          needle,
+          `${needle}
+  float d = clamp(uDensity, 0.0, 1.0);
+  float soft = clamp(uDensitySoft, 0.001, 0.25);
+  float mask = smoothstep(d, max(0.0, d - soft), vRand);
+  gl_FragColor.a *= mask;
+  if (gl_FragColor.a <= 0.001) discard;`,
+        );
+      } else {
+        shader.fragmentShader = shader.fragmentShader.replace(
+          "}",
+          `
+  float d = clamp(uDensity, 0.0, 1.0);
+  float soft = clamp(uDensitySoft, 0.001, 0.25);
+  float mask = smoothstep(d, max(0.0, d - soft), vRand);
+  gl_FragColor.a *= mask;
+  if (gl_FragColor.a <= 0.001) discard;
+}`,
+        );
+      }
+    };
+
+    mat.needsUpdate = true;
+  }
+
+  private applyDensityToMaterial(): void {
+    if (!this.material) return;
+
+    const mat = this.material as THREE.PointsMaterial;
+    if (!(mat as any).isPointsMaterial) return;
+
+    const ud = mat.userData as any;
+    const shader: THREE.Shader | undefined = ud.__stillDensityShader;
+
+    if (shader?.uniforms?.uDensity) {
+      shader.uniforms.uDensity.value = clamp01(this.density01);
+    }
+    if (shader?.uniforms?.uDensitySoft) {
+      shader.uniforms.uDensitySoft.value = clamp(this.densitySoftness, 0.005, 0.10);
+    }
+  }
+}
