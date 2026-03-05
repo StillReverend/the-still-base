@@ -12,13 +12,28 @@ import { LeavesEmitter } from "./emitters/LeavesEmitter";
 import { RainEmitter } from "./emitters/RainEmitter";
 import { SnowEmitter } from "./emitters/SnowEmitter";
 
-export type FieldFXMode = "stars" | "embers" | "dust" | "rain" | "snow" | "fireflies" | "leaves";
+export type FieldFXMode =
+  | "stars"
+  | "embers"
+  | "dust"
+  | "rain"
+  | "snow"
+  | "fireflies"
+  | "leaves";
 
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
-const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
+const isFiniteNumber = (v: number): boolean =>
+  Number.isFinite(v) && !Number.isNaN(v);
 
-type ResolvedMode = "stars" | "embers" | "dust" | "rain" | "snow" | "fireflies" | "leaves";
+type ResolvedMode =
+  | "stars"
+  | "embers"
+  | "dust"
+  | "rain"
+  | "snow"
+  | "fireflies"
+  | "leaves";
 
 const normalizeMode = (mode: FieldFXMode | null): ResolvedMode => {
   if (mode === "embers") return "embers";
@@ -45,15 +60,50 @@ const DEFAULT_TRANSITION: TransitionProfile = {
 };
 
 const TRANSITIONS: Record<ResolvedMode, TransitionProfile> = {
-  embers: { morphEase: 8.5, burstDuration: 0.6, burstStrengthBoost: 2.25, burstMorphEaseBoost: 1.8 },
-  dust: { morphEase: 8.0, burstDuration: 0.45, burstStrengthBoost: 1.8, burstMorphEaseBoost: 1.5 },
-  fireflies: { morphEase: 8.2, burstDuration: 0.5, burstStrengthBoost: 2.05, burstMorphEaseBoost: 1.6 },
-  leaves: { morphEase: 7.8, burstDuration: 0.55, burstStrengthBoost: 1.9, burstMorphEaseBoost: 1.55 },
+  embers: {
+    morphEase: 8.5,
+    burstDuration: 0.6,
+    burstStrengthBoost: 2.25,
+    burstMorphEaseBoost: 1.8,
+  },
+  dust: {
+    morphEase: 8.0,
+    burstDuration: 0.45,
+    burstStrengthBoost: 1.8,
+    burstMorphEaseBoost: 1.5,
+  },
+  fireflies: {
+    morphEase: 8.2,
+    burstDuration: 0.5,
+    burstStrengthBoost: 2.05,
+    burstMorphEaseBoost: 1.6,
+  },
+  leaves: {
+    morphEase: 7.8,
+    burstDuration: 0.55,
+    burstStrengthBoost: 1.9,
+    burstMorphEaseBoost: 1.55,
+  },
 
-  rain: { morphEase: 9.5, burstDuration: 0.4, burstStrengthBoost: 1.85, burstMorphEaseBoost: 1.45 },
-  snow: { morphEase: 7.6, burstDuration: 0.55, burstStrengthBoost: 1.7, burstMorphEaseBoost: 1.35 },
+  rain: {
+    morphEase: 9.5,
+    burstDuration: 0.4,
+    burstStrengthBoost: 1.85,
+    burstMorphEaseBoost: 1.45,
+  },
+  snow: {
+    morphEase: 7.6,
+    burstDuration: 0.55,
+    burstStrengthBoost: 1.7,
+    burstMorphEaseBoost: 1.35,
+  },
 
-  stars: { morphEase: 16.0, burstDuration: 0.0, burstStrengthBoost: 1.0, burstMorphEaseBoost: 1.0 },
+  stars: {
+    morphEase: 16.0,
+    burstDuration: 0.0,
+    burstStrengthBoost: 1.0,
+    burstMorphEaseBoost: 1.0,
+  },
 };
 
 const easeOutCubic01 = (t: number): number => {
@@ -195,8 +245,12 @@ export class FieldFXSystem {
     this.bus = opts.bus;
 
     this.onDevModeSet = (payload: unknown) => {
-      const mode = (payload as any)?.mode as FieldFXMode | undefined;
-      if (!mode) return;
+      // Explicit contract:
+      // - mode: null      => OFF
+      // - mode: "stars"|... => ON that mode
+      // - mode: undefined / missing => NO-OP
+      const mode = (payload as any)?.mode as FieldFXMode | null | undefined;
+      if (mode === undefined) return;
       this.setMode(mode);
     };
 
@@ -243,7 +297,9 @@ export class FieldFXSystem {
     this.geom = points.geometry as THREE.BufferGeometry;
     const pos = this.geom.getAttribute("position") as THREE.BufferAttribute | undefined;
     if (!pos || !(pos.array instanceof Float32Array) || pos.itemSize !== 3) {
-      throw new Error("[FieldFXSystem] BAND position attribute must be Float32Array itemSize=3.");
+      throw new Error(
+        "[FieldFXSystem] BAND position attribute must be Float32Array itemSize=3.",
+      );
     }
 
     this.posAttr = pos;
@@ -322,7 +378,8 @@ export class FieldFXSystem {
     this.off = false;
 
     const nextResolved = normalizeMode(mode);
-    if (!wasOff && nextResolved === this.targetResolved && mode === this.targetMode) return;
+    if (!wasOff && nextResolved === this.targetResolved && mode === this.targetMode)
+      return;
 
     this.targetMode = mode;
     this.targetResolved = nextResolved;
@@ -340,10 +397,14 @@ export class FieldFXSystem {
       return;
     }
 
-    this.transition = { ...DEFAULT_TRANSITION, ...(TRANSITIONS[this.targetResolved] ?? {}) };
+    this.transition = {
+      ...DEFAULT_TRANSITION,
+      ...(TRANSITIONS[this.targetResolved] ?? {}),
+    };
     this.blend01 = 0;
 
-    const enteringFromStars = (wasOff || this.activeResolved === "stars") && this.targetResolved !== "stars";
+    const enteringFromStars =
+      (wasOff || this.activeResolved === "stars") && this.targetResolved !== "stars";
     this.burstAllowed = enteringFromStars;
     this.burstTimeLeft = enteringFromStars ? this.transition.burstDuration : 0;
 
@@ -354,7 +415,10 @@ export class FieldFXSystem {
     if (wasOff) {
       this.applyBaseNow();
       this.activeResolved = "stars";
-      this.transition = { ...DEFAULT_TRANSITION, ...(TRANSITIONS[this.targetResolved] ?? {}) };
+      this.transition = {
+        ...DEFAULT_TRANSITION,
+        ...(TRANSITIONS[this.targetResolved] ?? {}),
+      };
       this.blend01 = 0;
 
       const fromStars = this.targetResolved !== "stars";
@@ -388,7 +452,8 @@ export class FieldFXSystem {
     if (d > this.simGapResetSec) {
       // Reset both ends of the transition so we don’t “step” a long integration frame.
       this.resetSimFor(this.activeResolved);
-      if (this.targetResolved !== this.activeResolved) this.resetSimFor(this.targetResolved);
+      if (this.targetResolved !== this.activeResolved)
+        this.resetSimFor(this.targetResolved);
 
       // Also soften any gust carry so it doesn’t snap.
       this.gust01 = 0;
@@ -420,7 +485,9 @@ export class FieldFXSystem {
 
     this.blend01 = lerp(this.blend01, 1, t);
 
-    const strengthBoost = burstActive ? lerp(1, this.transition.burstStrengthBoost, burst01) : 1;
+    const strengthBoost = burstActive
+      ? lerp(1, this.transition.burstStrengthBoost, burst01)
+      : 1;
 
     const inW = clamp01(this.blend01);
     const outW = 1 - inW;
@@ -431,8 +498,16 @@ export class FieldFXSystem {
     const audioMulActive = this.getAudioIntensityMul(this.activeResolved, d);
     const audioMulTarget = this.getAudioIntensityMul(this.targetResolved, d);
 
-    this.simulateMode(this.activeResolved, d, clamp01(outW * strengthBoost) * audioMulActive);
-    this.simulateMode(this.targetResolved, d, clamp01(inW * strengthBoost) * audioMulTarget);
+    this.simulateMode(
+      this.activeResolved,
+      d,
+      clamp01(outW * strengthBoost) * audioMulActive,
+    );
+    this.simulateMode(
+      this.targetResolved,
+      d,
+      clamp01(inW * strengthBoost) * audioMulTarget,
+    );
 
     this.applyComposite(inW);
 
@@ -520,7 +595,8 @@ export class FieldFXSystem {
   }
 
   private applyComposite(inWeight01: number): void {
-    if (!this.basePositions || !this.livePositions || !this.posAttr || !this.baseMat || !this.mat) return;
+    if (!this.basePositions || !this.livePositions || !this.posAttr || !this.baseMat || !this.mat)
+      return;
 
     const inW = clamp01(inWeight01);
     const outW = 1 - inW;
@@ -550,9 +626,11 @@ export class FieldFXSystem {
       if (!simFrom && !simTo) {
         live.set(base);
       } else if (!simFrom) {
-        for (let i = 0; i < live.length; i++) live[i] = lerp(base[i], (simTo as Float32Array)[i], inW);
+        for (let i = 0; i < live.length; i++)
+          live[i] = lerp(base[i], (simTo as Float32Array)[i], inW);
       } else if (!simTo) {
-        for (let i = 0; i < live.length; i++) live[i] = lerp((simFrom as Float32Array)[i], base[i], inW);
+        for (let i = 0; i < live.length; i++)
+          live[i] = lerp((simFrom as Float32Array)[i], base[i], inW);
       } else {
         for (let i = 0; i < live.length; i++) {
           const posFrom = lerp(base[i], simFrom[i], outW);
@@ -567,7 +645,9 @@ export class FieldFXSystem {
     let matW = inW;
 
     const enteringFromStars =
-      this.activeResolved === "stars" && this.targetResolved !== "stars" && this.activeResolved !== this.targetResolved;
+      this.activeResolved === "stars" &&
+      this.targetResolved !== "stars" &&
+      this.activeResolved !== this.targetResolved;
 
     if (enteringFromStars) {
       matW = smoothstep01(0.08, 0.24, inW);

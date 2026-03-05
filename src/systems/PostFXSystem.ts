@@ -27,6 +27,13 @@
 // Patch (Mar 2026):
 //  - Removed all LUMEN profile support (lumen, lumen1..4) per project direction.
 //    Any legacy filterIds for those profiles now fall back to "default".
+//
+// Patch (Mar 2026 - Profile cleanup):
+//  - Canonical profile names ONLY (no alias family):
+//      "default" | "blackHole" | "sol" | "luna" | "off"
+//  - Removed "void" profile.
+//  - Removed PostFXProfileName "string" escape hatch.
+//  - setProfile() now falls back loudly to "default" if an unknown name arrives at runtime.
 // ============================================================
 
 import * as THREE from "three";
@@ -42,18 +49,14 @@ import type { EventBus } from "../core/EventBus";
 // Types
 // ------------------------------------------------------------
 
-export type PostFXProfileName =
-  | "default"
-  | "void"
-  | "blackHole"
-  | "solar"
-  | "sun"
-  | "lunar"
-  | "luna"
-  | "moon"
-  | "sol"
-  | "off"
-  | string;
+/**
+ * Canonical, strict PostFX profiles.
+ * No aliases, no "string" escape hatch.
+ *
+ * If something tries to call setProfile("solar"), TypeScript should catch it.
+ * If garbage still arrives at runtime (JS), setProfile will fall back loudly.
+ */
+export type PostFXProfileName = "default" | "blackHole" | "sol" | "luna" | "off";
 
 export interface BloomSettings {
   enabled: boolean;
@@ -76,11 +79,11 @@ export interface PostFXSettings {
   enabled: boolean;
   bloom: BloomSettings;
   stability: StabilitySettings;
-  activeProfile?: string;
+  activeProfile?: PostFXProfileName;
 }
 
 export interface PostFXProfile {
-  name: string;
+  name: PostFXProfileName;
   enabled?: boolean;
   bloom?: Partial<BloomSettings>;
   stability?: Partial<StabilitySettings>;
@@ -189,8 +192,10 @@ const deepMergeSettings = (base: PostFXSettings, patch?: Partial<PostFXSettings>
   };
 };
 
-// Harmony filter mapping
-// Note: legacy "lumen*" filters are intentionally collapsed to "default" now.
+// ------------------------------------------------------------
+// Canonical Harmony filter mapping -> canonical profiles
+// ------------------------------------------------------------
+
 const mapHarmonyFilterToProfile = (filterId: string): PostFXProfileName => {
   const id = String(filterId || "").toLowerCase().trim();
 
@@ -293,7 +298,10 @@ const DEFAULT_SETTINGS: PostFXSettings = {
     bloomAttack: 12,
     bloomRelease: 6,
     resizeIgnorePxJitter: 1,
-    maxBloomStrength: 3,
+
+    // Important: needs to be >= strongest profile strength (sol=5)
+    maxBloomStrength: 12,
+
     stabilizationFrames: 3,
     primeFrames: 2,
   },
@@ -316,8 +324,6 @@ const DEFAULT_PROFILES: PostFXProfile[] = [
   { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.2, radius: 0.31, threshold: 0.79 } },
   { name: "sol", enabled: true, bloom: { enabled: true, strength: 5.0, radius: 0.1, threshold: 0.01 } },
   { name: "luna", enabled: true, bloom: { enabled: true, strength: 3.0, radius: 0.5, threshold: 0.01 } },
-
-  { name: "void", enabled: true, bloom: { enabled: true, strength: 0.0, radius: 0.1, threshold: 0.01 } },
 ];
 
 // ------------------------------------------------------------
@@ -350,7 +356,7 @@ export class PostFXSystem {
   private targetScene: THREE.Scene;
   private targetCamera: THREE.Camera;
 
-  private profiles: Map<string, PostFXProfile>;
+  private profiles: Map<PostFXProfileName, PostFXProfile>;
 
   private readonly debugEnabled: boolean;
   private lastLoggedBloomTarget = -999;
@@ -407,9 +413,11 @@ export class PostFXSystem {
     this.audioEnergyLastRxMs = performance.now();
     this.setAudioEnergy(payload?.impact01 ?? 0);
   };
+
   private readonly onImpulseEvent = (payload: PostFXImpulsePayload): void => {
     this.addImpulse(payload?.amount01 ?? 0);
   };
+
   private readonly onRitualEvent = (payload: PostFXRitualPayload): void => {
     this.setRitualCharge(payload?.charge01 ?? 0);
   };
@@ -445,7 +453,7 @@ export class PostFXSystem {
     this.debugEnabled = typeof import.meta !== "undefined" ? Boolean((import.meta as any).env?.DEV) : false;
 
     const allProfiles = [...DEFAULT_PROFILES, ...(deps.profiles ?? [])];
-    this.profiles = new Map(allProfiles.map((p) => [p.name, p]));
+    this.profiles = new Map(allProfiles.map((p) => [p.name, p] as const));
 
     if (deps.bus) {
       this.bus = deps.bus;
@@ -639,22 +647,39 @@ export class PostFXSystem {
       console.log(`[PostFX] setProfile("${profileName}") @ ${performance.now().toFixed(0)}ms`);
     }
 
-    if (String(profileName).toLowerCase() === "off") {
+    if (profileName === "off") {
       this.setEnabled(false);
       return;
     }
 
-    const profile = this.profiles.get(profileName);
+    // Runtime guard: if JS sends garbage, fall back loudly.
+    let resolved: PostFXProfileName = profileName;
+    const profile = this.profiles.get(resolved);
+
     if (!profile) {
-      this.settings.activeProfile = profileName;
+      if (this.debugEnabled) {
+        // eslint-disable-next-line no-console
+        console.error(`[PostFX] Unknown profile '${String(profileName)}'. Falling back to 'default'.`);
+      }
+      resolved = "default";
+    }
+
+    const p = this.profiles.get(resolved);
+    if (!p) {
+      // This should never happen unless DEFAULT_PROFILES is corrupted.
+      if (this.debugEnabled) {
+        // eslint-disable-next-line no-console
+        console.error("[PostFX] Missing 'default' profile. Disabling PostFX.");
+      }
+      this.setEnabled(false, true);
       return;
     }
 
     const next: Partial<PostFXSettings> = {
-      enabled: profile.enabled ?? this.settings.enabled,
-      bloom: profile.bloom ? { ...this.settings.bloom, ...profile.bloom } : this.settings.bloom,
-      stability: profile.stability ? { ...this.settings.stability, ...profile.stability } : this.settings.stability,
-      activeProfile: profileName,
+      enabled: p.enabled ?? this.settings.enabled,
+      bloom: p.bloom ? { ...this.settings.bloom, ...p.bloom } : this.settings.bloom,
+      stability: p.stability ? { ...this.settings.stability, ...p.stability } : this.settings.stability,
+      activeProfile: resolved,
     };
 
     this.settings = deepMergeSettings(this.settings, next);
@@ -870,9 +895,11 @@ export class PostFXSystem {
           3,
         )}) swell01=${swell01.toFixed(3)} quiet=${quiet ? "Y" : "N"} cutoff=${this.quietEnergyCutoff.toFixed(
           4,
-        )} floor=${this.intensityFloor.toFixed(3)} pow=${this.intensityPow.toFixed(2)} minPlay=${this.minBloomWhenPlaying01.toFixed(
-          3,
-        )} profile=${this.settings.activeProfile ?? "?"} @ ${performance.now().toFixed(0)}ms`,
+        )} floor=${this.intensityFloor.toFixed(3)} pow=${this.intensityPow.toFixed(
+          2,
+        )} minPlay=${this.minBloomWhenPlaying01.toFixed(3)} profile=${this.settings.activeProfile ?? "?"} @ ${performance.now().toFixed(
+          0,
+        )}ms`,
       );
     }
 
@@ -1091,9 +1118,9 @@ export class PostFXSystem {
         `fromAudio=${info.strengthFromAudio.toFixed(2)} +imp=${info.impulseBoost.toFixed(2)} +rit=${info.ritualBoost.toFixed(
           2,
         )} ` +
-        `=> target(str=${this.bloomStrengthTarget.toFixed(2)} rad=${this.bloomRadiusTarget.toFixed(2)} thr=${this.bloomPass.threshold.toFixed(
-          3,
-        )}) ` +
+        `=> target(str=${this.bloomStrengthTarget.toFixed(2)} rad=${this.bloomRadiusTarget.toFixed(
+          2,
+        )} thr=${this.bloomPass.threshold.toFixed(3)}) ` +
         `applied(str=${this.bloomPass.strength.toFixed(2)} rad=${this.bloomPass.radius.toFixed(2)})`,
     );
   }

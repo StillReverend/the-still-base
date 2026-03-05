@@ -7,6 +7,10 @@
 // MVP (Mar 2026):
 //  - KEEP: Ritual, Presets, Filters, Particles, Ambient, Audio Sliders
 //  - REMOVE: Lumen + Spectrum (and all related UI/capability/unlock plumbing)
+//
+// Patch (Mar 2026):
+//  - Particle winner selection for visuals is now deterministic (priority list),
+//    matching HarmonyEnvironmentSystem behavior.
 // ============================================================
 
 import type { HarmonyState } from "./types";
@@ -41,7 +45,10 @@ type UIHandlers = {
   onSetRitualDuration(durationSec: number): void;
 
   // ✅ Howler lane sliders (Phase 1.5)
-  onSetHowlerLane?(lane: "master" | "music" | "sfx" | "ambient" | "ui", volume01: number): void;
+  onSetHowlerLane?(
+    lane: "master" | "music" | "sfx" | "ambient" | "ui",
+    volume01: number,
+  ): void;
 
   // ✅ Optional UI SFX hooks (HarmonySystem can wire these to EventBus)
   onUiHover?: () => void;
@@ -248,7 +255,11 @@ function readCaps(state: HarmonyState): HarmonyCapabilitiesMap {
   return raw as HarmonyCapabilitiesMap;
 }
 
-function capEnabled(caps: HarmonyCapabilitiesMap, key: HarmonyCapabilityKey, fallback = true): boolean {
+function capEnabled(
+  caps: HarmonyCapabilitiesMap,
+  key: HarmonyCapabilityKey,
+  fallback = true,
+): boolean {
   const v = caps[key];
   return typeof v === "boolean" ? v : fallback;
 }
@@ -260,7 +271,12 @@ function readUnlocks(state: HarmonyState): HarmonyUnlocksShape {
   return u as HarmonyUnlocksShape;
 }
 
-function isUnlocked(owner: HarmonyOwner, unlocks: HarmonyUnlocksShape, kind: string, id: string): boolean {
+function isUnlocked(
+  owner: HarmonyOwner,
+  unlocks: HarmonyUnlocksShape,
+  kind: string,
+  id: string,
+): boolean {
   // Director is “authoring” or “guided”; unlock gating is primarily for lumen.
   if (String(owner).toLowerCase() === "director") return true;
 
@@ -285,14 +301,46 @@ function isUnlocked(owner: HarmonyOwner, unlocks: HarmonyUnlocksShape, kind: str
 // ✅ UI-only helper: enforce particle radio-group visuals immediately
 // (HarmonyEnvironmentSystem is authoritative; this prevents "multi-on" flashes.)
 // ------------------------------------------------------------
-function setParticleRadioVisual(root: HTMLElement, winnerId: string | null): void {
-  const tiles = root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="particle"]`);
+function setParticleRadioVisual(
+  root: HTMLElement,
+  winnerId: string | null,
+): void {
+  const tiles = root.querySelectorAll<HTMLDivElement>(
+    `.harmony-tile[data-kind="particle"]`,
+  );
   tiles.forEach((t) => {
     const id = t.dataset.id || "";
     const on = Boolean(winnerId && id && id === winnerId);
     t.classList.toggle("on", on);
     t.setAttribute("aria-pressed", on ? "true" : "false");
   });
+}
+
+// Deterministic particle winner for UI visuals (matches env system priority)
+const PARTICLE_PRIORITY_UI: ReadonlyArray<string> = [
+  "stars",
+  "embers",
+  "dust",
+  "rain",
+  "snow",
+  "fireflies",
+  "leaves",
+];
+
+function getParticleWinnerUi(
+  particles: Record<string, boolean> | undefined | null,
+): string | null {
+  if (!particles) return null;
+
+  for (const k of PARTICLE_PRIORITY_UI) {
+    if (particles[k] === true) return k;
+  }
+
+  const otherTrue = Object.keys(particles)
+    .filter((k) => particles[k] === true && !PARTICLE_PRIORITY_UI.includes(k))
+    .sort();
+
+  return otherTrue.length ? otherTrue[0] : null;
 }
 
 export class HarmonyUI {
@@ -333,7 +381,9 @@ export class HarmonyUI {
 
   // Howler lane RAF batching (avoid spamming handlers)
   private laneRaf = 0;
-  private lanePending: Partial<Record<"master" | "music" | "sfx" | "ambient" | "ui", number>> = {};
+  private lanePending: Partial<
+    Record<"master" | "music" | "sfx" | "ambient" | "ui", number>
+  > = {};
 
   constructor(handlers: UIHandlers) {
     this.handlers = handlers;
@@ -607,21 +657,36 @@ export class HarmonyUI {
     this.btnPrev.className = "harmony-btn";
     this.btnPrev.type = "button";
     this.btnPrev.textContent = "Prev";
-    this.unbinds.push(bindPress(this.btnPrev, () => this.handlers.onPrevTrack(), { onHover, onClick }));
+    this.unbinds.push(
+      bindPress(this.btnPrev, () => this.handlers.onPrevTrack(), {
+        onHover,
+        onClick,
+      }),
+    );
 
     // Play
     this.btnPlay = document.createElement("button");
     this.btnPlay.className = "harmony-btn";
     this.btnPlay.type = "button";
     this.btnPlay.textContent = "Play";
-    this.unbinds.push(bindPress(this.btnPlay, () => this.handlers.onTogglePlay(), { onHover, onClick }));
+    this.unbinds.push(
+      bindPress(this.btnPlay, () => this.handlers.onTogglePlay(), {
+        onHover,
+        onClick,
+      }),
+    );
 
     // Next
     this.btnNext = document.createElement("button");
     this.btnNext.className = "harmony-btn";
     this.btnNext.type = "button";
     this.btnNext.textContent = "Next";
-    this.unbinds.push(bindPress(this.btnNext, () => this.handlers.onNextTrack(), { onHover, onClick }));
+    this.unbinds.push(
+      bindPress(this.btnNext, () => this.handlers.onNextTrack(), {
+        onHover,
+        onClick,
+      }),
+    );
 
     const titleWrap = document.createElement("div");
     titleWrap.className = "harmony-title";
@@ -653,7 +718,11 @@ export class HarmonyUI {
       this.isScrubbing = true;
 
       // Capture pointer so we reliably get pointerup even if cursor leaves the control.
-      if (e && typeof (this.scrub as any).setPointerCapture === "function" && e.pointerId != null) {
+      if (
+        e &&
+        typeof (this.scrub as any).setPointerCapture === "function" &&
+        e.pointerId != null
+      ) {
         try {
           this.scrub.setPointerCapture(e.pointerId);
         } catch {}
@@ -667,7 +736,11 @@ export class HarmonyUI {
       if (this.scrub.disabled) return;
       if (!this.isScrubbing) return;
 
-      if (e && typeof (this.scrub as any).releasePointerCapture === "function" && e.pointerId != null) {
+      if (
+        e &&
+        typeof (this.scrub as any).releasePointerCapture === "function" &&
+        e.pointerId != null
+      ) {
         try {
           this.scrub.releasePointerCapture(e.pointerId);
         } catch {}
@@ -721,7 +794,9 @@ export class HarmonyUI {
     this.scrub.addEventListener("pointercancel", (e) => scrubEnd(e));
     this.scrub.addEventListener("lostpointercapture", () => scrubEnd());
 
-    this.scrub.addEventListener("touchstart", () => scrubStart(), { passive: true });
+    this.scrub.addEventListener("touchstart", () => scrubStart(), {
+      passive: true,
+    });
     this.scrub.addEventListener("touchend", () => scrubEnd());
 
     this.scrub.addEventListener("input", scrubLive);
@@ -733,21 +808,37 @@ export class HarmonyUI {
     this.btnShuffle.className = "harmony-btn";
     this.btnShuffle.type = "button";
     this.btnShuffle.textContent = "Shuf";
-    this.unbinds.push(bindPress(this.btnShuffle, () => this.handlers.onToggleShuffle(), { onHover, onClick }));
+    this.unbinds.push(
+      bindPress(this.btnShuffle, () => this.handlers.onToggleShuffle(), {
+        onHover,
+        onClick,
+      }),
+    );
 
     // Repeat
     this.btnRepeat = document.createElement("button");
     this.btnRepeat.className = "harmony-btn";
     this.btnRepeat.type = "button";
     this.btnRepeat.textContent = "R0";
-    this.unbinds.push(bindPress(this.btnRepeat, () => this.handlers.onCycleRepeat(), { onHover, onClick }));
+    this.unbinds.push(
+      bindPress(this.btnRepeat, () => this.handlers.onCycleRepeat(), {
+        onHover,
+        onClick,
+      }),
+    );
 
     // Environment panel
     this.btnEnvironment = document.createElement("button");
     this.btnEnvironment.className = "harmony-btn";
     this.btnEnvironment.type = "button";
     this.btnEnvironment.textContent = "Harmony";
-    this.unbinds.push(bindPress(this.btnEnvironment, () => this.handlers.onToggleEnvironmentPanel(), { onHover, onClick }));
+    this.unbinds.push(
+      bindPress(
+        this.btnEnvironment,
+        () => this.handlers.onToggleEnvironmentPanel(),
+        { onHover, onClick },
+      ),
+    );
 
     // Hide
     this.btnHide = document.createElement("button");
@@ -755,7 +846,11 @@ export class HarmonyUI {
     this.btnHide.type = "button";
     this.btnHide.textContent = "Hide";
     this.unbinds.push(
-      bindPress(this.btnHide, () => this.handlers.onSetUIVisible(false), { stopPropagation: true, onHover, onClick }),
+      bindPress(this.btnHide, () => this.handlers.onSetUIVisible(false), {
+        stopPropagation: true,
+        onHover,
+        onClick,
+      }),
     );
 
     // Order
@@ -890,8 +985,10 @@ export class HarmonyUI {
     // - cinematic: bar only, no panel
     // - minimal: bar, panel allowed if env.panel
     // - full: normal
-    const panelAllowedByMode = uiMode === "full" ? true : uiMode === "minimal" ? allowEnvPanel : false;
-    const panelOpen = Boolean(state.environmentPanelOpen) && panelAllowedByMode && allowEnvPanel;
+    const panelAllowedByMode =
+      uiMode === "full" ? true : uiMode === "minimal" ? allowEnvPanel : false;
+    const panelOpen =
+      Boolean(state.environmentPanelOpen) && panelAllowedByMode && allowEnvPanel;
     this.panel.classList.toggle("open", panelOpen);
 
     // If panel can't be open, force it visually closed (without calling handlers)
@@ -949,15 +1046,10 @@ export class HarmonyUI {
     // Toggle visuals
     this.syncToggleVisual("ambient", (state.ambients ?? {}) as Record<string, boolean>);
 
-    // ✅ Particle visuals: radio group (single active)
-    const particleMap = (state.particles ?? {}) as Record<string, boolean>;
-    let particleWinner: string | null = null;
-    for (const [k, v] of Object.entries(particleMap)) {
-      if (v === true) {
-        particleWinner = k;
-        break;
-      }
-    }
+    // ✅ Particle visuals: radio group winner (deterministic)
+    const particleWinner = getParticleWinnerUi(
+      (state.particles ?? {}) as Record<string, boolean>,
+    );
     setParticleRadioVisual(this.root, particleWinner);
 
     // Select visuals (single-choice)
@@ -1014,7 +1106,9 @@ export class HarmonyUI {
   }
 
   private setTilesEnabled(kind: string, enabled: boolean): void {
-    const tiles = this.root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="${kind}"]`);
+    const tiles = this.root.querySelectorAll<HTMLDivElement>(
+      `.harmony-tile[data-kind="${kind}"]`,
+    );
     tiles.forEach((tile) => {
       tile.classList.toggle("is-disabled", !enabled);
       tile.setAttribute("aria-disabled", enabled ? "false" : "true");
@@ -1028,7 +1122,9 @@ export class HarmonyUI {
     kind: string,
     enabledByCaps: boolean,
   ): void {
-    const tiles = this.root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="${kind}"]`);
+    const tiles = this.root.querySelectorAll<HTMLDivElement>(
+      `.harmony-tile[data-kind="${kind}"]`,
+    );
     tiles.forEach((tile) => {
       const id = tile.dataset.id || "";
       const unlocked = id ? isUnlocked(owner, unlocks, kind, id) : true;
@@ -1040,7 +1136,8 @@ export class HarmonyUI {
       tile.setAttribute("data-disabled", enabled ? "false" : "true");
 
       // Lock badge when not unlocked (but only if section is otherwise allowed)
-      const showLock = enabledByCaps && !unlocked && String(owner).toLowerCase() === "lumen";
+      const showLock =
+        enabledByCaps && !unlocked && String(owner).toLowerCase() === "lumen";
       tile.classList.toggle("is-locked", showLock);
       tile.setAttribute("data-locked", showLock ? "true" : "false");
     });
@@ -1061,16 +1158,23 @@ export class HarmonyUI {
   }
 
   private syncToggleVisual(kind: string, map: Record<string, boolean>): void {
-    const tiles = this.root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="${kind}"]`);
+    const tiles = this.root.querySelectorAll<HTMLDivElement>(
+      `.harmony-tile[data-kind="${kind}"]`,
+    );
     tiles.forEach((tile) => {
       const id = tile.dataset.id || "";
       tile.classList.toggle("on", Boolean(map[id]));
-      tile.setAttribute("aria-pressed", Boolean(map[id]) ? "true" : "false");
+      tile.setAttribute(
+        "aria-pressed",
+        Boolean(map[id]) ? "true" : "false",
+      );
     });
   }
 
   private syncSelectVisual(kind: string, selectedId: string): void {
-    const tiles = this.root.querySelectorAll<HTMLDivElement>(`.harmony-tile[data-kind="${kind}"]`);
+    const tiles = this.root.querySelectorAll<HTMLDivElement>(
+      `.harmony-tile[data-kind="${kind}"]`,
+    );
     tiles.forEach((tile) => {
       const id = tile.dataset.id || "";
       const on = id && id === selectedId;
@@ -1079,7 +1183,10 @@ export class HarmonyUI {
     });
   }
 
-  private makePresetSection(label: string, presets: Array<[string, string]>): HTMLElement {
+  private makePresetSection(
+    label: string,
+    presets: Array<[string, string]>,
+  ): HTMLElement {
     const wrap = document.createElement("div");
     const h = document.createElement("h3");
     h.textContent = label;
@@ -1123,7 +1230,10 @@ export class HarmonyUI {
     return wrap;
   }
 
-  private makeRitualSection(label: string, options: Array<[string, number]>): HTMLElement {
+  private makeRitualSection(
+    label: string,
+    options: Array<[string, number]>,
+  ): HTMLElement {
     const wrap = document.createElement("div");
     const h = document.createElement("h3");
     h.textContent = label;
@@ -1222,7 +1332,9 @@ export class HarmonyUI {
     const grid = document.createElement("div");
     grid.className = "harmony-grid";
 
-    const kind = label.toLowerCase().includes("particle") ? "particle" : "ambient";
+    const kind = label.toLowerCase().includes("particle")
+      ? "particle"
+      : "ambient";
 
     for (const [text, id] of toggles) {
       const tile = document.createElement("div");
@@ -1291,7 +1403,10 @@ export class HarmonyUI {
     const onHover = () => this.handlers.onUiHover?.();
     const onClick = () => this.handlers.onUiClick?.();
 
-    const makeLane = (key: "master" | "music" | "sfx" | "ambient" | "ui", initial: number) => {
+    const makeLane = (
+      key: "master" | "music" | "sfx" | "ambient" | "ui",
+      initial: number,
+    ) => {
       const row = document.createElement("div");
       row.className = "harmony-sliderRow";
 
@@ -1378,7 +1493,10 @@ export class HarmonyUI {
     return wrap;
   }
 
-  private queueLaneEmit(lane: "master" | "music" | "sfx" | "ambient" | "ui", value01: number): void {
+  private queueLaneEmit(
+    lane: "master" | "music" | "sfx" | "ambient" | "ui",
+    value01: number,
+  ): void {
     if (!this.handlers.onSetHowlerLane) return;
 
     // Don’t emit if lane control is disabled
@@ -1404,7 +1522,9 @@ export class HarmonyUI {
         const pending = this.lanePending;
         this.lanePending = {};
 
-        for (const [k, v] of Object.entries(pending) as Array<[typeof lane, number]>) {
+        for (const [k, v] of Object.entries(pending) as Array<
+          [typeof lane, number]
+        >) {
           if (typeof v === "number" && Number.isFinite(v)) {
             this.handlers.onSetHowlerLane?.(k, v);
           }
@@ -1413,7 +1533,10 @@ export class HarmonyUI {
     }
   }
 
-  private flushLaneEmit(lane: "master" | "music" | "sfx" | "ambient" | "ui", value01: number): void {
+  private flushLaneEmit(
+    lane: "master" | "music" | "sfx" | "ambient" | "ui",
+    value01: number,
+  ): void {
     if (!this.handlers.onSetHowlerLane) return;
 
     // Don’t emit if lane control is disabled
@@ -1440,7 +1563,9 @@ export class HarmonyUI {
     const pending = this.lanePending;
     this.lanePending = {};
 
-    for (const [k, v] of Object.entries(pending) as Array<[typeof lane, number]>) {
+    for (const [k, v] of Object.entries(pending) as Array<
+      [typeof lane, number]
+    >) {
       if (typeof v === "number" && Number.isFinite(v)) {
         this.handlers.onSetHowlerLane?.(k, v);
       }

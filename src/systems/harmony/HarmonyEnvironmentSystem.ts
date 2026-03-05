@@ -1,10 +1,14 @@
 // src/systems/harmony/HarmonyEnvironmentSystem.ts
 // ============================================================
 // THE STILL — HarmonyEnvironmentSystem
-//  - Canonical Environment options (filter/particles/ambients)   ✅ MVP
+//  - Canonical Environment options (filter/particles/ambients) MVP
 //  - Persists via PersistenceSystem
 //  - Applies world effects (PostFX now, ParticleFX now wired)
 //  - Broadcasts canonical state snapshots for HarmonySystem/UI
+//
+// Patch (Mar 2026):
+//  - Treat "stars" as a first-class particle radio option (deterministic).
+//  - Winner selection now follows a stable priority order, not Object.entries() order.
 // ============================================================
 
 import type { EventBus } from "../../core/EventBus";
@@ -56,6 +60,8 @@ const safeRecordBool = (v: unknown): Record<string, boolean> => {
 // ------------------------------------------------------------
 
 const KNOWN_PARTICLE_IDS = [
+  // ✅ include stars as an explicit radio choice
+  "stars",
   "embers",
   "dust",
   "rain",
@@ -67,12 +73,13 @@ const KNOWN_PARTICLE_IDS = [
 const PARTICLE_PRIORITY: ReadonlyArray<string> = [...KNOWN_PARTICLE_IDS];
 
 const enforceSingleParticleActive = (
-  particlesIn: Record<string, boolean>
+  particlesIn: Record<string, boolean>,
 ): Record<string, boolean> => {
   const particles = { ...(particlesIn ?? {}) };
 
   let winner: string | null = null;
 
+  // Prefer canonical priority order
   for (const k of PARTICLE_PRIORITY) {
     if (particles[k] === true) {
       winner = k;
@@ -80,6 +87,7 @@ const enforceSingleParticleActive = (
     }
   }
 
+  // If some unknown particle id is true, pick the first (stable by sort)
   if (!winner) {
     const otherTrue = Object.keys(particles)
       .filter((k) => particles[k] === true && !PARTICLE_PRIORITY.includes(k))
@@ -94,6 +102,7 @@ const enforceSingleParticleActive = (
 
   const out: Record<string, boolean> = {};
 
+  // None selected => canonicalize to all false
   if (!winner) {
     for (const k of keys) out[k] = false;
     return out;
@@ -106,7 +115,7 @@ const enforceSingleParticleActive = (
 const applyParticleToggleRadio = (
   prev: Record<string, boolean>,
   id: string,
-  enabled: boolean
+  enabled: boolean,
 ): Record<string, boolean> => {
   const base = { ...(prev ?? {}) };
 
@@ -128,20 +137,28 @@ const applyParticleToggleRadio = (
 };
 
 const getParticleWinner = (
-  particles: Record<string, boolean> | undefined | null
+  particles: Record<string, boolean> | undefined | null,
 ): string | null => {
   if (!particles) return null;
-  for (const [k, v] of Object.entries(particles)) {
-    if (v === true) return k;
+
+  // Deterministic: follow priority list first
+  for (const k of PARTICLE_PRIORITY) {
+    if (particles[k] === true) return k;
   }
-  return null;
+
+  // If some unknown id is the active one, pick first sorted true key
+  const otherTrue = Object.keys(particles)
+    .filter((k) => particles[k] === true && !PARTICLE_PRIORITY.includes(k))
+    .sort();
+
+  return otherTrue.length ? otherTrue[0] : null;
 };
 
 const normalizeEnv = (raw: unknown): HarmonyEnvironmentState => {
   const r = (raw ?? {}) as Partial<HarmonyEnvironmentState>;
 
   const particles = enforceSingleParticleActive(
-    safeRecordBool(r.particles)
+    safeRecordBool(r.particles),
   );
 
   const ambients = safeRecordBool(r.ambients);
@@ -170,7 +187,8 @@ export class HarmonyEnvironmentSystem {
   private initialized = false;
 
   // prevent redundant fieldfx mode emits
-  private lastFieldFxMode: string | null = null;
+  // NOTE: initialize to sentinel so first apply() always emits (including mode:null).
+  private lastFieldFxMode: string | null = "__unset__";
 
   constructor(deps: HarmonyEnvironmentSystemDeps) {
     this.bus = deps.bus;
@@ -193,7 +211,7 @@ export class HarmonyEnvironmentSystem {
         const current = this.readPersisted();
         this.apply(current);
         this.emitState(current, `requestState:${src}`);
-      }
+      },
     );
 
     const onSelectFilter = (p: { filterId: string }) => {
@@ -204,10 +222,7 @@ export class HarmonyEnvironmentSystem {
     this.on("harmony:environment:selectFilter", onSelectFilter);
     this.on("harmony:env:selectFilter", onSelectFilter);
 
-    const onToggleParticle = (p: {
-      particleId: string;
-      enabled: boolean;
-    }) => {
+    const onToggleParticle = (p: { particleId: string; enabled: boolean }) => {
       const id = safeString(p?.particleId, "");
       if (!id) return;
 
@@ -215,7 +230,7 @@ export class HarmonyEnvironmentSystem {
       const particles = applyParticleToggleRadio(
         prev.particles ?? {},
         id,
-        safeBool(p?.enabled)
+        safeBool(p?.enabled),
       );
 
       this.set({ particles }, "toggleParticle");
@@ -238,14 +253,14 @@ export class HarmonyEnvironmentSystem {
 
   private writePersisted(
     partial: Partial<HarmonyEnvironmentState>,
-    reason: string
+    reason: string,
   ): void {
     this.persistence.setHarmonyEnvironment(partial, reason);
   }
 
   private set(
     partial: Partial<HarmonyEnvironmentState>,
-    reason: string
+    reason: string,
   ): void {
     if (partial.particles) {
       partial = {
@@ -265,7 +280,7 @@ export class HarmonyEnvironmentSystem {
 
   private emitState(
     environment: HarmonyEnvironmentState,
-    reason: string
+    reason: string,
   ): void {
     const payload: HarmonyEnvironmentStateEvent = {
       state: environment,
@@ -281,7 +296,7 @@ export class HarmonyEnvironmentSystem {
 
   private emitChanged(
     environment: HarmonyEnvironmentState,
-    reason: string
+    reason: string,
   ): void {
     const payload: HarmonyEnvironmentStateEvent = {
       state: environment,
@@ -304,10 +319,10 @@ export class HarmonyEnvironmentSystem {
         "c1",
     });
 
-    // 🔥 This is the critical wiring: tell FieldFX which emitter to use
-    const winner = getParticleWinner(
-      (environment as any).particles
-    );
+    // 🔥 Critical wiring: tell FieldFX which emitter to use
+    // - "stars" => starfield mode (FieldFX should treat as pristine stars)
+    // - null => no particles at all (quiet Still)
+    const winner = getParticleWinner((environment as any).particles);
 
     if (winner !== this.lastFieldFxMode) {
       this.lastFieldFxMode = winner;
