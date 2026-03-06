@@ -4,22 +4,12 @@
 // ------------------------------------------------------------
 // Uses existing BAND points. No new point clouds.
 //
-// Goals (MVP+):
-// - Smooth snow at any framerate, including tab-switch return.
-// - Deterministic drift/swirl (no per-frame RNG jitter).
-// - Y-wrap respawn (top->bottom), stable per-flake parameters.
-// - World-scale motion (BAND radii are large) so it reads from mid camera distance.
-//
-// Fixes (Mar 2026):
-// - Y-wrap bounds from base positions.
-// - Deterministic motion + fixed-step accumulator.
-// - Large-dt reset to avoid “catch-up jitter” after tab switching.
-//
-// NEW (Mar 2026 - Option B "True Density"):
-// - Adds a stable per-point random attribute (aRand) to BAND geometry.
-// - Patches the PointsMaterial shader (onBeforeCompile) with a uDensity uniform.
-// - When uDensity < 1, only a subset of points render (true sparse snow at low energy).
-// - Defaults to uDensity = 1 (no change) unless setDensity01() is called.
+// Updates (Mar 2026 - Option B parity + visibility):
+// - Density shader patch now matches RainEmitter gating logic (mask = 1 - smoothstep(d, d+soft, vRand))
+//   so: density=1 => visible, density small => sparse (and no inverted behavior).
+// - sampleMaterial now uses a SnowLook profile (like RainEmitter) so snow reads in DEFAULT filter mode.
+// - Adds setLook() + rebuildLookFromBase() for quick tuning and consistent defaults.
+// - Keeps deterministic motion + fixed-step accumulator + large-dt reset.
 // ============================================================
 
 import * as THREE from "three";
@@ -66,6 +56,17 @@ const SIN_LUT = (() => {
 
 const lutSin = (phase: number): number => SIN_LUT[phase & SIN_LUT_MASK];
 const lutCos = (phase: number): number => SIN_LUT[(phase + (SIN_LUT_SIZE >> 2)) & SIN_LUT_MASK];
+
+type SnowLook = {
+  sizeMin: number;
+  sizeMax: number;
+  opacityMin: number;
+  opacityMax: number;
+  colorMin: THREE.Color;
+  colorMax: THREE.Color;
+  blending: THREE.Blending;
+  sizeAttenuation: boolean;
+};
 
 export class SnowEmitter {
   public readonly id = "snow";
@@ -138,11 +139,67 @@ export class SnowEmitter {
   private baseOpacity = 1;
   private baseColor = new THREE.Color(0xffffff);
 
+  // legacy targets (kept)
   private snowSize = 0.07;
   private snowOpacity = 0.99;
   private snowColor = new THREE.Color(0xffffed);
 
   private tmpColor = new THREE.Color();
+
+  // NEW: look profile for legibility in DEFAULT filter mode
+  private look: SnowLook = {
+    sizeMin: 0.065,
+    sizeMax: 0.11,
+    opacityMin: 0.08,
+    opacityMax: 0.32,
+    colorMin: new THREE.Color(0xf6fbff),
+    colorMax: new THREE.Color(0xffffed),
+    blending: THREE.NormalBlending,
+    sizeAttenuation: false,
+  };
+
+  /**
+   * Optional tuning hook (for maximum control without spelunking).
+   */
+  public setLook(
+    partial: Partial<{
+      sizeMin: number;
+      sizeMax: number;
+      opacityMin: number;
+      opacityMax: number;
+      colorMin: THREE.Color | number;
+      colorMax: THREE.Color | number;
+      blending: THREE.Blending;
+      sizeAttenuation: boolean;
+    }>,
+  ): void {
+    if (typeof partial.sizeMin === "number") this.look.sizeMin = partial.sizeMin;
+    if (typeof partial.sizeMax === "number") this.look.sizeMax = partial.sizeMax;
+    if (typeof partial.opacityMin === "number") this.look.opacityMin = partial.opacityMin;
+    if (typeof partial.opacityMax === "number") this.look.opacityMax = partial.opacityMax;
+
+    if (partial.colorMin !== undefined) {
+      this.look.colorMin =
+        partial.colorMin instanceof THREE.Color
+          ? partial.colorMin.clone()
+          : new THREE.Color(partial.colorMin);
+    }
+    if (partial.colorMax !== undefined) {
+      this.look.colorMax =
+        partial.colorMax instanceof THREE.Color
+          ? partial.colorMax.clone()
+          : new THREE.Color(partial.colorMax);
+    }
+
+    if (partial.blending !== undefined) this.look.blending = partial.blending;
+    if (typeof partial.sizeAttenuation === "boolean") this.look.sizeAttenuation = partial.sizeAttenuation;
+
+    // sanity clamps
+    this.look.sizeMin = clamp(this.look.sizeMin, 0.0005, 10);
+    this.look.sizeMax = clamp(this.look.sizeMax, this.look.sizeMin, 20);
+    this.look.opacityMin = clamp(this.look.opacityMin, 0, 1);
+    this.look.opacityMax = clamp(this.look.opacityMax, this.look.opacityMin, 1);
+  }
 
   public attach(points: THREE.Points): void {
     if (this.points === points) return;
@@ -217,6 +274,7 @@ export class SnowEmitter {
 
     this.cacheMaterialBase();
     this.setSnowTargetsFromBase();
+    this.rebuildLookFromBase();
 
     this.restorePositionsBase();
     this.restoreMaterialBase();
@@ -447,21 +505,21 @@ export class SnowEmitter {
     }
   }
 
-  // NEW: compositor sampling
+  // NEW: compositor sampling (uses Look profile)
   public sampleMaterial(morph01: number, out: MaterialState): void {
     const t = clamp01(morph01);
+    const L = this.look;
 
-    out.size = lerp(this.baseSize, this.snowSize, t);
-    out.opacity = lerp(this.baseOpacity, this.snowOpacity, t);
+    out.size = lerp(L.sizeMin, L.sizeMax, t);
+    out.opacity = lerp(L.opacityMin, L.opacityMax, t);
 
-    this.tmpColor.lerpColors(this.baseColor, this.snowColor, t);
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     out.color.copy(this.tmpColor);
 
-    out.blending = THREE.NormalBlending;
+    out.blending = L.blending;
     out.transparent = true;
     out.depthWrite = false;
-
-    out.sizeAttenuation = false;
+    out.sizeAttenuation = L.sizeAttenuation;
   }
 
   // Legacy remains
@@ -484,16 +542,17 @@ export class SnowEmitter {
     const mat = this.material as THREE.PointsMaterial;
     if (!(mat as any).isPointsMaterial) return;
 
-    mat.size = lerp(this.baseSize, this.snowSize, t);
-    mat.opacity = lerp(this.baseOpacity, this.snowOpacity, t);
+    const L = this.look;
 
-    this.tmpColor.lerpColors(this.baseColor, this.snowColor, t);
+    mat.size = lerp(L.sizeMin, L.sizeMax, t);
+    mat.opacity = lerp(L.opacityMin, L.opacityMax, t);
+
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     mat.color.copy(this.tmpColor);
 
     mat.transparent = true;
     mat.depthWrite = false;
-
-    mat.sizeAttenuation = false;
+    mat.sizeAttenuation = L.sizeAttenuation;
 
     // Keep density uniforms in sync during morphs too
     this.applyDensityToMaterial();
@@ -524,6 +583,7 @@ export class SnowEmitter {
     mat.transparent = true;
     mat.depthWrite = false;
 
+    // keep snow readable at BAND scale by default
     mat.sizeAttenuation = false;
 
     // Keep density uniforms in sync even when restoring material state
@@ -544,9 +604,42 @@ export class SnowEmitter {
   }
 
   private setSnowTargetsFromBase(): void {
+    // legacy values (kept)
     this.snowSize = Math.max(this.baseSize * 1.35, 0.065);
     this.snowOpacity = Math.min(0.5, Math.max(0.24, this.baseOpacity * 0.99));
     this.snowColor = this.baseColor.clone().lerp(new THREE.Color(0xffffed), 0.58);
+  }
+
+  private rebuildLookFromBase(): void {
+    const baseSize = Number.isFinite(this.baseSize) && this.baseSize > 0 ? this.baseSize : 0.04;
+    const baseOpacity = clamp(this.baseOpacity, 0.0, 1.0);
+    const baseCol = this.baseColor.clone();
+
+    // Snow needs to read as larger, softer points than stars, but not as bright as rain.
+    const sizeMax = clamp(Math.max(0.095, baseSize * 2.35), baseSize * 1.6, baseSize * 7.5);
+    const sizeMin = clamp(sizeMax * 0.68, baseSize * 1.15, sizeMax);
+
+    // Opacity: keep moderate, density drives “amount of weather”.
+    const opMax = clamp(Math.max(0.22, baseOpacity * 0.30), 0.10, 0.55);
+    const opMin = clamp(opMax * 0.38, 0.04, opMax);
+
+    // Color: slightly warm white helps snow differentiate from rain.
+    const warm = new THREE.Color(0xffffed);
+    const cool = new THREE.Color(0xf6fbff);
+
+    const cMin = baseCol.clone().lerp(cool, 0.45);
+    const cMax = cool.clone().lerp(warm, 0.55);
+
+    this.look = {
+      sizeMin,
+      sizeMax,
+      opacityMin: opMin,
+      opacityMax: opMax,
+      colorMin: cMin,
+      colorMax: cMax,
+      blending: THREE.NormalBlending,
+      sizeAttenuation: false,
+    };
   }
 
   // ==========================================================
@@ -594,11 +687,13 @@ export class SnowEmitter {
     mat.onBeforeCompile = (shader: THREE.Shader) => {
       if (prevOnBeforeCompile) prevOnBeforeCompile(shader);
 
-      shader.uniforms.uDensity = { value: 1.0 };
-      shader.uniforms.uDensitySoft = { value: 0.03 };
+      // Initialize to CURRENT density settings
+      shader.uniforms.uDensity = { value: clamp01(this.density01) };
+      shader.uniforms.uDensitySoft = { value: clamp(this.densitySoftness, 0.005, 0.10) };
 
       ud.__stillDensityShader = shader;
 
+      // --- Vertex: pass aRand to fragment ---
       shader.vertexShader =
         `attribute float aRand;\nvarying float vRand;\n` +
         shader.vertexShader.replace(
@@ -610,32 +705,26 @@ export class SnowEmitter {
         shader.vertexShader = shader.vertexShader.replace("void main() {", "void main() {\n  vRand = aRand;");
       }
 
+      // --- Fragment: gate alpha by density (matches RainEmitter) ---
       shader.fragmentShader =
-        `uniform float uDensity;\nuniform float uDensitySoft;\nvarying float vRand;\n` +
-        shader.fragmentShader;
+        `uniform float uDensity;\nuniform float uDensitySoft;\nvarying float vRand;\n` + shader.fragmentShader;
 
       const needle = "gl_FragColor = vec4( diffuse, opacity );";
+      const gate = `
+  float d = clamp(uDensity, 0.0, 1.0);
+  float soft = clamp(uDensitySoft, 0.001, 0.25);
+
+  // vRand in [0..1]. If vRand <= d => visible.
+  // Fade out over [d .. d+soft] so density ramps stay smooth.
+  float mask = 1.0 - smoothstep(d, min(1.0, d + soft), vRand);
+
+  gl_FragColor.a *= mask;
+  if (gl_FragColor.a <= 0.001) discard;`;
+
       if (shader.fragmentShader.includes(needle)) {
-        shader.fragmentShader = shader.fragmentShader.replace(
-          needle,
-          `${needle}
-  float d = clamp(uDensity, 0.0, 1.0);
-  float soft = clamp(uDensitySoft, 0.001, 0.25);
-  float mask = smoothstep(d, max(0.0, d - soft), vRand);
-  gl_FragColor.a *= mask;
-  if (gl_FragColor.a <= 0.001) discard;`,
-        );
+        shader.fragmentShader = shader.fragmentShader.replace(needle, `${needle}${gate}`);
       } else {
-        shader.fragmentShader = shader.fragmentShader.replace(
-          "}",
-          `
-  float d = clamp(uDensity, 0.0, 1.0);
-  float soft = clamp(uDensitySoft, 0.001, 0.25);
-  float mask = smoothstep(d, max(0.0, d - soft), vRand);
-  gl_FragColor.a *= mask;
-  if (gl_FragColor.a <= 0.001) discard;
-}`,
-        );
+        shader.fragmentShader = shader.fragmentShader.replace("}", `${gate}\n}`);
       }
     };
 

@@ -351,10 +351,21 @@ export class FieldFXSystem {
     if (!this.scene) return false;
 
     const obj = this.scene.getObjectByName(name);
-    if (obj && (obj as any).isPoints) {
+    if (!obj) return false;
+
+    // Direct hit
+    if ((obj as any).isPoints) {
       this.attachBandPoints(obj as THREE.Points);
       return true;
     }
+
+    // Fallback: search children
+    const pointsChild = obj.getObjectByProperty("isPoints", true) as THREE.Points | undefined;
+    if (pointsChild) {
+      this.attachBandPoints(pointsChild);
+      return true;
+    }
+
     return false;
   }
 

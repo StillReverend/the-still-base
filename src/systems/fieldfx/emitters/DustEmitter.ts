@@ -1,9 +1,12 @@
+// src/systems/fieldfx/emitters/DustEmitter.ts
 import * as THREE from "three";
 
-const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
+const clamp = (v: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
-const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
+const isFiniteNumber = (v: number): boolean =>
+  Number.isFinite(v) && !Number.isNaN(v);
 
 type MaterialState = {
   size: number;
@@ -28,6 +31,16 @@ class LcgRng {
     return this.next01() * 2 - 1;
   }
 }
+
+type DustLook = {
+  sizeMin: number;
+  sizeMax: number;
+  opacityMin: number;
+  opacityMax: number;
+  colorMin: THREE.Color;
+  colorMax: THREE.Color;
+  blending: THREE.Blending;
+};
 
 export class DustEmitter {
   public readonly id = "dust";
@@ -58,9 +71,21 @@ export class DustEmitter {
   private baseOpacity = 1;
   private baseColor = new THREE.Color(0xffffff);
 
+  // Legacy single-target (kept for compatibility / debugging if needed)
   private dustSize = 0.05;
   private dustOpacity = 0.22;
   private dustColor = new THREE.Color(0xffffff);
+
+  // Max-control profile used by sampleMaterial()
+  private look: DustLook = {
+    sizeMin: 0.055,
+    sizeMax: 0.075,
+    opacityMin: 0.35,
+    opacityMax: 0.65,
+    colorMin: new THREE.Color(0xffffff),
+    colorMax: new THREE.Color(0xffffff),
+    blending: THREE.NormalBlending,
+  };
 
   private tmpColor = new THREE.Color();
 
@@ -73,7 +98,9 @@ export class DustEmitter {
     this.geometry = points.geometry as THREE.BufferGeometry;
     this.material = points.material as THREE.Material;
 
-    const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute | undefined;
+    const attr = this.geometry.getAttribute("position") as
+      | THREE.BufferAttribute
+      | undefined;
     if (!attr || attr.itemSize !== 3) {
       // eslint-disable-next-line no-console
       console.warn("[DustEmitter] BAND points has no valid position attribute.");
@@ -168,15 +195,28 @@ export class DustEmitter {
     const inBurst = this.burstTimer > 0;
     if (inBurst) this.burstTimer = Math.max(0, this.burstTimer - dts);
 
-    const jitterMul = (inBurst ? this.burstJitterMul : 1) * this.jitter * this.driftSpeed;
+    const jitterMul =
+      (inBurst ? this.burstJitterMul : 1) * this.jitter * this.driftSpeed;
     const velMul = (inBurst ? this.burstVelMul : 1) * this.driftSpeed;
 
     for (let i = 0; i < this.count; i++) {
       const ix = i * 3;
 
-      vel[ix + 0] = clamp(vel[ix + 0] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
-      vel[ix + 1] = clamp(vel[ix + 1] + this.rng.nextSigned() * (jitterMul * 0.6) * dts, -this.maxVel, this.maxVel);
-      vel[ix + 2] = clamp(vel[ix + 2] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
+      vel[ix + 0] = clamp(
+        vel[ix + 0] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
+      vel[ix + 1] = clamp(
+        vel[ix + 1] + this.rng.nextSigned() * (jitterMul * 0.6) * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
+      vel[ix + 2] = clamp(
+        vel[ix + 2] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
 
       sim[ix + 0] += vel[ix + 0] * velMul * dts;
       sim[ix + 1] += vel[ix + 1] * velMul * dts;
@@ -204,17 +244,18 @@ export class DustEmitter {
     }
   }
 
-  // NEW: compositor sampling
+  // NEW: compositor sampling (max-control)
   public sampleMaterial(morph01: number, out: MaterialState): void {
     const t = clamp01(morph01);
+    const L = this.look;
 
-    out.size = lerp(this.baseSize, this.dustSize, t);
-    out.opacity = lerp(this.baseOpacity, this.dustOpacity, t);
+    out.size = lerp(L.sizeMin, L.sizeMax, t);
+    out.opacity = lerp(L.opacityMin, L.opacityMax, t);
 
-    this.tmpColor.lerpColors(this.baseColor, this.dustColor, t);
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     out.color.copy(this.tmpColor);
 
-    out.blending = THREE.NormalBlending;
+    out.blending = L.blending;
     out.transparent = true;
     out.depthWrite = false;
     out.sizeAttenuation = true;
@@ -290,12 +331,40 @@ export class DustEmitter {
 
     this.baseSize = typeof mat.size === "number" ? mat.size : 0.04;
     this.baseOpacity = typeof mat.opacity === "number" ? mat.opacity : 1;
-    this.baseColor = (mat.color ? mat.color.clone() : new THREE.Color(0xffffff)) as THREE.Color;
+    this.baseColor = (mat.color
+      ? mat.color.clone()
+      : new THREE.Color(0xffffff)) as THREE.Color;
   }
 
   private setDustTargetsFromBase(): void {
-    this.dustSize = Math.max(this.baseSize, 0.045);
-    this.dustOpacity = Math.min(this.baseOpacity, 0.22);
-    this.dustColor = this.baseColor.clone().lerp(new THREE.Color(0xffffff), 0.25);
+    const white = new THREE.Color(0xffffff);
+
+    // Size: dust should read slightly larger than stars.
+    const sizeMin = Math.max(this.baseSize * 1.25, 0.052);
+    const sizeMax = Math.max(this.baseSize * 1.55, 0.070);
+
+    // Opacity: allow dust to be visible in default filter without relying on bloom.
+    const opacityMin = clamp(this.baseOpacity * 0.55, 0.28, 0.55);
+    const opacityMax = clamp(this.baseOpacity * 0.95, 0.45, 0.78);
+
+    // Color: brighten toward white so it reads as “wind” rather than “gone”.
+    const colorMin = this.baseColor.clone().lerp(white, 0.45);
+    const colorMax = this.baseColor.clone().lerp(white, 0.75);
+
+    this.look = {
+      sizeMin,
+      sizeMax,
+      opacityMin,
+      opacityMax,
+      colorMin,
+      colorMax,
+      // Swap to THREE.AdditiveBlending if you want “glow dust”.
+      blending: THREE.NormalBlending,
+    };
+
+    // Keep legacy single targets aligned (useful if older code paths are still toggled)
+    this.dustSize = sizeMax;
+    this.dustOpacity = opacityMax;
+    this.dustColor = colorMax.clone();
   }
 }

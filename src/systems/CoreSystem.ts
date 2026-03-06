@@ -254,7 +254,7 @@ export class CoreSystem {
   private mapPhaseToPostFXProfile(phase: CorePhase): PostFXProfileName {
     switch (phase) {
       case "solar":
-        return "solar";
+        return "sol";
       case "lunar":
         return "luna";
       case "black_hole":

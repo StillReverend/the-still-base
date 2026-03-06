@@ -1,6 +1,18 @@
+// src/systems/fieldfx/emitters/LeavesEmitter.ts
+// ============================================================
+// THE STILL — LeavesEmitter (BAND morph controller)
+//
+// Update (visibility / max control):
+//  - Introduced LeavesLook profile (size/opacity/color/blending) derived from base
+//  - sampleMaterial() now uses LeavesLook so leaves read in DEFAULT filter mode
+//  - Switched default blending to AdditiveBlending for luminosity (you can flip to Normal)
+//  - Added setLook() to tune without hunting constants
+// ============================================================
+
 import * as THREE from "three";
 
-const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
+const clamp = (v: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
@@ -28,6 +40,16 @@ class LcgRng {
     return this.next01() * 2 - 1;
   }
 }
+
+type LeavesLook = {
+  sizeMin: number;
+  sizeMax: number;
+  opacityMin: number;
+  opacityMax: number;
+  colorMin: THREE.Color;
+  colorMax: THREE.Color;
+  blending: THREE.Blending;
+};
 
 export class LeavesEmitter {
   public readonly id = "leaves";
@@ -66,6 +88,56 @@ export class LeavesEmitter {
   private leafColor = new THREE.Color(0xb48a5a);
 
   private tmpColor = new THREE.Color();
+
+  // NEW: look profile for strong default-mode legibility
+  private look: LeavesLook = {
+    sizeMin: 0.06,
+    sizeMax: 0.11,
+    opacityMin: 0.22,
+    opacityMax: 0.72,
+    colorMin: new THREE.Color(0xa0703f),
+    colorMax: new THREE.Color(0xffd6a3),
+    blending: THREE.AdditiveBlending,
+  };
+
+  /**
+   * Optional: live tuning hook.
+   */
+  public setLook(partial: Partial<{
+    sizeMin: number;
+    sizeMax: number;
+    opacityMin: number;
+    opacityMax: number;
+    colorMin: THREE.Color | number;
+    colorMax: THREE.Color | number;
+    blending: THREE.Blending;
+  }>): void {
+    if (typeof partial.sizeMin === "number") this.look.sizeMin = partial.sizeMin;
+    if (typeof partial.sizeMax === "number") this.look.sizeMax = partial.sizeMax;
+    if (typeof partial.opacityMin === "number") this.look.opacityMin = partial.opacityMin;
+    if (typeof partial.opacityMax === "number") this.look.opacityMax = partial.opacityMax;
+
+    if (partial.colorMin !== undefined) {
+      this.look.colorMin =
+        partial.colorMin instanceof THREE.Color
+          ? partial.colorMin.clone()
+          : new THREE.Color(partial.colorMin);
+    }
+    if (partial.colorMax !== undefined) {
+      this.look.colorMax =
+        partial.colorMax instanceof THREE.Color
+          ? partial.colorMax.clone()
+          : new THREE.Color(partial.colorMax);
+    }
+
+    if (partial.blending !== undefined) this.look.blending = partial.blending;
+
+    // Sanity clamps
+    this.look.sizeMin = clamp(this.look.sizeMin, 0.0005, 10);
+    this.look.sizeMax = clamp(this.look.sizeMax, this.look.sizeMin, 20);
+    this.look.opacityMin = clamp(this.look.opacityMin, 0, 1);
+    this.look.opacityMax = clamp(this.look.opacityMax, this.look.opacityMin, 1);
+  }
 
   public attach(points: THREE.Points): void {
     if (this.points === points) return;
@@ -110,6 +182,7 @@ export class LeavesEmitter {
 
     this.cacheMaterialBase();
     this.setLeafTargetsFromBase();
+    this.rebuildLookFromBase();
 
     this.restorePositionsBase();
     this.restoreMaterialBase();
@@ -179,9 +252,21 @@ export class LeavesEmitter {
     for (let i = 0; i < this.count; i++) {
       const ix = i * 3;
 
-      vel[ix + 0] = clamp(vel[ix + 0] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
-      vel[ix + 1] = clamp(vel[ix + 1] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
-      vel[ix + 2] = clamp(vel[ix + 2] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
+      vel[ix + 0] = clamp(
+        vel[ix + 0] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
+      vel[ix + 1] = clamp(
+        vel[ix + 1] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
+      vel[ix + 2] = clamp(
+        vel[ix + 2] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
 
       vel[ix + 1] -= this.down * s * dts;
 
@@ -212,17 +297,18 @@ export class LeavesEmitter {
     }
   }
 
-  // NEW: compositor sampling
+  // NEW: compositor sampling (uses Look profile for visibility)
   public sampleMaterial(morph01: number, out: MaterialState): void {
     const t = clamp01(morph01);
+    const L = this.look;
 
-    out.size = lerp(this.baseSize, this.leafSize, t);
-    out.opacity = lerp(this.baseOpacity, this.leafOpacity, t);
+    out.size = lerp(L.sizeMin, L.sizeMax, t);
+    out.opacity = lerp(L.opacityMin, L.opacityMax, t);
 
-    this.tmpColor.lerpColors(this.baseColor, this.leafColor, t);
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     out.color.copy(this.tmpColor);
 
-    out.blending = THREE.NormalBlending;
+    out.blending = L.blending;
     out.transparent = true;
     out.depthWrite = false;
     out.sizeAttenuation = true;
@@ -248,10 +334,12 @@ export class LeavesEmitter {
     const mat = this.material as THREE.PointsMaterial;
     if (!(mat as any).isPointsMaterial) return;
 
-    mat.size = lerp(this.baseSize, this.leafSize, t);
-    mat.opacity = lerp(this.baseOpacity, this.leafOpacity, t);
+    const L = this.look;
 
-    this.tmpColor.lerpColors(this.baseColor, this.leafColor, t);
+    mat.size = lerp(L.sizeMin, L.sizeMax, t);
+    mat.opacity = lerp(L.opacityMin, L.opacityMax, t);
+
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     mat.color.copy(this.tmpColor);
 
     mat.transparent = true;
@@ -298,8 +386,42 @@ export class LeavesEmitter {
   }
 
   private setLeafTargetsFromBase(): void {
+    // Keep these for legacy paths, but compositor now uses Look profile.
     this.leafSize = Math.max(this.baseSize, 0.06);
     this.leafOpacity = 0.38;
     this.leafColor = this.baseColor.clone().lerp(new THREE.Color(0xb48a5a), 0.75);
+  }
+
+  private rebuildLookFromBase(): void {
+    const baseSize = Number.isFinite(this.baseSize) && this.baseSize > 0 ? this.baseSize : 0.04;
+    const baseOpacity = clamp(this.baseOpacity, 0.0, 1.0);
+    const baseCol = this.baseColor.clone();
+
+    // Size: leaves should read in default filter; bias upward.
+    const sizeMax = clamp(Math.max(this.leafSize, baseSize * 2.7), baseSize * 1.6, baseSize * 7.5);
+    const sizeMin = clamp(sizeMax * 0.58, baseSize * 1.15, sizeMax);
+
+    // Opacity: Normal blending often disappears on dark backgrounds.
+    // We'll keep a solid min, and let morph blend handle the rest.
+    const opacityMax = clamp(Math.max(0.62, this.leafOpacity * 1.35) * clamp(baseOpacity, 0.75, 1.0), 0.45, 1.0);
+    const opacityMin = clamp(opacityMax * 0.40, 0.18, 0.75);
+
+    // Color: warm amber that still feels “leafy” but luminous.
+    const leaf = new THREE.Color(0xb48a5a);
+    const warm = new THREE.Color(0xffd8a6);
+
+    const colorMin = baseCol.clone().lerp(leaf, 0.72);
+    const colorMax = leaf.clone().lerp(warm, 0.35);
+
+    // Blending: Additive reads best in “default filter” for these point sprites.
+    this.look = {
+      sizeMin,
+      sizeMax,
+      opacityMin,
+      opacityMax,
+      colorMin,
+      colorMax,
+      blending: THREE.AdditiveBlending,
+    };
   }
 }

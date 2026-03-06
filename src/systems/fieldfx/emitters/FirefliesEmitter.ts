@@ -1,7 +1,19 @@
 // src/systems/fieldfx/emitters/FirefliesEmitter.ts
+// ============================================================
+// THE STILL — FirefliesEmitter (BAND morph controller)
+//
+// Update (visibility / max control):
+//  - Added FirefliesLook profile (size/opacity/color/blending) computed from base material
+//  - sampleMaterial() now uses FirefliesLook for stronger default-mode visibility
+//  - Twinkle shader now also gets uBaseOpacity/uOpacityBoost so alpha remains readable even
+//    when PointMaterial opacity is conservative (and while blending between modes)
+//  - Added tiny helper setLook() so you can tune without re-deriving from base
+// ============================================================
+
 import * as THREE from "three";
 
-const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
+const clamp = (v: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
@@ -35,6 +47,23 @@ type FirefliesShaderUniforms = {
   uEnergy?: { value: number };
   uDensity?: { value: number };
   uSpeedMul?: { value: number };
+
+  // NEW: keep twinkle visible in default filter even during blend-outs
+  uBaseOpacity?: { value: number };
+  uOpacityBoost?: { value: number };
+};
+
+type FirefliesLook = {
+  sizeMin: number;
+  sizeMax: number;
+  opacityMin: number;
+  opacityMax: number;
+  colorMin: THREE.Color;
+  colorMax: THREE.Color;
+  blending: THREE.Blending;
+
+  // Shader-side twinkle alpha boost (multiplies diffuseColor.a after twinkle)
+  twinkleOpacityBoost: number;
 };
 
 export class FirefliesEmitter {
@@ -85,9 +114,61 @@ export class FirefliesEmitter {
     | null = null;
 
   // IMPORTANT: must be called with material bound as `this`
-  private prevCustomProgramCacheKey: ((this: unknown) => string) | undefined | null = null;
+  private prevCustomProgramCacheKey: ((this: unknown) => string) | undefined | null =
+    null;
 
-  private readonly shaderKey = "fireflies_twinkle_v1";
+  private readonly shaderKey = "fireflies_twinkle_v2";
+
+  // NEW: max-control look profile (computed from base material)
+  private look: FirefliesLook = {
+    sizeMin: 0.05,
+    sizeMax: 0.11,
+    opacityMin: 0.45,
+    opacityMax: 1.0,
+    colorMin: new THREE.Color(0xbfffa2),
+    colorMax: new THREE.Color(0xf5ffd8),
+    blending: THREE.AdditiveBlending,
+    twinkleOpacityBoost: 1.35,
+  };
+
+  /**
+   * Optional: live tuning hook.
+   */
+  public setLook(partial: Partial<{
+    sizeMin: number;
+    sizeMax: number;
+    opacityMin: number;
+    opacityMax: number;
+    colorMin: THREE.Color | number;
+    colorMax: THREE.Color | number;
+    blending: THREE.Blending;
+    twinkleOpacityBoost: number;
+  }>): void {
+    if (typeof partial.sizeMin === "number") this.look.sizeMin = partial.sizeMin;
+    if (typeof partial.sizeMax === "number") this.look.sizeMax = partial.sizeMax;
+    if (typeof partial.opacityMin === "number") this.look.opacityMin = partial.opacityMin;
+    if (typeof partial.opacityMax === "number") this.look.opacityMax = partial.opacityMax;
+
+    if (partial.colorMin !== undefined) {
+      if (partial.colorMin instanceof THREE.Color) this.look.colorMin = partial.colorMin.clone();
+      else this.look.colorMin = new THREE.Color(partial.colorMin);
+    }
+    if (partial.colorMax !== undefined) {
+      if (partial.colorMax instanceof THREE.Color) this.look.colorMax = partial.colorMax.clone();
+      else this.look.colorMax = new THREE.Color(partial.colorMax);
+    }
+
+    if (partial.blending !== undefined) this.look.blending = partial.blending;
+    if (typeof partial.twinkleOpacityBoost === "number")
+      this.look.twinkleOpacityBoost = partial.twinkleOpacityBoost;
+
+    // Sanity clamps
+    this.look.sizeMin = clamp(this.look.sizeMin, 0.0005, 10);
+    this.look.sizeMax = clamp(this.look.sizeMax, this.look.sizeMin, 20);
+    this.look.opacityMin = clamp(this.look.opacityMin, 0, 1);
+    this.look.opacityMax = clamp(this.look.opacityMax, this.look.opacityMin, 1);
+    this.look.twinkleOpacityBoost = clamp(this.look.twinkleOpacityBoost, 0.5, 4.0);
+  }
 
   public attach(points: THREE.Points): void {
     if (this.points === points) return;
@@ -109,7 +190,7 @@ export class FirefliesEmitter {
     this.posAttr = attr;
 
     const arr = attr.array as Float32Array | ArrayLike<number>;
-    const len = arr.length | 0;
+    const len = (arr.length | 0) >>> 0;
     this.count = (len / 3) | 0;
 
     const base = new Float32Array(len);
@@ -132,6 +213,7 @@ export class FirefliesEmitter {
 
     this.cacheMaterialBase();
     this.setFireflyTargetsFromBase();
+    this.rebuildLookFromBase();
 
     // Create per-point twinkle attributes + patch shader on the shared PointsMaterial.
     this.ensureTwinkleAttributes();
@@ -217,9 +299,21 @@ export class FirefliesEmitter {
     for (let i = 0; i < this.count; i++) {
       const ix = i * 3;
 
-      vel[ix + 0] = clamp(vel[ix + 0] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
-      vel[ix + 1] = clamp(vel[ix + 1] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
-      vel[ix + 2] = clamp(vel[ix + 2] + this.rng.nextSigned() * jitterMul * dts, -this.maxVel, this.maxVel);
+      vel[ix + 0] = clamp(
+        vel[ix + 0] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
+      vel[ix + 1] = clamp(
+        vel[ix + 1] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
+      vel[ix + 2] = clamp(
+        vel[ix + 2] + this.rng.nextSigned() * jitterMul * dts,
+        -this.maxVel,
+        this.maxVel,
+      );
 
       const x = sim[ix + 0];
       const z = sim[ix + 2];
@@ -248,17 +342,18 @@ export class FirefliesEmitter {
     }
   }
 
-  // NEW: compositor sampling
+  // NEW: compositor sampling (uses Look profile)
   public sampleMaterial(morph01: number, out: MaterialState): void {
     const t = clamp01(morph01);
+    const L = this.look;
 
-    out.size = lerp(this.baseSize, this.flySize, t);
-    out.opacity = lerp(this.baseOpacity, this.flyOpacity, t);
+    out.size = lerp(L.sizeMin, L.sizeMax, t);
+    out.opacity = lerp(L.opacityMin, L.opacityMax, t);
 
-    this.tmpColor.lerpColors(this.baseColor, this.flyColor, t);
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     out.color.copy(this.tmpColor);
 
-    out.blending = THREE.AdditiveBlending;
+    out.blending = L.blending;
     out.transparent = true;
     out.depthWrite = false;
     out.sizeAttenuation = true;
@@ -284,10 +379,12 @@ export class FirefliesEmitter {
     const mat = this.material as THREE.PointsMaterial;
     if (!(mat as any).isPointsMaterial) return;
 
-    mat.size = lerp(this.baseSize, this.flySize, t);
-    mat.opacity = lerp(this.baseOpacity, this.flyOpacity, t);
+    const L = this.look;
 
-    this.tmpColor.lerpColors(this.baseColor, this.flyColor, t);
+    mat.size = lerp(L.sizeMin, L.sizeMax, t);
+    mat.opacity = lerp(L.opacityMin, L.opacityMax, t);
+
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     mat.color.copy(this.tmpColor);
 
     mat.transparent = true;
@@ -366,7 +463,7 @@ export class FirefliesEmitter {
       const r3 = this.rng.next01();
 
       phase[i] = r0 * Math.PI * 2;
-      speed[i] = lerp(0.35, 1.60, Math.pow(r1, 0.75));
+      speed[i] = lerp(0.35, 1.6, Math.pow(r1, 0.75));
       duty[i] = clamp01(Math.pow(r2, 2.2));
       amp[i] = lerp(0.65, 1.15, Math.pow(r3, 0.6));
     }
@@ -403,6 +500,10 @@ export class FirefliesEmitter {
       shader.uniforms.uDensity = { value: 0.15 };
       shader.uniforms.uSpeedMul = { value: 1.0 };
 
+      // NEW
+      shader.uniforms.uBaseOpacity = { value: 1.0 };
+      shader.uniforms.uOpacityBoost = { value: 1.0 };
+
       this.shaderUniforms = shader.uniforms as unknown as FirefliesShaderUniforms;
 
       shader.vertexShader = shader.vertexShader
@@ -419,7 +520,12 @@ uniform float uEnergy;
 uniform float uDensity;
 uniform float uSpeedMul;
 
+// NEW
+uniform float uBaseOpacity;
+uniform float uOpacityBoost;
+
 varying float vTwinkle;
+varying float vOpacityMul;
 
 void main() {
 `,
@@ -447,6 +553,9 @@ float e = clamp(uEnergy, 0.0, 1.0);
 float energyMul = mix(0.35, 1.0, e);
 
 vTwinkle = clamp(tw * gate * aAmp * energyMul, 0.0, 1.25);
+
+// NEW: let alpha remain readable even if material opacity is conservative.
+vOpacityMul = clamp(uBaseOpacity * uOpacityBoost, 0.0, 2.0);
 `,
         );
 
@@ -455,6 +564,7 @@ vTwinkle = clamp(tw * gate * aAmp * energyMul, 0.0, 1.25);
           "void main() {",
           `
 varying float vTwinkle;
+varying float vOpacityMul;
 
 void main() {
 `,
@@ -464,8 +574,11 @@ void main() {
           `
 vec4 diffuseColor = vec4( diffuse, opacity );
 
-diffuseColor.a *= clamp(vTwinkle, 0.0, 1.0);
-diffuseColor.rgb *= mix(0.85, 1.12, clamp(vTwinkle, 0.0, 1.0));
+// Twinkle drives alpha strongly (readable in default filter)
+diffuseColor.a *= clamp(vTwinkle, 0.0, 1.0) * vOpacityMul;
+
+// Slight brightness lift (but not purely bloom-dependent)
+diffuseColor.rgb *= mix(0.90, 1.18, clamp(vTwinkle, 0.0, 1.0));
 `,
         );
     };
@@ -536,9 +649,50 @@ diffuseColor.rgb *= mix(0.85, 1.12, clamp(vTwinkle, 0.0, 1.0));
     const density = clamp01(lerp(0.12, 0.92, Math.pow(energy01, 0.85)));
     const speedMul = lerp(0.30, 2.10, Math.pow(energy01, 0.95));
 
+    // NEW: use Look profile to keep “default filter” visible
+    // - Base opacity comes from compositor (out.opacity), but shader doesn’t know that.
+    // - So we feed a conservative proxy here (max of baseOpacity + look min), plus boost.
+    const baseOpacityProxy = clamp(this.baseOpacity, 0.25, 1.0);
+    const opacityBoost = clamp(this.look.twinkleOpacityBoost, 0.5, 4.0);
+
     if (u.uTime) u.uTime.value = this.twinkleTime;
     if (u.uEnergy) u.uEnergy.value = energy01;
     if (u.uDensity) u.uDensity.value = density;
     if (u.uSpeedMul) u.uSpeedMul.value = speedMul;
+
+    if (u.uBaseOpacity) u.uBaseOpacity.value = baseOpacityProxy;
+    if (u.uOpacityBoost) u.uOpacityBoost.value = opacityBoost;
+  }
+
+  private rebuildLookFromBase(): void {
+    // Base-driven defaults: visible without bloom, but still “firefly” not “flare gun”
+    const baseSize = Number.isFinite(this.baseSize) && this.baseSize > 0 ? this.baseSize : 0.04;
+    const baseOpacity = clamp(this.baseOpacity, 0.0, 1.0);
+
+    // Size: in default filter, small points disappear. We bias up a little.
+    const sizeMax = clamp(Math.max(this.flySize, baseSize * 2.4), baseSize * 1.6, baseSize * 6.5);
+    const sizeMin = clamp(sizeMax * 0.62, baseSize * 1.15, sizeMax);
+
+    // Opacity: allow a real presence even when base stars are dim.
+    const opacityMax = clamp(Math.max(this.flyOpacity, 0.9) * clamp(baseOpacity, 0.75, 1.0), 0.55, 1.0);
+    const opacityMin = clamp(opacityMax * 0.50, 0.22, 0.75);
+
+    // Color: keep your greenish tint, but give it a warmer rim so it reads as “alive”
+    const green = this.flyColor.clone();
+    const warm = new THREE.Color(0xfff6c7);
+
+    const colorMin = this.baseColor.clone().lerp(green, 0.58);
+    const colorMax = green.clone().lerp(warm, 0.22);
+
+    this.look = {
+      sizeMin,
+      sizeMax,
+      opacityMin,
+      opacityMax,
+      colorMin,
+      colorMax,
+      blending: THREE.AdditiveBlending,
+      twinkleOpacityBoost: 1.35, // strong default-filter legibility
+    };
   }
 }

@@ -2,34 +2,17 @@
 // ============================================================
 // THE STILL — RainEmitter (BAND morph controller)
 // ------------------------------------------------------------
-// Uses existing BAND points. No new point clouds.
-// - Fast vertical fall with slight wind shear
-// - “Sheet” feel via stable per-particle wind banding (seeded, no popping)
-// - Burst on reset for a quick “weather arrives” feeling
-//
-// Fix (Mar 2026):
-// - Respawn/wrap based on Y bounds (top->bottom) instead of sphere escape,
-//   because particles tend to move inward/down and never exceed r^2.
-// - Increase default drift so motion reads at normal camera distances.
-//
-// Fix (Mar 2026 - Option B prep):
-// - Keep sizeAttenuation = false so points remain readable at BAND scale.
-// - Move rain in WORLD units/sec (BAND radii are huge) so motion reads immediately.
-//
-// Fix (Mar 2026 - Smoothness):
-// - Semi-fixed timestep with accumulator for stable motion.
-// - If dt is "large" (tab inactive / throttled), reset accumulator and do NOT catch up.
-//
-// NEW (Mar 2026 - Option B "True Density"):
-// - Adds a stable per-point random attribute (aRand) to BAND geometry.
-// - Patches the PointsMaterial shader (onBeforeCompile) with a uDensity uniform.
-// - When uDensity < 1, only a subset of points render (true sparse rain at low energy).
-// - Defaults to uDensity = 1 (no change) unless setDensity01() is called.
+// Update (visibility / max control):
+//  - Adds RainLook profile (size/opacity/color/blending/attenuation) derived from base
+//  - sampleMaterial() now uses RainLook so rain reads in DEFAULT filter mode
+//  - Adds setLook() to tune quickly (and keep emitter values centralized)
+//  - Keeps your Option B "true density" shader gating intact
 // ============================================================
 
 import * as THREE from "three";
 
-const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
+const clamp = (v: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, v));
 const clamp01 = (v: number): number => clamp(v, 0, 1);
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
@@ -57,6 +40,17 @@ class LcgRng {
     return this.next01() * 2 - 1;
   }
 }
+
+type RainLook = {
+  sizeMin: number;
+  sizeMax: number;
+  opacityMin: number;
+  opacityMax: number;
+  colorMin: THREE.Color;
+  colorMax: THREE.Color;
+  blending: THREE.Blending;
+  sizeAttenuation: boolean;
+};
 
 export class RainEmitter {
   public readonly id = "rain";
@@ -119,11 +113,65 @@ export class RainEmitter {
   private baseOpacity = 1;
   private baseColor = new THREE.Color(0xffffff);
 
-  private rainSize = 0.045;
-  private rainOpacity = 0.99;
-  private rainColor = new THREE.Color(0xeaf3ff);
+  private rainSize = 0.045; // legacy (kept)
+  private rainOpacity = 0.99; // legacy (kept)
+  private rainColor = new THREE.Color(0xeaf3ff); // legacy (kept)
 
   private tmpColor = new THREE.Color();
+
+  // NEW: look profile for legibility in DEFAULT filter mode
+  private look: RainLook = {
+    sizeMin: 0.06,
+    sizeMax: 0.11,
+    opacityMin: 0.12,
+    opacityMax: 0.38,
+    colorMin: new THREE.Color(0x9fd2ff),
+    colorMax: new THREE.Color(0xeaf3ff),
+    blending: THREE.AdditiveBlending,
+    sizeAttenuation: false,
+  };
+
+  /**
+   * Optional tuning hook (for maximum control without spelunking).
+   */
+  public setLook(partial: Partial<{
+    sizeMin: number;
+    sizeMax: number;
+    opacityMin: number;
+    opacityMax: number;
+    colorMin: THREE.Color | number;
+    colorMax: THREE.Color | number;
+    blending: THREE.Blending;
+    sizeAttenuation: boolean;
+  }>): void {
+    if (typeof partial.sizeMin === "number") this.look.sizeMin = partial.sizeMin;
+    if (typeof partial.sizeMax === "number") this.look.sizeMax = partial.sizeMax;
+    if (typeof partial.opacityMin === "number") this.look.opacityMin = partial.opacityMin;
+    if (typeof partial.opacityMax === "number") this.look.opacityMax = partial.opacityMax;
+
+    if (partial.colorMin !== undefined) {
+      this.look.colorMin =
+        partial.colorMin instanceof THREE.Color
+          ? partial.colorMin.clone()
+          : new THREE.Color(partial.colorMin);
+    }
+    if (partial.colorMax !== undefined) {
+      this.look.colorMax =
+        partial.colorMax instanceof THREE.Color
+          ? partial.colorMax.clone()
+          : new THREE.Color(partial.colorMax);
+    }
+
+    if (partial.blending !== undefined) this.look.blending = partial.blending;
+    if (typeof partial.sizeAttenuation === "boolean")
+      this.look.sizeAttenuation = partial.sizeAttenuation;
+
+    // sanity clamps
+    this.look.sizeMin = clamp(this.look.sizeMin, 0.0005, 10);
+    this.look.sizeMax = clamp(this.look.sizeMax, this.look.sizeMin, 20);
+    this.look.opacityMin = clamp(this.look.opacityMin, 0, 1);
+    this.look.opacityMax = clamp(this.look.opacityMax, this.look.opacityMin, 1);
+  }
 
   public attach(points: THREE.Points): void {
     if (this.points === points) return;
@@ -192,6 +240,7 @@ export class RainEmitter {
 
     this.cacheMaterialBase();
     this.setRainTargetsFromBase();
+    this.rebuildLookFromBase();
 
     this.restorePositionsBase();
     this.restoreMaterialBase();
@@ -242,7 +291,14 @@ export class RainEmitter {
   }
 
   public resetSimToBase(): void {
-    if (!this.basePositions || !this.simPositions || !this.velocities || !this.windBias || !this.sheetBand) return;
+    if (
+      !this.basePositions ||
+      !this.simPositions ||
+      !this.velocities ||
+      !this.windBias ||
+      !this.sheetBand
+    )
+      return;
 
     const base = this.basePositions;
     const sim = this.simPositions;
@@ -368,21 +424,21 @@ export class RainEmitter {
     }
   }
 
-  // NEW: compositor sampling
+  // NEW: compositor sampling (uses Look profile)
   public sampleMaterial(morph01: number, out: MaterialState): void {
     const t = clamp01(morph01);
+    const L = this.look;
 
-    out.size = lerp(this.baseSize, this.rainSize, t);
-    out.opacity = lerp(this.baseOpacity, this.rainOpacity, t);
+    out.size = lerp(L.sizeMin, L.sizeMax, t);
+    out.opacity = lerp(L.opacityMin, L.opacityMax, t);
 
-    this.tmpColor.lerpColors(this.baseColor, this.rainColor, t);
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     out.color.copy(this.tmpColor);
 
-    out.blending = THREE.AdditiveBlending;
-    out.opacity = lerp(this.baseOpacity, Math.min(0.55, this.rainOpacity * 1.6), t);
+    out.blending = L.blending;
     out.transparent = true;
     out.depthWrite = false;
-    out.sizeAttenuation = false;
+    out.sizeAttenuation = L.sizeAttenuation;
   }
 
   // Legacy remains
@@ -405,15 +461,21 @@ export class RainEmitter {
     const mat = this.material as THREE.PointsMaterial;
     if (!(mat as any).isPointsMaterial) return;
 
-    mat.size = lerp(this.baseSize, this.rainSize, t);
-    mat.opacity = lerp(this.baseOpacity, this.rainOpacity, t);
+    const L = this.look;
 
-    this.tmpColor.lerpColors(this.baseColor, this.rainColor, t);
+    mat.size = lerp(L.sizeMin, L.sizeMax, t);
+    mat.opacity = lerp(L.opacityMin, L.opacityMax, t);
+
+    this.tmpColor.lerpColors(L.colorMin, L.colorMax, t);
     mat.color.copy(this.tmpColor);
 
     mat.transparent = true;
     mat.depthWrite = false;
-    mat.sizeAttenuation = false;
+    mat.sizeAttenuation = L.sizeAttenuation;
+
+    // Keep density uniforms in sync even when updating material
+    this.applyDensityToMaterial();
+
     mat.needsUpdate = true;
   }
 
@@ -439,6 +501,7 @@ export class RainEmitter {
 
     mat.transparent = true;
     mat.depthWrite = false;
+    // Keep your original readabilty decision for rain (world-scale, non-attenuated)
     mat.sizeAttenuation = false;
 
     // Keep density uniforms in sync even when restoring material state
@@ -459,9 +522,43 @@ export class RainEmitter {
   }
 
   private setRainTargetsFromBase(): void {
+    // Legacy fields (no longer used by compositor, but kept for any fallback usage)
     this.rainSize = Math.max(0.06, Math.min(0.095, this.baseSize * 1.55));
     this.rainOpacity = Math.min(0.42, Math.max(0.24, this.baseOpacity * 0.36));
     this.rainColor = this.baseColor.clone().lerp(new THREE.Color(0x9fd2ff), 0.6);
+  }
+
+  private rebuildLookFromBase(): void {
+    const baseSize = Number.isFinite(this.baseSize) && this.baseSize > 0 ? this.baseSize : 0.04;
+    const baseOpacity = clamp(this.baseOpacity, 0.0, 1.0);
+    const baseCol = this.baseColor.clone();
+
+    // Rain reads best as "thin bright" points. In default filter mode,
+    // we need additive + enough opacity to survive tonemapping without bloom.
+    const sizeMax = clamp(Math.max(0.085, baseSize * 2.2), baseSize * 1.4, baseSize * 6.5);
+    const sizeMin = clamp(sizeMax * 0.72, baseSize * 1.05, sizeMax);
+
+    // Opacity: keep modest so it doesn't become snow. Additive + density does the work.
+    const opMax = clamp(Math.max(0.28, baseOpacity * 0.36), 0.12, 0.60);
+    const opMin = clamp(opMax * 0.42, 0.05, opMax);
+
+    // Color: cool blue-white for "wet" sparkle.
+    const cool = new THREE.Color(0x9fd2ff);
+    const white = new THREE.Color(0xf4fbff);
+
+    const cMin = baseCol.clone().lerp(cool, 0.55);
+    const cMax = cool.clone().lerp(white, 0.55);
+
+    this.look = {
+      sizeMin,
+      sizeMax,
+      opacityMin: opMin,
+      opacityMax: opMax,
+      colorMin: cMin,
+      colorMax: cMax,
+      blending: THREE.AdditiveBlending,
+      sizeAttenuation: false,
+    };
   }
 
   // ==========================================================
@@ -475,7 +572,11 @@ export class RainEmitter {
     const name = "aRand";
 
     const existing = this.geometry.getAttribute(name) as THREE.BufferAttribute | undefined;
-    if (existing && existing.itemSize === 1 && (existing.array as any)?.length === this.count) {
+    if (
+      existing &&
+      existing.itemSize === 1 &&
+      (existing.array as any)?.length === this.count
+    ) {
       return;
     }
 
@@ -511,7 +612,9 @@ export class RainEmitter {
 
       // Attach uniforms and initialize to CURRENT values (so first compile respects current density)
       shader.uniforms.uDensity = { value: clamp01(this.density01) };
-      shader.uniforms.uDensitySoft = { value: clamp(this.densitySoftness, 0.005, 0.10) };
+      shader.uniforms.uDensitySoft = {
+        value: clamp(this.densitySoftness, 0.005, 0.10),
+      };
 
       ud.__stillDensityShader = shader;
 
@@ -524,12 +627,16 @@ export class RainEmitter {
         );
 
       if (!shader.vertexShader.includes("vRand = aRand")) {
-        shader.vertexShader = shader.vertexShader.replace("void main() {", "void main() {\n  vRand = aRand;");
+        shader.vertexShader = shader.vertexShader.replace(
+          "void main() {",
+          "void main() {\n  vRand = aRand;",
+        );
       }
 
       // --- Fragment: gate alpha by density ---
       shader.fragmentShader =
-        `uniform float uDensity;\nuniform float uDensitySoft;\nvarying float vRand;\n` + shader.fragmentShader;
+        `uniform float uDensity;\nuniform float uDensitySoft;\nvarying float vRand;\n` +
+        shader.fragmentShader;
 
       const needle = "gl_FragColor = vec4( diffuse, opacity );";
       const gate = `
@@ -544,7 +651,10 @@ export class RainEmitter {
   if (gl_FragColor.a <= 0.001) discard;`;
 
       if (shader.fragmentShader.includes(needle)) {
-        shader.fragmentShader = shader.fragmentShader.replace(needle, `${needle}${gate}`);
+        shader.fragmentShader = shader.fragmentShader.replace(
+          needle,
+          `${needle}${gate}`,
+        );
       } else {
         shader.fragmentShader = shader.fragmentShader.replace("}", `${gate}\n}`);
       }
