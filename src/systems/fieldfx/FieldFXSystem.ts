@@ -129,6 +129,92 @@ type MaterialState = {
   sizeAttenuation: boolean;
 };
 
+type FieldFXBlendMode = "additive" | "normal" | "base";
+
+type FieldFXLookProfile = {
+  sizeMul: number;
+  opacityMul: number;
+  intensity: number;
+  bloomBias: number;
+  audioResponse: number;
+  blendMode: FieldFXBlendMode;
+  tint: THREE.Color | null;
+  tintMix: number;
+};
+
+const FIELD_FX_LOOKS: Record<ResolvedMode, FieldFXLookProfile> = {
+  stars: {
+    sizeMul: 1.12,
+    opacityMul: 0.92,
+    intensity: 1.12,
+    bloomBias: 0.38,
+    audioResponse: 0.18,
+    blendMode: "additive",
+    tint: new THREE.Color("#d6defd"),
+    tintMix: 0.16,
+  },
+  embers: {
+    sizeMul: 1.2,
+    opacityMul: 1.05,
+    intensity: 1.42,
+    bloomBias: 0.92,
+    audioResponse: 0.55,
+    blendMode: "additive",
+    tint: new THREE.Color("#ffd36b"),
+    tintMix: 0.10,
+  },
+  dust: {
+    sizeMul: 1.1,
+    opacityMul: 0.94,
+    intensity: 1.02,
+    bloomBias: 0.48,
+    audioResponse: 0.4,
+    blendMode: "additive",
+    tint: new THREE.Color("#efe4d1"),
+    tintMix: 0.08,
+  },
+  rain: {
+    sizeMul: 1.06,
+    opacityMul: 1.0,
+    intensity: 0.96,
+    bloomBias: 0.22,
+    audioResponse: 0.22,
+    blendMode: "normal",
+    tint: new THREE.Color("#e7f2ff"),
+    tintMix: 0.1,
+  },
+  snow: {
+    sizeMul: 1.16,
+    opacityMul: 1.02,
+    intensity: 1.02,
+    bloomBias: 0.32,
+    audioResponse: 0.18,
+    blendMode: "normal",
+    tint: new THREE.Color("#f4f9ff"),
+    tintMix: 0.12,
+  },
+  fireflies: {
+    sizeMul: 1.22,
+    opacityMul: 1.04,
+    intensity: 1.36,
+    bloomBias: 1.0,
+    audioResponse: 0.62,
+    blendMode: "additive",
+    tint: new THREE.Color("#fff6a8"),
+    tintMix: 0.16,
+  },
+  leaves: {
+    sizeMul: 1.14,
+    opacityMul: 1.0,
+    intensity: 0.88,
+    bloomBias: 0.08,
+    audioResponse: 0.16,
+    blendMode: "normal",
+    tint: new THREE.Color("#c6a96b"),
+    tintMix: 0.08,
+  },
+};
+
 // Audio frame contract we care about (from AudioSystem audio:frame payload.frame)
 type AudioFrame01 = {
   energy: number;
@@ -177,6 +263,7 @@ export class FieldFXSystem {
   private readonly snow = new SnowEmitter();
 
   private readonly tmpColorOut = new THREE.Color();
+  private readonly tmpTintColor = new THREE.Color();
 
   private readonly matA: MaterialState = {
     size: 0.04,
@@ -585,12 +672,19 @@ export class FieldFXSystem {
     this.mat.size = this.baseMat.size;
     this.mat.opacity = this.baseMat.opacity;
     this.mat.color.copy(this.baseMat.color);
+
+    const stateChanged =
+      this.mat.blending !== this.baseMat.blending ||
+      this.mat.transparent !== this.baseMat.transparent ||
+      this.mat.depthWrite !== this.baseMat.depthWrite ||
+      (this.mat as any).sizeAttenuation !== this.baseMat.sizeAttenuation;
+
     this.mat.blending = this.baseMat.blending;
     this.mat.transparent = this.baseMat.transparent;
     this.mat.depthWrite = this.baseMat.depthWrite;
     (this.mat as any).sizeAttenuation = this.baseMat.sizeAttenuation;
 
-    this.mat.needsUpdate = true;
+    if (stateChanged) this.mat.needsUpdate = true;
   }
 
   private applyOffNow(): void {
@@ -678,12 +772,19 @@ export class FieldFXSystem {
     m.color.copy(this.tmpColorOut);
 
     const dom = matW >= 0.5 ? this.matB : this.matA;
+
+    const stateChanged =
+      m.blending !== dom.blending ||
+      m.transparent !== dom.transparent ||
+      m.depthWrite !== dom.depthWrite ||
+      (m as any).sizeAttenuation !== dom.sizeAttenuation;
+
     m.blending = dom.blending;
     m.transparent = dom.transparent;
     m.depthWrite = dom.depthWrite;
     (m as any).sizeAttenuation = dom.sizeAttenuation;
 
-    m.needsUpdate = true;
+    if (stateChanged) m.needsUpdate = true;
   }
 
   // ---- sim + sampling helpers (this is where rain/snow must exist) ----
@@ -732,14 +833,84 @@ export class FieldFXSystem {
     out.depthWrite = this.baseMat.depthWrite;
     out.sizeAttenuation = this.baseMat.sizeAttenuation;
 
-    if (mode === "stars") return;
+    if (mode !== "stars") {
+      if (mode === "embers") this.embers.sampleMaterial(t, out);
+      if (mode === "dust") this.dust.sampleMaterial(t, out);
+      if (mode === "fireflies") this.fireflies.sampleMaterial(t, out);
+      if (mode === "leaves") this.leaves.sampleMaterial(t, out);
+      if (mode === "rain") this.rain.sampleMaterial(t, out);
+      if (mode === "snow") this.snow.sampleMaterial(t, out);
+    }
 
-    if (mode === "embers") this.embers.sampleMaterial(t, out);
-    if (mode === "dust") this.dust.sampleMaterial(t, out);
-    if (mode === "fireflies") this.fireflies.sampleMaterial(t, out);
-    if (mode === "leaves") this.leaves.sampleMaterial(t, out);
-    if (mode === "rain") this.rain.sampleMaterial(t, out);
-    if (mode === "snow") this.snow.sampleMaterial(t, out);
+    this.applyLookProfile(mode, t, out);
+  }
+
+  private applyLookProfile(mode: ResolvedMode, morph01: number, out: MaterialState): void {
+    const look = FIELD_FX_LOOKS[mode];
+    const t = clamp01(morph01);
+
+    if (t <= 0) return;
+
+    const visualAudioMul = this.getVisualAudioMul(mode, look.audioResponse);
+    const bloomMul = lerp(1, 1 + look.bloomBias * 0.22, t);
+    const intensityMul = lerp(1, look.intensity * visualAudioMul * bloomMul, t);
+
+    out.size *= lerp(1, look.sizeMul, t);
+    out.opacity = clamp01(out.opacity * lerp(1, look.opacityMul, t));
+
+    if (look.tint && look.tintMix > 0) {
+      this.tmpTintColor.copy(out.color);
+      this.tmpTintColor.lerp(look.tint, clamp01(look.tintMix * t));
+      out.color.copy(this.tmpTintColor);
+    }
+
+    out.color.multiplyScalar(intensityMul);
+
+    if (look.blendMode === "additive") {
+      out.blending = THREE.AdditiveBlending;
+      out.transparent = true;
+      out.depthWrite = false;
+      out.sizeAttenuation = true;
+      return;
+    }
+
+    if (look.blendMode === "normal") {
+      out.blending = THREE.NormalBlending;
+      out.transparent = true;
+      out.depthWrite = false;
+      out.sizeAttenuation = true;
+      return;
+    }
+
+    // "base" falls through intentionally
+  }
+
+  private getVisualAudioMul(mode: ResolvedMode, response01: number): number {
+    const r = clamp01(response01);
+    if (r <= 0) return 1;
+
+    if (!this.hasAudioFrame) return 1;
+
+    let driver = 0;
+
+    if (mode === "stars") {
+      driver = clamp01(this.smMid * 0.7 + this.smHigh * 0.3);
+    } else if (mode === "embers") {
+      driver = clamp01(this.smMid * 0.72 + this.smHigh * 0.2 + this.smImpact * 0.08);
+    } else if (mode === "dust") {
+      driver = clamp01(this.smLow * 0.45 + this.smMid * 0.35 + this.gust01 * 0.2);
+    } else if (mode === "rain") {
+      driver = clamp01(this.smEnergy * 0.8 + this.smMid * 0.2);
+    } else if (mode === "snow") {
+      driver = clamp01(this.smEnergy * 0.75 + this.smHigh * 0.25);
+    } else if (mode === "fireflies") {
+      driver = clamp01(this.smHigh * 0.58 + this.smImpact * 0.22 + this.smEnergy * 0.2);
+      if (this.smQuiet) driver *= 0.86;
+    } else if (mode === "leaves") {
+      driver = clamp01(this.smLow * 0.56 + this.gust01 * 0.28 + this.smMid * 0.16);
+    }
+
+    return lerp(1, 1 + driver * 0.55, r);
   }
 
   // ------------------------------------------------------------
