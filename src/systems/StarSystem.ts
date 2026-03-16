@@ -418,7 +418,7 @@ export class StarSystem {
     const bandCount = Math.max(0, options.bandCount ?? 777);
     const bandInnerRadius = Math.max(this.exclusionRadius, options.bandInnerRadius ?? 1300);
     const bandOuterRadius = Math.max(bandInnerRadius + 1, options.bandOuterRadius ?? 2600);
-    const bandSize = Math.max(0.1, options.bandSize ?? 1.45);
+    const bandSize = Math.max(0.1, options.bandSize ?? 0.5);
 
     this.bandInnerRadius = bandInnerRadius;
     this.bandOuterRadius = bandOuterRadius;

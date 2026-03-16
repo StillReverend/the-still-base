@@ -302,12 +302,12 @@ export class DemoScene implements SceneController {
 
       farCount: 31,
       farRadius: 8000,
-      farSize: 3.1,
+      farSize: 3.0,
 
-      nearCount: 500,
+      nearCount: 333,
       nearInnerRadius: 5000,
       nearOuterRadius: 8000,
-      nearSize: 1.2,
+      nearSize: 1.5,
 
       nearReveal01: 0.0,
     });

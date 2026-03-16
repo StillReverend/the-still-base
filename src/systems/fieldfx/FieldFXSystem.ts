@@ -144,74 +144,74 @@ type FieldFXLookProfile = {
 
 const FIELD_FX_LOOKS: Record<ResolvedMode, FieldFXLookProfile> = {
   stars: {
-    sizeMul: 1.12,
-    opacityMul: 0.92,
-    intensity: 1.12,
-    bloomBias: 0.38,
-    audioResponse: 0.18,
+    sizeMul: 1.5,
+    opacityMul: 0.9,
+    intensity: 1.04,
+    bloomBias: 0.16,
+    audioResponse: 0.1,
     blendMode: "additive",
-    tint: new THREE.Color("#d6defd"),
-    tintMix: 0.16,
-  },
-  embers: {
-    sizeMul: 1.2,
-    opacityMul: 1.05,
-    intensity: 1.42,
-    bloomBias: 0.92,
-    audioResponse: 0.55,
-    blendMode: "additive",
-    tint: new THREE.Color("#ffd36b"),
-    tintMix: 0.10,
-  },
-  dust: {
-    sizeMul: 1.1,
-    opacityMul: 0.94,
-    intensity: 1.02,
-    bloomBias: 0.48,
-    audioResponse: 0.4,
-    blendMode: "additive",
-    tint: new THREE.Color("#efe4d1"),
-    tintMix: 0.08,
-  },
-  rain: {
-    sizeMul: 1.06,
-    opacityMul: 1.0,
-    intensity: 0.96,
-    bloomBias: 0.22,
-    audioResponse: 0.22,
-    blendMode: "normal",
-    tint: new THREE.Color("#e7f2ff"),
+    tint: new THREE.Color("#d9e4ff"),
     tintMix: 0.1,
   },
-  snow: {
-    sizeMul: 1.16,
-    opacityMul: 1.02,
-    intensity: 1.02,
-    bloomBias: 0.32,
-    audioResponse: 0.18,
-    blendMode: "normal",
-    tint: new THREE.Color("#f4f9ff"),
+  embers: {
+    sizeMul: 10.0,
+    opacityMul: 1.08,
+    intensity: 1.7,
+    bloomBias: 1.08,
+    audioResponse: 0.68,
+    blendMode: "additive",
+    tint: new THREE.Color("#ffd16a"),
+    tintMix: 0.14,
+  },
+  dust: {
+    sizeMul: 3.0,
+    opacityMul: 0.92,
+    intensity: 0.96,
+    bloomBias: 0.24,
+    audioResponse: 0.28,
+    blendMode: "additive",
+    tint: new THREE.Color("#e8dcc8"),
     tintMix: 0.12,
   },
-  fireflies: {
-    sizeMul: 1.22,
-    opacityMul: 1.04,
-    intensity: 1.36,
-    bloomBias: 1.0,
-    audioResponse: 0.62,
-    blendMode: "additive",
-    tint: new THREE.Color("#fff6a8"),
-    tintMix: 0.16,
+  rain: {
+    sizeMul: 5.0,
+    opacityMul: 1.05,
+    intensity: 0.92,
+    bloomBias: 0.1,
+    audioResponse: 0.18,
+    blendMode: "normal",
+    tint: new THREE.Color("#dfeeff"),
+    tintMix: 0.08,
   },
-  leaves: {
-    sizeMul: 1.14,
-    opacityMul: 1.0,
-    intensity: 0.88,
-    bloomBias: 0.08,
+  snow: {
+    sizeMul: 10.0,
+    opacityMul: 0.96,
+    intensity: 1.08,
+    bloomBias: 0.22,
     audioResponse: 0.16,
     blendMode: "normal",
-    tint: new THREE.Color("#c6a96b"),
-    tintMix: 0.08,
+    tint: new THREE.Color("#eef6ff"),
+    tintMix: 0.14,
+  },
+  fireflies: {
+    sizeMul: 3.0,
+    opacityMul: 1.0,
+    intensity: 1.58,
+    bloomBias: 1.12,
+    audioResponse: 0.82,
+    blendMode: "additive",
+    tint: new THREE.Color("#fff3a1"),
+    tintMix: 0.14,
+  },
+  leaves: {
+    sizeMul: 10.0,
+    opacityMul: 0.98,
+    intensity: 0.82,
+    bloomBias: 0.04,
+    audioResponse: 0.12,
+    blendMode: "normal",
+    tint: new THREE.Color("#c7a46d"),
+    tintMix: 0.06,
   },
 };
 
@@ -266,7 +266,7 @@ export class FieldFXSystem {
   private readonly tmpTintColor = new THREE.Color();
 
   private readonly matA: MaterialState = {
-    size: 0.04,
+    size: 0.5,
     opacity: 1,
     color: new THREE.Color(),
     blending: THREE.NormalBlending,
@@ -276,7 +276,7 @@ export class FieldFXSystem {
   };
 
   private readonly matB: MaterialState = {
-    size: 0.04,
+    size: 0.5,
     opacity: 1,
     color: new THREE.Color(),
     blending: THREE.NormalBlending,
@@ -548,23 +548,14 @@ export class FieldFXSystem {
     // dt gap reset (tab switch / suspend)
     // ------------------------------------------------------------
     if (d > this.simGapResetSec) {
-      // Reset both ends of the transition so we don’t “step” a long integration frame.
       this.resetSimFor(this.activeResolved);
       if (this.targetResolved !== this.activeResolved)
         this.resetSimFor(this.targetResolved);
 
-      // Also soften any gust carry so it doesn’t snap.
       this.gust01 = 0;
     }
 
-    // ------------------------------------------------------------
-    // Update smoothed audio (if any)
-    // ------------------------------------------------------------
     this.updateSmoothedAudio(d);
-
-    // ------------------------------------------------------------
-    // Density (Option B): drive rain/snow sparsity from smoothed energy
-    // ------------------------------------------------------------
     this.applyWeatherDensity();
 
     const burstActive = this.burstAllowed && this.burstTimeLeft > 0;
@@ -590,9 +581,6 @@ export class FieldFXSystem {
     const inW = clamp01(this.blend01);
     const outW = 1 - inW;
 
-    // ------------------------------------------------------------
-    // Audio-driven “light/heavy” per-mode mapping
-    // ------------------------------------------------------------
     const audioMulActive = this.getAudioIntensityMul(this.activeResolved, d);
     const audioMulTarget = this.getAudioIntensityMul(this.targetResolved, d);
 
@@ -787,8 +775,6 @@ export class FieldFXSystem {
     if (stateChanged) m.needsUpdate = true;
   }
 
-  // ---- sim + sampling helpers (this is where rain/snow must exist) ----
-
   private resetSimFor(mode: ResolvedMode): void {
     if (mode === "embers") this.embers.resetSimToBase();
     if (mode === "dust") this.dust.resetSimToBase();
@@ -881,8 +867,6 @@ export class FieldFXSystem {
       out.sizeAttenuation = true;
       return;
     }
-
-    // "base" falls through intentionally
   }
 
   private getVisualAudioMul(mode: ResolvedMode, response01: number): number {
@@ -892,44 +876,48 @@ export class FieldFXSystem {
     if (!this.hasAudioFrame) return 1;
 
     let driver = 0;
+    let gain = 0.55;
 
     if (mode === "stars") {
-      driver = clamp01(this.smMid * 0.7 + this.smHigh * 0.3);
+      driver = clamp01(this.smMid * 0.55 + this.smHigh * 0.25);
+      gain = 0.18;
     } else if (mode === "embers") {
-      driver = clamp01(this.smMid * 0.72 + this.smHigh * 0.2 + this.smImpact * 0.08);
+      const heat = clamp01(this.smMid * 0.62 + this.smHigh * 0.28 + this.smImpact * 0.1);
+      const flare = smoothstep01(0.3, 0.82, heat);
+      driver = clamp01(heat * 0.72 + flare * 0.55);
+      gain = 0.82;
     } else if (mode === "dust") {
-      driver = clamp01(this.smLow * 0.45 + this.smMid * 0.35 + this.gust01 * 0.2);
+      driver = clamp01(this.smLow * 0.42 + this.smMid * 0.28 + this.gust01 * 0.14);
+      gain = 0.28;
     } else if (mode === "rain") {
-      driver = clamp01(this.smEnergy * 0.8 + this.smMid * 0.2);
+      driver = clamp01(this.smEnergy * 0.72 + this.smMid * 0.18 + this.smHigh * 0.1);
+      gain = 0.16;
     } else if (mode === "snow") {
-      driver = clamp01(this.smEnergy * 0.75 + this.smHigh * 0.25);
+      driver = clamp01(this.smEnergy * 0.58 + this.smHigh * 0.28 + this.smMid * 0.14);
+      gain = 0.22;
     } else if (mode === "fireflies") {
-      driver = clamp01(this.smHigh * 0.58 + this.smImpact * 0.22 + this.smEnergy * 0.2);
-      if (this.smQuiet) driver *= 0.86;
+      const raw = clamp01(this.smHigh * 0.56 + this.smImpact * 0.24 + this.smEnergy * 0.2);
+      const sparkle = smoothstep01(0.34, 0.78, raw);
+      driver = clamp01(raw * 0.4 + sparkle * 0.95);
+      if (this.smQuiet) driver *= 0.82;
+      gain = 1.08;
     } else if (mode === "leaves") {
-      driver = clamp01(this.smLow * 0.56 + this.gust01 * 0.28 + this.smMid * 0.16);
+      driver = clamp01(this.smLow * 0.5 + this.gust01 * 0.3 + this.smMid * 0.12);
+      gain = 0.14;
     }
 
-    return lerp(1, 1 + driver * 0.55, r);
+    return lerp(1, 1 + driver * gain, r);
   }
 
-  // ------------------------------------------------------------
-  // Density control (Option B)
-  // ------------------------------------------------------------
-
   private applyWeatherDensity(): void {
-    // If no audio, default to full density (current behavior).
     if (!this.hasAudioFrame) {
       this.setEmitterDensity("rain", 1, this.densitySoftness);
       this.setEmitterDensity("snow", 1, this.densitySoftness);
       return;
     }
 
-    // Use smoothed energy, but bias so very quiet music still yields a few flakes/drops.
     const e = clamp01(this.smEnergy);
 
-    // Map energy -> density in a way that “arrives” earlier than speed.
-    // You can tweak these edges anytime.
     const rainT = smoothstep01(0.03, 0.55, e);
     const snowT = smoothstep01(0.02, 0.48, e);
 
@@ -944,14 +932,12 @@ export class FieldFXSystem {
     const d = clamp01(density01);
     const s = clamp01(softness01);
 
-    // We keep this duck-typed so FieldFXSystem compiles even before RainEmitter is upgraded.
     const emitter: any = mode === "rain" ? this.rain : this.snow;
 
     if (typeof emitter?.setDensity01 === "function") {
       emitter.setDensity01(d);
     }
 
-    // Optional support if your emitter exposes a softness setter.
     if (typeof emitter?.setDensitySoftness01 === "function") {
       emitter.setDensitySoftness01(s);
     } else if (typeof emitter?.setDensitySoftness === "function") {
@@ -959,14 +945,9 @@ export class FieldFXSystem {
     }
   }
 
-  // ------------------------------------------------------------
-  // Audio mapping (light/heavy)
-  // ------------------------------------------------------------
-
   private updateSmoothedAudio(dt: number): void {
     if (!this.hasAudioFrame || !this.audioFrame) return;
 
-    // One-pole AR smoothing for “feel” (separate from AudioSystem smoothing).
     const eT = clamp01(this.audioFrame.energy);
     const lT = clamp01(this.audioFrame.low);
     const mT = clamp01(this.audioFrame.mid);
@@ -987,21 +968,12 @@ export class FieldFXSystem {
 
     this.smQuiet = Boolean(this.audioFrame.quiet);
 
-    // Gust is “impacty” for wind-driven things (dust/leaves).
     const gustTarget = clamp01(impact * 1.25);
     this.gust01 = this.smoothAR(this.gust01, gustTarget, this.gustAttackHz, this.gustReleaseHz, dt);
   }
 
-  /**
-   * Returns a multiplier [0..1.25ish] used to scale the strength passed to emitters.
-   * - 0 means effectively off (very light)
-   * - 1 means full intensity
-   */
-  private getAudioIntensityMul(mode: ResolvedMode, dt: number): number {
-    // No audio yet? behave like old system.
+  private getAudioIntensityMul(mode: ResolvedMode, _dt: number): number {
     if (!this.hasAudioFrame) return 1;
-
-    // Stars should not be driven by music energy here (that’s handled elsewhere).
     if (mode === "stars") return 1;
 
     const e = clamp01(this.smEnergy);
@@ -1011,56 +983,48 @@ export class FieldFXSystem {
     const impact = clamp01(this.smImpact);
     const gust = clamp01(this.gust01);
 
-    // A general “light->heavy” curve. These edges are intentionally low
-    // so quiet music still yields subtle motion.
-    const baseLight = smoothstep01(0.03, 0.22, e); // first visible motion
-    const baseHeavy = smoothstep01(0.25, 0.78, e); // ramps to full
-
-    // We keep a tiny minimum so the world never looks “stuck” while active.
+    const baseLight = smoothstep01(0.03, 0.22, e);
+    const baseHeavy = smoothstep01(0.25, 0.78, e);
     const tiny = 0.06;
 
     if (mode === "rain") {
-      // Rain reads best as steady. Let energy control density/speed via strength.
-      const t = smoothstep01(0.04, 0.62, e);
-      return clamp01(tiny + t * 0.94);
+      const motion = clamp01(e * 0.72 + mid * 0.18 + high * 0.1);
+      const t = smoothstep01(0.04, 0.6, motion);
+      return clamp01(0.08 + t * 0.88);
     }
 
     if (mode === "snow") {
-      // Snow feels calmer; slightly less “heavy” than rain at peak energy.
-      const t = smoothstep01(0.03, 0.58, e);
-      return clamp01(tiny + t * 0.88);
+      const drift = clamp01(e * 0.56 + high * 0.24 + mid * 0.2);
+      const t = smoothstep01(0.03, 0.54, drift);
+      return clamp01(0.1 + t * 0.78);
     }
 
     if (mode === "embers") {
-      // Embers like mids/highs and a little impact “heat”.
-      const emberEnergy = clamp01(mid * 0.72 + high * 0.28);
-      const t = smoothstep01(0.03, 0.65, emberEnergy);
-      const heatKick = 1 + impact * 0.28;
-      return clamp01((tiny + t * 0.94) * heatKick);
+      const emberEnergy = clamp01(mid * 0.7 + high * 0.22 + impact * 0.08);
+      const t = smoothstep01(0.03, 0.62, emberEnergy);
+      const heatKick = 1 + impact * 0.32;
+      return clamp01((tiny + t * 0.98) * heatKick);
     }
 
     if (mode === "dust") {
-      // Dust is wind. Let low/mid and gust control it.
-      const windEnergy = clamp01(low * 0.55 + mid * 0.45);
-      const t = smoothstep01(0.02, 0.55, windEnergy);
-      const gustKick = 1 + gust * 0.75;
-      return clamp01((tiny + t * 0.90) * gustKick);
+      const windEnergy = clamp01(low * 0.58 + mid * 0.28 + gust * 0.14);
+      const t = smoothstep01(0.02, 0.52, windEnergy);
+      const gustKick = 1 + gust * 0.62;
+      return clamp01((tiny + t * 0.82) * gustKick);
     }
 
     if (mode === "leaves") {
-      // Leaves: mostly wind (low) plus gust.
-      const leafEnergy = clamp01(low * 0.72 + mid * 0.28);
-      const t = smoothstep01(0.02, 0.58, leafEnergy);
-      const gustKick = 1 + gust * 0.65;
-      return clamp01((tiny + t * 0.92) * gustKick);
+      const leafEnergy = clamp01(low * 0.66 + mid * 0.18 + gust * 0.16);
+      const t = smoothstep01(0.02, 0.5, leafEnergy);
+      const gustKick = 1 + gust * 0.42;
+      return clamp01((0.07 + t * 0.72) * gustKick);
     }
 
     if (mode === "fireflies") {
-      // Fireflies: gentle presence. Prefer being visible even when quiet, but not frantic.
-      // If AudioSystem flags quiet, soften them a bit (more sparse feel).
-      const t = lerp(baseLight, baseHeavy, 0.55);
-      const quietMul = this.smQuiet ? 0.78 : 1.0;
-      return clamp01((0.10 + t * 0.85) * quietMul);
+      const airy = clamp01(high * 0.52 + impact * 0.24 + e * 0.24);
+      const pop = smoothstep01(0.32, 0.74, airy);
+      const quietBase = this.smQuiet ? 0.18 : 0.24;
+      return clamp01(quietBase + airy * 0.42 + pop * 0.5);
     }
 
     return clamp01(tiny + lerp(baseLight, baseHeavy, 0.65) * 0.94);

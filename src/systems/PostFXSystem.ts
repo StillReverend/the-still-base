@@ -322,8 +322,8 @@ const DEFAULT_PROFILES: PostFXProfile[] = [
   },
 
   { name: "blackHole", enabled: true, bloom: { enabled: true, strength: 1.2, radius: 0.31, threshold: 0.79 } },
-  { name: "sol", enabled: true, bloom: { enabled: true, strength: 5.0, radius: 0.1, threshold: 0.01 } },
-  { name: "luna", enabled: true, bloom: { enabled: true, strength: 3.0, radius: 0.5, threshold: 0.01 } },
+  { name: "sol",  enabled: true, bloom: { enabled: true, strength: 1.4, radius: 0.22, threshold: 0.60 } },
+  { name: "luna", enabled: true, bloom: { enabled: true, strength: 1.1, radius: 0.35, threshold: 0.55 } },
 ];
 
 // ------------------------------------------------------------
@@ -381,8 +381,8 @@ export class PostFXSystem {
   private ritualChargeCurrent = 0;
   private ritualChargeTarget = 0;
 
-  private quietStrength = 0.4;
-  private quietRadius = 0.1;
+  private quietStrength = 0.08;
+  private quietRadius = 0.04;
 
   private intensityFloor = 0.05;
   private intensityPow = 1.0;
