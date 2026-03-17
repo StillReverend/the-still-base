@@ -1,24 +1,18 @@
 // src/systems/ParticleFXSystem.ts
 // ============================================================
-// THE STILL — ParticleFXSystem (Router-only: BAND morph modes)
+// THE STILL — ParticleFXSystem (owned particle field + mode router)
 // ------------------------------------------------------------
-// Updated direction (per your clarified vision):
-//  - ALL particle looks (embers, dust, rain, snow, etc.) are morph states of BAND points.
-//  - ParticleFXSystem does NOT spawn separate particle point clouds.
-//  - ParticleFXSystem routes Harmony particle selections into FieldFXSystem.setMode().
+// New direction:
+//  - ParticleFXSystem now owns its own dynamic particle field
+//  - FieldFXSystem no longer depends on StarSystem BAND ownership
+//  - Harmony particle selections are still routed canonically from snapshots
+//  - Existing debug mounts/local API remain intact for future work
 //
-// What remains here:
-//  - Engine-owned singleton (one instance per app)
-//  - Owns debug mounts (camera/field/local roots) for visualization + future expansion
-//  - Listens to Harmony environment snapshots (canonical truth)
-//  - (Optional) local volume API is kept for compatibility, but currently not implemented
-//    because your current vision is a global BAND morph, not per-anchor emitters.
-//
-// IMPORTANT (Mar 2026 fix):
-//  - We DO NOT apply mode changes on toggle *intent* events.
-//  - We ONLY apply mode changes on canonical snapshots:
-//      harmony:environment:state / harmony:environment:changed
-//    This prevents 1-frame "flash" transitions from intermediate intent states.
+// Notes:
+//  - We keep a THREE.PointsMaterial substrate for compatibility with the
+//    current emitter stack (Rain/Snow/Fireflies shader patching, etc).
+//  - The field is created as a spherical shell so current emitters inherit
+//    a familiar spatial distribution.
 // ============================================================
 
 import * as THREE from "three";
@@ -46,12 +40,10 @@ type ParticleMode = "camera" | "field";
 // ------------------------------------------------------------
 
 const isFiniteNumber = (v: number): boolean => Number.isFinite(v) && !Number.isNaN(v);
-
-const safeString = (v: unknown, fallback = ""): string => (typeof v === "string" ? v : fallback);
+const safeString = (v: unknown, fallback = ""): string =>
+  typeof v === "string" ? v : fallback;
 
 // Preferred priority when multiple toggles are true.
-// (Harmony may allow multiple toggles; we choose one “active mode” deterministically.)
-//
 // IMPORTANT: We do NOT default to "stars" when nothing is selected.
 // Stars is an explicit selection (particles.stars === true).
 const FIELD_MODE_PRIORITY: Array<Exclude<FieldFXMode, "stars">> = [
@@ -65,22 +57,48 @@ const FIELD_MODE_PRIORITY: Array<Exclude<FieldFXMode, "stars">> = [
 
 // Returns:
 //  - a concrete FieldFXMode when we have an explicit selection
-//  - null when nothing is selected (TRUE OFF state; disable FieldFX / BAND morph)
+//  - null when nothing is selected (TRUE OFF state)
 function pickFieldModeFromParticles(raw: unknown): FieldFXMode | null {
   if (!raw || typeof raw !== "object") return null;
   const m = raw as Record<string, unknown>;
 
-  // Highest-priority non-stars modes
   for (const k of FIELD_MODE_PRIORITY) {
     if (m[k] === true) return k;
   }
 
-  // Stars is explicit, not a fallback
   if (m.stars === true) return "stars";
-
-  // No selection: true OFF
   return null;
 }
+
+// ------------------------------------------------------------
+// Particle field substrate config
+// ------------------------------------------------------------
+
+type ParticleFieldConfig = {
+  count: number;
+  innerRadius: number;
+  outerRadius: number;
+  pointSize: number;
+  color: number;
+  opacity: number;
+  blending: THREE.Blending;
+  sizeAttenuation: boolean;
+  visibleByDefault: boolean;
+};
+
+const PARTICLE_FIELD_NAME = "ParticleFX_FIELD";
+
+const DEFAULT_PARTICLE_FIELD: ParticleFieldConfig = {
+  count: 4096,
+  innerRadius: 1300,
+  outerRadius: 2600,
+  pointSize: 0.5,
+  color: 0xffffed,
+  opacity: 1.0,
+  blending: THREE.AdditiveBlending,
+  sizeAttenuation: false,
+  visibleByDefault: false,
+};
 
 // ------------------------------------------------------------
 // ParticleFXSystem
@@ -141,19 +159,25 @@ export class ParticleFXSystem {
   private fieldMount: ParticleMount | null = null;
   private localMounts = new Map<string, ParticleMount>();
 
-  // FIELD is the new default (you can still switch to camera via event)
+  // FIELD is the debug mount default.
   private mode: ParticleMode = "field";
 
   // ------------------------------------------------------------
-  // FieldFX (BAND router)
+  // Owned particle field substrate
+  // ------------------------------------------------------------
+
+  private particleFieldRoot: THREE.Group | null = null;
+  private particleFieldPoints: THREE.Points | null = null;
+  private particleFieldGeometry: THREE.BufferGeometry | null = null;
+  private particleFieldMaterial: THREE.PointsMaterial | null = null;
+
+  // ------------------------------------------------------------
+  // FieldFX
   // ------------------------------------------------------------
 
   private readonly fieldFX: FieldFXSystem;
 
-  // Cached last-known Harmony particle toggles (canonical within router)
   private lastParticles: Record<string, boolean> = {};
-
-  // Track last mode we actually applied to FieldFX (for debug + stability)
   private lastAppliedMode: FieldFXMode | null = null;
 
   // ------------------------------------------------------------
@@ -178,8 +202,6 @@ export class ParticleFXSystem {
 
   constructor(deps: ParticleFXSystemDeps) {
     this.bus = deps.bus;
-
-    // Single “router” for BAND starfield mode swaps (stars <-> embers/dust/fireflies/leaves/rain/snow/etc)
     this.fieldFX = new FieldFXSystem({ bus: this.bus });
   }
 
@@ -187,33 +209,47 @@ export class ParticleFXSystem {
     if (this.initialized) return;
     this.initialized = true;
 
-    // ✅ Canonical truth only (prevents intermediate flash states)
-    this.on<HarmonyEnvironmentSnapshot>("harmony:environment:state", (p) => this.onEnvironmentSnapshot(p, "state"));
+    this.on<HarmonyEnvironmentSnapshot>("harmony:environment:state", (p) =>
+      this.onEnvironmentSnapshot(p, "state"),
+    );
     this.on<HarmonyEnvironmentSnapshot>("harmony:environment:changed", (p) =>
       this.onEnvironmentSnapshot(p, "changed"),
     );
 
-    // NOTE: We intentionally ignore toggle intent events for applying FieldFX mode.
-    // They can arrive before persistence normalization/snapshot and cause 1-frame flashes.
-    // We keep listeners only for optional debug logging.
-    this.on<ToggleParticleIntent>("harmony:environment:toggleParticle", (p) => this.onToggleIntentDebug(p));
-    this.on<ToggleParticleIntent>("harmony:env:toggleParticle", (p) => this.onToggleIntentDebug(p));
+    this.on<ToggleParticleIntent>("harmony:environment:toggleParticle", (p) =>
+      this.onToggleIntentDebug(p),
+    );
+    this.on<ToggleParticleIntent>("harmony:env:toggleParticle", (p) =>
+      this.onToggleIntentDebug(p),
+    );
 
-    this.on<{ enabled: boolean }>("particlefx:debug:set", (p) => this.setDebug(Boolean(p?.enabled)));
-    this.on<{ enabled: boolean }>("particlefx:debug-bounds:set", (p) => this.setDebugBounds(Boolean(p?.enabled)));
+    this.on<{ enabled: boolean }>("particlefx:debug:set", (p) =>
+      this.setDebug(Boolean(p?.enabled)),
+    );
+    this.on<{ enabled: boolean }>("particlefx:debug-bounds:set", (p) =>
+      this.setDebugBounds(Boolean(p?.enabled)),
+    );
 
-    // Debug mount mode (camera/field). This does NOT affect FieldFX.
     this.on<{ mode: ParticleMode }>("particlefx:mode:set", (p) => {
       const next: ParticleMode = p?.mode === "camera" ? "camera" : "field";
       this.setMode(next);
     });
 
-    // Local volume API (compat/future)
-    this.on<LocalRegisterPayload>("particlefx:local:register", (p) => this.onLocalRegister(p));
-    this.on<LocalUnregisterPayload>("particlefx:local:unregister", (p) => this.onLocalUnregister(p));
-    this.on<LocalSetPayload>("particlefx:local:set", (p) => this.onLocalSet(p));
-    this.on<LocalApplyPayload>("particlefx:local:apply", (p) => this.onLocalApply(p));
-    this.on<LocalClearPayload>("particlefx:local:clear", (p) => this.onLocalClear(p));
+    this.on<LocalRegisterPayload>("particlefx:local:register", (p) =>
+      this.onLocalRegister(p),
+    );
+    this.on<LocalUnregisterPayload>("particlefx:local:unregister", (p) =>
+      this.onLocalUnregister(p),
+    );
+    this.on<LocalSetPayload>("particlefx:local:set", (p) =>
+      this.onLocalSet(p),
+    );
+    this.on<LocalApplyPayload>("particlefx:local:apply", (p) =>
+      this.onLocalApply(p),
+    );
+    this.on<LocalClearPayload>("particlefx:local:clear", (p) =>
+      this.onLocalClear(p),
+    );
   }
 
   public setTargets(scene: THREE.Scene | null, camera: THREE.Camera | null): void {
@@ -221,20 +257,22 @@ export class ParticleFXSystem {
 
     this.detachMountFromScene(this.cameraMount);
     this.detachMountFromScene(this.fieldMount);
+    this.detachParticleFieldFromScene();
 
     this.scene = scene;
     this.camera = camera;
-
-    // Forward to FieldFX router
-    if (this.scene && this.camera) {
-      this.fieldFX.setTargets(this.scene, this.camera);
-    }
 
     if (!this.scene || !this.camera) {
       this.removeDebugMarker();
       this.removeDebugBounds();
       return;
     }
+
+    this.ensureParticleField();
+    if (this.particleFieldPoints) {
+      this.fieldFX.attachParticlePoints(this.particleFieldPoints);
+    }
+    this.fieldFX.setTargets(this.scene, this.camera);
 
     if (!this.cameraMount) {
       this.cameraMount = this.createMount("camera", CAMERA_MOUNT_ID);
@@ -246,9 +284,11 @@ export class ParticleFXSystem {
       this.fieldMount.root.name = "ParticleFXRoot_Field";
     }
 
-    // Compute forward offset based on camera.near (if available)
     const camAny = this.camera as unknown as { near?: number };
-    const near = typeof camAny.near === "number" && isFiniteNumber(camAny.near) ? camAny.near : 0.1;
+    const near =
+      typeof camAny.near === "number" && isFiniteNumber(camAny.near)
+        ? camAny.near
+        : 0.1;
     this.cameraForwardOffset = Math.max(MIN_CAMERA_OFFSET, near * 6);
 
     this.attachActiveMount();
@@ -256,10 +296,8 @@ export class ParticleFXSystem {
   }
 
   public update(dt: number): void {
-    // 1) Update FIELD FX router (BAND morph)
     this.fieldFX.update(dt);
 
-    // 2) Update debug mount transforms (only affects debug visuals, not FieldFX)
     const active = this.getActiveMount();
     if (active && this.camera) {
       if (active.kind === "camera") {
@@ -267,10 +305,11 @@ export class ParticleFXSystem {
         this.camera.getWorldQuaternion(this.tmpQuat);
         this.camera.getWorldDirection(this.tmpDir);
 
-        active.root.position.copy(this.tmpPos).add(this.tmpDir.multiplyScalar(this.cameraForwardOffset));
+        active.root.position
+          .copy(this.tmpPos)
+          .add(this.tmpDir.multiplyScalar(this.cameraForwardOffset));
         active.root.quaternion.copy(this.tmpQuat);
       } else if (active.kind === "field") {
-        // FIELD: follow camera position only, no rotation
         this.camera.getWorldPosition(this.tmpPos);
         active.root.position.copy(this.tmpPos);
         active.root.quaternion.identity();
@@ -320,7 +359,6 @@ export class ParticleFXSystem {
     this.disposers = [];
     this.initialized = false;
 
-    // FieldFX router
     this.fieldFX.dispose();
 
     for (const m of this.localMounts.values()) {
@@ -329,14 +367,20 @@ export class ParticleFXSystem {
     this.localMounts.clear();
 
     if (this.cameraMount) {
-      if (this.cameraMount.root.parent) this.cameraMount.root.parent.remove(this.cameraMount.root);
+      if (this.cameraMount.root.parent) {
+        this.cameraMount.root.parent.remove(this.cameraMount.root);
+      }
       this.cameraMount = null;
     }
 
     if (this.fieldMount) {
-      if (this.fieldMount.root.parent) this.fieldMount.root.parent.remove(this.fieldMount.root);
+      if (this.fieldMount.root.parent) {
+        this.fieldMount.root.parent.remove(this.fieldMount.root);
+      }
       this.fieldMount = null;
     }
+
+    this.destroyParticleField();
 
     this.lastParticles = {};
     this.lastAppliedMode = null;
@@ -360,14 +404,16 @@ export class ParticleFXSystem {
   // Harmony snapshot handling (canonical truth)
   // ------------------------------------------------------------
 
-  private onEnvironmentSnapshot(p: HarmonyEnvironmentSnapshot | undefined, kind: "state" | "changed"): void {
+  private onEnvironmentSnapshot(
+    p: HarmonyEnvironmentSnapshot | undefined,
+    kind: "state" | "changed",
+  ): void {
     const raw =
       (p?.particles as unknown) ??
       (p?.state?.particles as unknown) ??
       (p?.environment?.particles as unknown) ??
       {};
 
-    // Cache last known particles (shallow, booleans only)
     const nextCache: Record<string, boolean> = {};
     if (raw && typeof raw === "object") {
       for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
@@ -379,8 +425,6 @@ export class ParticleFXSystem {
 
     const nextMode = pickFieldModeFromParticles(this.lastParticles);
 
-    // ✅ IMPORTANT: "none selected" is TRUE OFF.
-    // Always apply (including null) so effects don't "stick" after UI deselect.
     this.fieldFX.setMode(nextMode);
     this.lastAppliedMode = nextMode;
 
@@ -397,10 +441,6 @@ export class ParticleFXSystem {
     }
   }
 
-  /**
-   * Intent debug only. We do NOT apply visual mode changes here.
-   * This prevents intermediate states from flashing before the canonical snapshot arrives.
-   */
   private onToggleIntentDebug(p: ToggleParticleIntent | undefined): void {
     if (!import.meta.env.DEV) return;
 
@@ -408,11 +448,15 @@ export class ParticleFXSystem {
     if (!id) return;
 
     // eslint-disable-next-line no-console
-    console.log(`[ParticleFX] toggle intent (ignored for apply) id='${id}' enabled=${Boolean(p?.enabled)}`);
+    console.log(
+      `[ParticleFX] toggle intent (ignored for apply) id='${id}' enabled=${Boolean(
+        p?.enabled,
+      )}`,
+    );
   }
 
   // ------------------------------------------------------------
-  // Local/world volume API (explicit) — kept for compatibility/future
+  // Local/world volume API (compat/future)
   // ------------------------------------------------------------
 
   private onLocalRegister(p: LocalRegisterPayload | undefined): void {
@@ -437,7 +481,7 @@ export class ParticleFXSystem {
     if (import.meta.env.DEV) {
       // eslint-disable-next-line no-console
       console.log(
-        `[ParticleFX] local register '${anchorId}' (note: local volumes not implemented yet in BAND-morph mode)`,
+        `[ParticleFX] local register '${anchorId}' (global particle field active)`,
       );
     }
   }
@@ -461,7 +505,7 @@ export class ParticleFXSystem {
     if (import.meta.env.DEV) {
       // eslint-disable-next-line no-console
       console.log(
-        `[ParticleFX] local:set ignored (global BAND morph active) anchor='${anchorId}' particle='${particleId}' enabled=${Boolean(
+        `[ParticleFX] local:set ignored (single shared particle field active) anchor='${anchorId}' particle='${particleId}' enabled=${Boolean(
           p?.enabled,
         )}`,
       );
@@ -475,7 +519,7 @@ export class ParticleFXSystem {
     if (import.meta.env.DEV) {
       // eslint-disable-next-line no-console
       console.log(
-        `[ParticleFX] local:apply ignored (global BAND morph active) anchor='${anchorId}' particles=`,
+        `[ParticleFX] local:apply ignored (single shared particle field active) anchor='${anchorId}' particles=`,
         p?.particles,
       );
     }
@@ -487,8 +531,128 @@ export class ParticleFXSystem {
 
     if (import.meta.env.DEV) {
       // eslint-disable-next-line no-console
-      console.log(`[ParticleFX] local:clear ignored (global BAND morph active) anchor='${anchorId}'`);
+      console.log(
+        `[ParticleFX] local:clear ignored (single shared particle field active) anchor='${anchorId}'`,
+      );
     }
+  }
+
+  // ------------------------------------------------------------
+  // Owned particle field
+  // ------------------------------------------------------------
+
+  private ensureParticleField(): void {
+    if (!this.scene) return;
+    if (this.particleFieldPoints && this.particleFieldRoot) {
+      if (!this.particleFieldRoot.parent) this.scene.add(this.particleFieldRoot);
+      return;
+    }
+
+    const cfg = DEFAULT_PARTICLE_FIELD;
+
+    const geometry = new THREE.BufferGeometry();
+    const positions = this.makeShellPositions(
+      cfg.count,
+      cfg.innerRadius,
+      cfg.outerRadius,
+    );
+    const colors = new Float32Array(cfg.count * 3);
+
+    for (let i = 0; i < cfg.count; i++) {
+      const k = i * 3;
+      colors[k + 0] = 0;
+      colors[k + 1] = 0;
+      colors[k + 2] = 0;
+    }
+
+    const posAttr = new THREE.BufferAttribute(positions, 3);
+    posAttr.setUsage(THREE.DynamicDrawUsage);
+    geometry.setAttribute("position", posAttr);
+
+    const colorAttr = new THREE.BufferAttribute(colors, 3);
+    colorAttr.setUsage(THREE.DynamicDrawUsage);
+    geometry.setAttribute("color", colorAttr);
+
+    const material = new THREE.PointsMaterial({
+      color: cfg.color,
+      vertexColors: true,
+      size: cfg.pointSize,
+      sizeAttenuation: cfg.sizeAttenuation,
+      transparent: true,
+      opacity: cfg.opacity,
+      depthWrite: false,
+      blending: cfg.blending,
+    });
+
+    const points = new THREE.Points(geometry, material);
+    points.name = PARTICLE_FIELD_NAME;
+    points.frustumCulled = false;
+    points.visible = cfg.visibleByDefault;
+    points.renderOrder = 10;
+
+    const root = new THREE.Group();
+    root.name = "ParticleFXFieldRoot";
+    root.add(points);
+
+    this.scene.add(root);
+
+    this.particleFieldRoot = root;
+    this.particleFieldPoints = points;
+    this.particleFieldGeometry = geometry;
+    this.particleFieldMaterial = material;
+  }
+
+  private destroyParticleField(): void {
+    this.detachParticleFieldFromScene();
+
+    if (this.particleFieldGeometry) {
+      this.particleFieldGeometry.dispose();
+      this.particleFieldGeometry = null;
+    }
+
+    if (this.particleFieldMaterial) {
+      this.particleFieldMaterial.dispose();
+      this.particleFieldMaterial = null;
+    }
+
+    this.particleFieldPoints = null;
+    this.particleFieldRoot = null;
+  }
+
+  private detachParticleFieldFromScene(): void {
+    if (this.particleFieldRoot && this.particleFieldRoot.parent) {
+      this.particleFieldRoot.parent.remove(this.particleFieldRoot);
+    }
+  }
+
+  private makeShellPositions(
+    count: number,
+    innerRadius: number,
+    outerRadius: number,
+  ): Float32Array {
+    const safeCount = Math.max(1, count | 0);
+    const inner = Math.max(0, innerRadius);
+    const outer = Math.max(inner + 1, outerRadius);
+
+    const out = new Float32Array(safeCount * 3);
+
+    const r0c = inner * inner * inner;
+    const r1c = outer * outer * outer;
+
+    for (let i = 0; i < safeCount; i++) {
+      const theta = Math.random() * Math.PI * 2;
+      const u = Math.random() * 2 - 1;
+      const phi = Math.acos(u);
+
+      const tt = Math.random();
+      const r = Math.cbrt(r0c + tt * (r1c - r0c));
+
+      out[i * 3 + 0] = r * Math.sin(phi) * Math.cos(theta);
+      out[i * 3 + 1] = r * Math.cos(phi);
+      out[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+    }
+
+    return out;
   }
 
   // ------------------------------------------------------------
@@ -591,7 +755,9 @@ export class ParticleFXSystem {
 
     if (!this.debugBounds) {
       const radius = DEFAULT_DEBUG_RADIUS;
-      const geo = new THREE.WireframeGeometry(new THREE.SphereGeometry(radius, 12, 10));
+      const geo = new THREE.WireframeGeometry(
+        new THREE.SphereGeometry(radius, 12, 10),
+      );
       const mat = new THREE.LineBasicMaterial({
         color: 0x00aaff,
         transparent: true,

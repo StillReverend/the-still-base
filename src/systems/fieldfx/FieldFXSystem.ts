@@ -1,10 +1,17 @@
 // src/systems/fieldfx/FieldFXSystem.ts
 // ============================================================
-// THE STILL — FieldFXSystem (BAND Morph Conductor)
+// THE STILL — FieldFXSystem (Particle Field Morph Conductor)
+// ------------------------------------------------------------
+// New direction:
+//  - FieldFXSystem operates on a ParticleFX-owned dynamic particle field
+//  - No longer assumes StarSystem BAND ownership
+//  - Stars / embers / dust / rain / snow / fireflies / leaves are all modes
+//    of the same shared particle substrate
 // ============================================================
 
 import * as THREE from "three";
 import type { EventBus } from "../../core/EventBus";
+import { StarsEmitter } from "./emitters/StarsEmitter";
 import { EmbersEmitter } from "./emitters/EmbersEmitter";
 import { DustEmitter } from "./emitters/DustEmitter";
 import { FirefliesEmitter } from "./emitters/FirefliesEmitter";
@@ -84,7 +91,6 @@ const TRANSITIONS: Record<ResolvedMode, TransitionProfile> = {
     burstStrengthBoost: 1.9,
     burstMorphEaseBoost: 1.55,
   },
-
   rain: {
     morphEase: 9.5,
     burstDuration: 0.4,
@@ -97,7 +103,6 @@ const TRANSITIONS: Record<ResolvedMode, TransitionProfile> = {
     burstStrengthBoost: 1.7,
     burstMorphEaseBoost: 1.35,
   },
-
   stars: {
     morphEase: 16.0,
     burstDuration: 0.0,
@@ -215,7 +220,6 @@ const FIELD_FX_LOOKS: Record<ResolvedMode, FieldFXLookProfile> = {
   },
 };
 
-// Audio frame contract we care about (from AudioSystem audio:frame payload.frame)
 type AudioFrame01 = {
   energy: number;
   low: number;
@@ -231,7 +235,7 @@ export class FieldFXSystem {
 
   private scene: THREE.Scene | null = null;
   private camera: THREE.Camera | null = null;
-  private bandPoints: THREE.Points | null = null;
+  private particlePoints: THREE.Points | null = null;
 
   private geom: THREE.BufferGeometry | null = null;
   private posAttr: THREE.BufferAttribute | null = null;
@@ -255,6 +259,7 @@ export class FieldFXSystem {
   private transition: TransitionProfile = { ...DEFAULT_TRANSITION };
   private burstAllowed = false;
 
+  private readonly stars = new StarsEmitter();
   private readonly embers = new EmbersEmitter();
   private readonly dust = new DustEmitter();
   private readonly fireflies = new FirefliesEmitter();
@@ -287,14 +292,9 @@ export class FieldFXSystem {
 
   private readonly onDevModeSet: (payload: unknown) => void;
 
-  // ------------------------------------------------------------
-  // Audio-reactive intensity (light/heavy)
-  // ------------------------------------------------------------
-
   private audioFrame: AudioFrame01 | null = null;
   private hasAudioFrame = false;
 
-  // Optional extra smoothing in this system (keeps “physics” feel stable)
   private smEnergy = 0;
   private smLow = 0;
   private smMid = 0;
@@ -302,40 +302,26 @@ export class FieldFXSystem {
   private smImpact = 0;
   private smQuiet = true;
 
-  // FieldFX-side smoothing (seconds^-1), separate from AudioSystem smoothing.
   private readonly fxAttackHz = 7.5;
   private readonly fxReleaseHz = 4.0;
 
-  // Gust helper (dust/leaves) driven by impact
   private gust01 = 0;
   private readonly gustAttackHz = 18;
   private readonly gustReleaseHz = 2.6;
 
-  // Tab-switch / suspend guard:
-  // if we see a big dt, reset emitter sims so motion doesn’t “step”
   private readonly simGapResetSec = 0.22;
 
-  // ------------------------------------------------------------
-  // Density control (Option B: fewer rendered points at low energy)
-  // ------------------------------------------------------------
-  // These are intentionally low so rain/snow can be “barely there” instead of off.
   private readonly rainMinDensity = 0.06;
   private readonly snowMinDensity = 0.08;
 
-  // Optional: if emitter supports soft thresholding, we’ll set it.
   private readonly densitySoftness = 0.035;
 
-  // Bus handler references for cleanup
   private readonly onAudioFrame: (payload: unknown) => void;
 
   constructor(opts: { bus: EventBus }) {
     this.bus = opts.bus;
 
     this.onDevModeSet = (payload: unknown) => {
-      // Explicit contract:
-      // - mode: null      => OFF
-      // - mode: "stars"|... => ON that mode
-      // - mode: undefined / missing => NO-OP
       const mode = (payload as any)?.mode as FieldFXMode | null | undefined;
       if (mode === undefined) return;
       this.setMode(mode);
@@ -345,7 +331,6 @@ export class FieldFXSystem {
       const frame = (payload as any)?.frame as AudioFrame01 | undefined;
       if (!frame) return;
 
-      // Be defensive; AudioSystem should already guarantee 0..1.
       this.setAudioFrame({
         energy: clamp01(Number(frame.energy) || 0),
         low: clamp01(Number(frame.low) || 0),
@@ -358,13 +343,9 @@ export class FieldFXSystem {
     };
 
     this.bus.on("fieldfx:mode:set", this.onDevModeSet);
-
-    // MVP wiring: listen directly.
-    // Later, if you want ParticleFXSystem to forward, keep setAudioFrame() and remove this listener.
     this.bus.on("audio:frame", this.onAudioFrame);
   }
 
-  // Allows ParticleFXSystem (or any orchestrator) to feed audio without direct bus listening.
   public setAudioFrame(frame: AudioFrame01): void {
     this.audioFrame = frame;
     this.hasAudioFrame = true;
@@ -373,19 +354,18 @@ export class FieldFXSystem {
   public setTargets(scene: THREE.Scene, camera: THREE.Camera): void {
     this.scene = scene;
     this.camera = camera;
-    this.tryAttachByName();
   }
 
-  public attachBandPoints(points: THREE.Points): void {
-    if (this.bandPoints === points) return;
+  public attachParticlePoints(points: THREE.Points): void {
+    if (this.particlePoints === points) return;
 
-    this.bandPoints = points;
+    this.particlePoints = points;
 
     this.geom = points.geometry as THREE.BufferGeometry;
     const pos = this.geom.getAttribute("position") as THREE.BufferAttribute | undefined;
     if (!pos || !(pos.array instanceof Float32Array) || pos.itemSize !== 3) {
       throw new Error(
-        "[FieldFXSystem] BAND position attribute must be Float32Array itemSize=3.",
+        "[FieldFXSystem] Particle field position attribute must be Float32Array itemSize=3.",
       );
     }
 
@@ -433,29 +413,6 @@ export class FieldFXSystem {
     this.applyComposite(1);
   }
 
-  public tryAttachByName(name = "Stars_BAND"): boolean {
-    if (this.bandPoints) return true;
-    if (!this.scene) return false;
-
-    const obj = this.scene.getObjectByName(name);
-    if (!obj) return false;
-
-    // Direct hit
-    if ((obj as any).isPoints) {
-      this.attachBandPoints(obj as THREE.Points);
-      return true;
-    }
-
-    // Fallback: search children
-    const pointsChild = obj.getObjectByProperty("isPoints", true) as THREE.Points | undefined;
-    if (pointsChild) {
-      this.attachBandPoints(pointsChild);
-      return true;
-    }
-
-    return false;
-  }
-
   public setMode(mode: FieldFXMode | null): void {
     if (mode === null) {
       if (this.off && this.targetMode === null) return;
@@ -476,19 +433,20 @@ export class FieldFXSystem {
     this.off = false;
 
     const nextResolved = normalizeMode(mode);
-    if (!wasOff && nextResolved === this.targetResolved && mode === this.targetMode)
+    if (!wasOff && nextResolved === this.targetResolved && mode === this.targetMode) {
       return;
+    }
 
     this.targetMode = mode;
     this.targetResolved = nextResolved;
 
-    if (!this.bandPoints) {
+    if (!this.particlePoints) {
       this.mode = mode;
       this.activeResolved = nextResolved;
       return;
     }
 
-    this.bandPoints.visible = true;
+    this.particlePoints.visible = true;
 
     if (this.activeResolved === this.targetResolved && this.blend01 >= 0.9999) {
       this.mode = mode;
@@ -527,31 +485,29 @@ export class FieldFXSystem {
 
   public update(dt: number): void {
     if (this.off) {
-      if (this.bandPoints) this.bandPoints.visible = false;
+      if (this.particlePoints) this.particlePoints.visible = false;
       return;
     }
 
     if (
-      !this.bandPoints ||
+      !this.particlePoints ||
       !this.basePositions ||
       !this.posAttr ||
       !this.livePositions ||
       !this.baseMat ||
       !this.mat
-    )
+    ) {
       return;
+    }
 
     const d = Math.max(0, isFiniteNumber(dt) ? dt : 0);
     if (d <= 0) return;
 
-    // ------------------------------------------------------------
-    // dt gap reset (tab switch / suspend)
-    // ------------------------------------------------------------
     if (d > this.simGapResetSec) {
       this.resetSimFor(this.activeResolved);
-      if (this.targetResolved !== this.activeResolved)
+      if (this.targetResolved !== this.activeResolved) {
         this.resetSimFor(this.targetResolved);
-
+      }
       this.gust01 = 0;
     }
 
@@ -618,7 +574,7 @@ export class FieldFXSystem {
     this.bus.off("fieldfx:mode:set", this.onDevModeSet);
     this.bus.off("audio:frame", this.onAudioFrame);
 
-    this.bandPoints = null;
+    this.particlePoints = null;
     this.scene = null;
     this.camera = null;
 
@@ -645,14 +601,15 @@ export class FieldFXSystem {
 
   private applyBaseNow(): void {
     if (
-      !this.bandPoints ||
+      !this.particlePoints ||
       !this.basePositions ||
       !this.livePositions ||
       !this.posAttr ||
       !this.baseMat ||
       !this.mat
-    )
+    ) {
       return;
+    }
 
     this.livePositions.set(this.basePositions);
     this.posAttr.needsUpdate = true;
@@ -684,12 +641,13 @@ export class FieldFXSystem {
     this.activeResolved = "stars";
     this.targetResolved = "stars";
 
-    if (this.bandPoints) this.bandPoints.visible = false;
+    if (this.particlePoints) this.particlePoints.visible = false;
   }
 
   private applyComposite(inWeight01: number): void {
-    if (!this.basePositions || !this.livePositions || !this.posAttr || !this.baseMat || !this.mat)
+    if (!this.basePositions || !this.livePositions || !this.posAttr || !this.baseMat || !this.mat) {
       return;
+    }
 
     const inW = clamp01(inWeight01);
     const outW = 1 - inW;
@@ -719,11 +677,13 @@ export class FieldFXSystem {
       if (!simFrom && !simTo) {
         live.set(base);
       } else if (!simFrom) {
-        for (let i = 0; i < live.length; i++)
+        for (let i = 0; i < live.length; i++) {
           live[i] = lerp(base[i], (simTo as Float32Array)[i], inW);
+        }
       } else if (!simTo) {
-        for (let i = 0; i < live.length; i++)
+        for (let i = 0; i < live.length; i++) {
           live[i] = lerp((simFrom as Float32Array)[i], base[i], inW);
+        }
       } else {
         for (let i = 0; i < live.length; i++) {
           const posFrom = lerp(base[i], simFrom[i], outW);
@@ -776,6 +736,16 @@ export class FieldFXSystem {
   }
 
   private resetSimFor(mode: ResolvedMode): void {
+    if (mode === "stars") {
+      if (this.particlePoints && this.mat) {
+        this.stars.reset({
+          points: this.particlePoints,
+          material: this.mat,
+        });
+      }
+      return;
+    }
+
     if (mode === "embers") this.embers.resetSimToBase();
     if (mode === "dust") this.dust.resetSimToBase();
     if (mode === "fireflies") this.fireflies.resetSimToBase();
@@ -788,6 +758,20 @@ export class FieldFXSystem {
     const s = clamp01(strength01);
     if (s <= 0.00001) return;
 
+    if (mode === "stars") {
+      if (this.particlePoints && this.mat) {
+        this.stars.simulate({
+          points: this.particlePoints,
+          material: this.mat,
+          dt,
+          time: performance.now() * 0.001,
+          energy: this.smEnergy,
+          intensity: s,
+        });
+      }
+      return;
+    }
+
     if (mode === "embers") this.embers.simulate(dt, s);
     if (mode === "dust") this.dust.simulate(dt, s);
     if (mode === "fireflies") this.fireflies.simulate(dt, s);
@@ -797,6 +781,7 @@ export class FieldFXSystem {
   }
 
   private getSim(mode: ResolvedMode): Float32Array | null {
+    if (mode === "stars") return null;
     if (mode === "embers") return this.embers.getSimPositions();
     if (mode === "dust") return this.dust.getSimPositions();
     if (mode === "fireflies") return this.fireflies.getSimPositions();
@@ -819,7 +804,41 @@ export class FieldFXSystem {
     out.depthWrite = this.baseMat.depthWrite;
     out.sizeAttenuation = this.baseMat.sizeAttenuation;
 
-    if (mode !== "stars") {
+    if (mode === "stars") {
+      if (this.particlePoints) {
+        const tempMaterial = new THREE.PointsMaterial({
+          color: out.color.clone(),
+          size: out.size,
+          sizeAttenuation: out.sizeAttenuation,
+          transparent: out.transparent,
+          opacity: out.opacity,
+          depthWrite: out.depthWrite,
+          blending: out.blending,
+          vertexColors: true,
+        });
+
+        this.stars.sampleMaterial({
+          points: this.particlePoints,
+          material: tempMaterial,
+          dt: 0,
+          energy: this.smEnergy,
+          intensity: t,
+          visibility: t,
+          sizeMul: 1,
+        });
+
+        out.size = tempMaterial.size;
+        out.opacity = tempMaterial.opacity;
+        out.color.copy(tempMaterial.color);
+        out.blending = tempMaterial.blending;
+        out.transparent = tempMaterial.transparent;
+        out.depthWrite = tempMaterial.depthWrite;
+        out.sizeAttenuation =
+          (tempMaterial as any).sizeAttenuation ?? out.sizeAttenuation;
+
+        tempMaterial.dispose();
+      }
+    } else {
       if (mode === "embers") this.embers.sampleMaterial(t, out);
       if (mode === "dust") this.dust.sampleMaterial(t, out);
       if (mode === "fireflies") this.fireflies.sampleMaterial(t, out);
@@ -882,7 +901,9 @@ export class FieldFXSystem {
       driver = clamp01(this.smMid * 0.55 + this.smHigh * 0.25);
       gain = 0.18;
     } else if (mode === "embers") {
-      const heat = clamp01(this.smMid * 0.62 + this.smHigh * 0.28 + this.smImpact * 0.1);
+      const heat = clamp01(
+        this.smMid * 0.62 + this.smHigh * 0.28 + this.smImpact * 0.1,
+      );
       const flare = smoothstep01(0.3, 0.82, heat);
       driver = clamp01(heat * 0.72 + flare * 0.55);
       gain = 0.82;
@@ -896,7 +917,9 @@ export class FieldFXSystem {
       driver = clamp01(this.smEnergy * 0.58 + this.smHigh * 0.28 + this.smMid * 0.14);
       gain = 0.22;
     } else if (mode === "fireflies") {
-      const raw = clamp01(this.smHigh * 0.56 + this.smImpact * 0.24 + this.smEnergy * 0.2);
+      const raw = clamp01(
+        this.smHigh * 0.56 + this.smImpact * 0.24 + this.smEnergy * 0.2,
+      );
       const sparkle = smoothstep01(0.34, 0.78, raw);
       driver = clamp01(raw * 0.4 + sparkle * 0.95);
       if (this.smQuiet) driver *= 0.82;
@@ -969,7 +992,13 @@ export class FieldFXSystem {
     this.smQuiet = Boolean(this.audioFrame.quiet);
 
     const gustTarget = clamp01(impact * 1.25);
-    this.gust01 = this.smoothAR(this.gust01, gustTarget, this.gustAttackHz, this.gustReleaseHz, dt);
+    this.gust01 = this.smoothAR(
+      this.gust01,
+      gustTarget,
+      this.gustAttackHz,
+      this.gustReleaseHz,
+      dt,
+    );
   }
 
   private getAudioIntensityMul(mode: ResolvedMode, _dt: number): number {
@@ -1030,7 +1059,13 @@ export class FieldFXSystem {
     return clamp01(tiny + lerp(baseLight, baseHeavy, 0.65) * 0.94);
   }
 
-  private smoothAR(current: number, target: number, attackHz: number, releaseHz: number, dt: number): number {
+  private smoothAR(
+    current: number,
+    target: number,
+    attackHz: number,
+    releaseHz: number,
+    dt: number,
+  ): number {
     const a = Math.max(0, attackHz);
     const r = Math.max(0, releaseHz);
     const rate = target > current ? a : r;
